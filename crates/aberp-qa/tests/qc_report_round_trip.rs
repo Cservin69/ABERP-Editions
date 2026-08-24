@@ -533,6 +533,89 @@ fn a_coc_only_customer_cannot_be_handed_a_characteristic_table() {
     assert_eq!(count_kind(&conn, EventKind::QcReportDrafted), 0);
 }
 
+/// **A measurement nothing can date REFUSES the freeze** (round 3).
+///
+/// `latest_measurement` now orders by the parsed instant, and an
+/// unparseable `measured_at_utc` yields `None` — which `Option`'s ordering
+/// sorts LOWEST. Left alone that silently demotes the offending row, and
+/// demoting a failing re-measurement is how a part is reported on its
+/// earlier passing value. So `freeze_report` refuses the whole freeze
+/// instead, before anything is written.
+///
+/// The row is corrupted with direct SQL because nothing in the application
+/// can produce it: `record_inspection` formats every `measured_at_utc`
+/// through the one `rfc3339` helper. That is the point — this is the
+/// backstop against a row written outside the application.
+#[test]
+fn a_measurement_with_an_unreadable_timestamp_refuses_the_freeze() {
+    let mut conn = setup_db();
+    let plan_id = seed_plan(&conn, "Bore D", "1", true);
+    let unit = ReportUnit {
+        part_serial: "SN-001".into(),
+        part_uid: "uid1".into(),
+    };
+    measure(&mut conn, &plan_id, "uid1", 25.0);
+
+    // Positive control: the freeze succeeds while the timestamp is readable.
+    let ok_id = freeze(
+        &mut conn,
+        std::slice::from_ref(&unit),
+        QcReportKind::DimensionalInspection,
+        QcReportTemplate::AbenStandard,
+    );
+    assert!(!ok_id.is_empty());
+    let drafted_before = count_kind(&conn, EventKind::QcReportDrafted);
+
+    conn.execute(
+        "UPDATE qc_inspections SET measured_at_utc = 'not-a-timestamp'
+         WHERE tenant_id = ?1",
+        duckdb::params![TEST_TENANT],
+    )
+    .unwrap();
+
+    let m = meta();
+    let plans = list_inspection_plans(&conn, TEST_TENANT, Some("prd_bracket"), false).unwrap();
+    let inspections = aberp_qa::list_inspections_for_wo(&conn, TEST_TENANT, "wo_1").unwrap();
+    assert!(
+        !inspections.is_empty(),
+        "precondition: there is a measurement to be refused over"
+    );
+    let tx = conn.transaction().unwrap();
+    let err = freeze_report(
+        &tx,
+        &ctx(&m, "ervin"),
+        FreezeReportInputs {
+            report_kind: QcReportKind::DimensionalInspection,
+            template: QcReportTemplate::AbenStandard,
+            wo_id: "wo_1",
+            product_id: "prd_bracket",
+            partner_id: "ptr_prime",
+            plans: &plans,
+            inspections: &inspections,
+            units: std::slice::from_ref(&unit),
+            open_ncr_against_reported_part: false,
+            traceability: ReportTraceability::default(),
+            customer: ReportCustomer::default(),
+            created_by: "ervin",
+        },
+        now(),
+    )
+    .expect_err("the freeze must refuse a measurement it cannot order");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("measured_at_utc"),
+        "the refusal names the field: {msg}"
+    );
+    drop(tx);
+
+    // Nothing was written — the refusal is before the draft, not after it.
+    assert_eq!(
+        count_kind(&conn, EventKind::QcReportDrafted),
+        drafted_before,
+        "a refused freeze must not leave a drafted report behind"
+    );
+}
+
 /// Report numbers are allocated densely per tenant per year.
 #[test]
 fn report_numbers_are_allocated_in_sequence() {

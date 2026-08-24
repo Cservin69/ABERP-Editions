@@ -17678,10 +17678,12 @@ pub enum QcReportBlockReason {
     Incomplete,
     /// A report exists and a characteristic failed.
     Rejected,
-    /// The current report RELEASES, but the product's inspection plan has
-    /// gained a required characteristic since that report was frozen — so
-    /// the release was granted over evidence that no longer covers what
-    /// must be inspected.
+    /// The current report RELEASES, but the product's inspection plan now
+    /// requires a characteristic the report carries no MEASUREMENT for —
+    /// either the characteristic was added after the report was frozen, or
+    /// it was PROMOTED from optional to required while its frozen line is
+    /// an unmeasured accountability row. Either way the release was granted
+    /// over evidence that does not cover what must be inspected.
     PlanDrift,
 }
 
@@ -17782,6 +17784,8 @@ pub fn resolve_qc_report_gate_with_capability(
             Some(d) => d == dispatch.dsp_id,
         })
         .collect();
+    // A row nothing can date cannot be ranked, and the gate does not guess.
+    refuse_unparseable_report_timestamps(&releasing)?;
     // NEWEST FIRST, deterministically — see `report_recency_key`. The
     // caller's SQL already orders this way; re-sorting here means the gate
     // does not silently depend on an `ORDER BY` in another crate, which a
@@ -17843,11 +17847,54 @@ pub fn resolve_qc_report_gate_with_capability(
         // `(product, feature_name)` is the plan table's own uniqueness key
         // and is exactly what `build_report_lines` writes into
         // `characteristic_name`, so it is the join.
+        //
+        // **A characteristic is COVERED only if EVERY line for it carries a
+        // measurement** (round 3, B1-a). `freeze_report` writes a line for
+        // EVERY enabled plan, optional ones included, and an unmeasured
+        // characteristic gets an `Accountability::NotMeasured` ACCOUNTABILITY
+        // ROW — printed with a blank actual, deliberately never omitted. A
+        // bare name-set over the lines therefore counted that blank row as
+        // coverage, which opened the promotion bypass: an OPTIONAL
+        // characteristic is unmeasured at freeze (so it does not make the
+        // report `incomplete`, and the report issues as `accept`), the
+        // operator then PROMOTES it to required via
+        // `PUT /api/inspection-plans/:id`, and the drift check saw the name on
+        // both sides and passed — releasing a shipment over a required
+        // characteristic that was never measured at all.
+        //
+        // **Subtracting the unmeasured names, not merely filtering the
+        // unmeasured lines.** Lines are PER UNIT: a per-serial characteristic
+        // produces one line per unit in scope. Filtering only the
+        // `NotMeasured` lines would still call a characteristic covered when
+        // it was measured on unit 1 and left blank on unit 2 — the surviving
+        // Measured line re-adds the name. That is the same bypass with two
+        // units instead of one: promote it, and unit 2 ships with no
+        // measurement for a required characteristic. So a name is covered
+        // only when NO line for it is `NotMeasured`.
+        //
+        // This cannot produce a false block. A characteristic that was
+        // required AT FREEZE and left unmeasured on ANY unit counts as
+        // `unaccounted` (`summarise` tallies per line), so
+        // `compute_disposition` already returned `Incomplete` and the report
+        // never reaches this arm — `permits_shipment()` is false above. Only
+        // optional-at-freeze characteristics change verdict here, and for
+        // those a block is the correct answer once they become required.
+        //
+        // The line's own `required` flag is NOT usable for this:
+        // `qc_report_lines` does not persist it and `parse_line_row`
+        // reconstructs it as `true` for every row. `accountability` IS
+        // persisted and read back, which is why the fix keys on it.
         let report_lines = aberp_qa::list_report_lines(conn, tenant, &current.qcr_id)
             .map_err(|e| anyhow!("list QC report lines for {}: {e}", current.qcr_id))?;
+        let unmeasured: std::collections::BTreeSet<&str> = report_lines
+            .iter()
+            .filter(|l| l.accountability == aberp_qa::Accountability::NotMeasured)
+            .map(|l| l.characteristic_name.as_str())
+            .collect();
         let covered: std::collections::BTreeSet<&str> = report_lines
             .iter()
             .map(|l| l.characteristic_name.as_str())
+            .filter(|n| !unmeasured.contains(n))
             .collect();
         if required_now.iter().all(|n| covered.contains(n)) {
             return Ok(QcReportGate::Pass);
@@ -17876,20 +17923,78 @@ pub fn resolve_qc_report_gate_with_capability(
 
 /// Recency key for "which QC report is the CURRENT one", newest-largest.
 ///
-/// `created_at` first, then `report_number`, then `qcr_id`. The middle term
-/// is the one that matters: `qcr_id` is a `Ulid`, and two ULIDs minted in
-/// the SAME millisecond order by their random suffix, not by time — so an
+/// The parsed INSTANT first, then `report_number`, then `qcr_id`.
+///
+/// **The instant, not the string** (round 3, B1-b). `created_at` is written
+/// by `time`'s `Rfc3339` formatter, which emits sub-second digits only when
+/// they are non-zero and trims trailing zeros — so a report frozen at
+/// `…12:00:00Z` and one frozen half a second LATER at `…12:00:00.5Z` are
+/// stored with one being a strict PREFIX of the other, and a byte compare
+/// puts the prefix's next character (`Z`, 0x5A) above the fraction's (`.`,
+/// 0x2E). Ordering those two as strings therefore ranks the EARLIER report
+/// as newer, and every strict-prefix pair inverts the same way. That is the
+/// exact shape the round-2 fix was written to stop: a later `reject` sorting
+/// below an earlier `accept`, so a failed part ships. The `report_number`
+/// tiebreak could not save it — that term is only consulted when the first
+/// terms compare EQUAL, and these compare unequal-and-backwards.
+///
+/// `report_number` remains the second term and is the one that matters when
+/// two reports share an instant: `qcr_id` is a `Ulid`, and two ULIDs minted
+/// in the SAME millisecond order by their random suffix, not by time — so an
 /// id-only tiebreak can put the older report first. `report_number` is
 /// `QCR-<YYYY>-<NNNN>` allocated by a COUNT under the one shared writer, so
 /// it is strictly monotonic within a year, and two reports sharing a
 /// `created_at` necessarily share a year. `qcr_id` remains as the final
 /// term so the ordering is total even if a future numbering scheme repeats.
-fn report_recency_key(r: &aberp_qa::QcReport) -> (&str, &str, &str) {
+///
+/// An UNPARSEABLE `created_at` yields `None`, which `Option`'s ordering puts
+/// below every `Some` — the report sorts oldest and cannot become `current`
+/// on the strength of a timestamp nothing can read. Every `created_at` this
+/// code writes goes through `aberp_qa`'s one `rfc3339` helper, so `None` is
+/// only reachable by writing the row outside the application; the shipment
+/// path refuses that case outright rather than guessing — see
+/// `refuse_unparseable_report_timestamps`.
+fn report_recency_key(r: &aberp_qa::QcReport) -> (Option<time::OffsetDateTime>, &str, &str) {
     (
-        r.created_at.as_str(),
+        parse_report_created_at(r),
         r.report_number.as_str(),
         r.qcr_id.as_str(),
     )
+}
+
+/// The ONE parse of `QcReport::created_at`, so the sort key and the refusal
+/// below can never disagree about which strings are readable.
+fn parse_report_created_at(r: &aberp_qa::QcReport) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(
+        &r.created_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()
+}
+
+/// Refuse the whole gate decision when any candidate report carries a
+/// `created_at` that cannot be parsed.
+///
+/// Sorting an unreadable timestamp to the bottom is the right *ordering*
+/// default, but it is the wrong *shipping* answer: it silently demotes the
+/// offending report, and if that report is the `reject`, the part ships on
+/// the strength of a corrupt row. Every `created_at` is minted by
+/// `aberp_qa`'s `rfc3339` helper, so an unparseable one means the row was
+/// written outside the application — exactly the case where guessing is
+/// worse than stopping. Failing loud turns it into a 500 an operator must
+/// escalate rather than a release nobody notices.
+fn refuse_unparseable_report_timestamps(reports: &[&aberp_qa::QcReport]) -> anyhow::Result<()> {
+    for r in reports {
+        if parse_report_created_at(r).is_none() {
+            return Err(anyhow!(
+                "QC report {} has an unparseable created_at ({:?}); refusing to \
+                 decide the shipment gate on an unreadable timestamp",
+                r.qcr_id,
+                r.created_at
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// ADR-0199 §D6 — enforce the QC-report gate at the dispatch-ship route
@@ -17970,28 +18075,40 @@ fn enforce_qc_report_gate_for_shipment(
         WorkOrderRouteError::Other(anyhow!("commit tx for qc-report-block audit: {e}"))
     })?;
 
-    let detail = match reason {
+    Err(WorkOrderRouteError::Conflict(format!(
+        "Shipment blocked: {}. Complete and issue the QC report before shipping.",
+        qc_report_block_detail(reason, qcr_id.as_deref())
+    )))
+}
+
+/// The operator-facing sentence for one [`QcReportBlockReason`]. Pure, and
+/// split out of the route so the wording is reachable from a unit test — a
+/// 409 body is the only thing an operator sees, and a message that
+/// understates the cause sends them looking in the wrong place.
+fn qc_report_block_detail(reason: QcReportBlockReason, qcr_id: Option<&str>) -> String {
+    let id = qcr_id.unwrap_or("(unknown)");
+    match reason {
         QcReportBlockReason::NoIssuedReport => {
             "no QC inspection report has been issued for this work order".to_string()
         }
         QcReportBlockReason::Incomplete => format!(
-            "QC report {} is incomplete — a required characteristic is unaccounted for \
-             or was measured with a stale-calibration probe",
-            qcr_id.as_deref().unwrap_or("(unknown)")
+            "QC report {id} is incomplete — a required characteristic is unaccounted for \
+             or was measured with a stale-calibration probe"
         ),
-        QcReportBlockReason::Rejected => format!(
-            "QC report {} is a REJECT — a characteristic failed",
-            qcr_id.as_deref().unwrap_or("(unknown)")
-        ),
+        QcReportBlockReason::Rejected => {
+            format!("QC report {id} is a REJECT — a characteristic failed")
+        }
+        // Round 3 — this used to say only "was added", which understated
+        // it: the same block now fires for a characteristic PROMOTED from
+        // optional to required whose frozen line carries no measurement.
+        // An operator told "added" would go looking for a new plan row that
+        // does not exist.
         QcReportBlockReason::PlanDrift => format!(
-            "QC report {} no longer covers the inspection plan — a required \
-             characteristic was added after it was issued",
-            qcr_id.as_deref().unwrap_or("(unknown)")
+            "QC report {id} no longer covers the inspection plan — a required \
+             characteristic was added, or promoted from optional to required, \
+             after it was issued, and it carries no measurement for it"
         ),
-    };
-    Err(WorkOrderRouteError::Conflict(format!(
-        "Shipment blocked: {detail}. Complete and issue the QC report before shipping."
-    )))
+    }
 }
 
 /// GET /api/products/:id/bom — list active BOM rows.
@@ -27417,10 +27534,10 @@ fn qc_report_error_response(e: crate::qc_report::QcReportError) -> Response {
         // pretending the resource does not exist.
         E::NotPermitted(_) => (StatusCode::FORBIDDEN, Json(error_body(msg))).into_response(),
         // 409, not 404 and not 200-with-bytes: the report exists, and the
-        // honest answer is that no valid document does. Serving a voided
-        // report's PDF would hand out a repudiated certificate that reads
-        // as evidence of conformity.
-        E::Voided(_) => (StatusCode::CONFLICT, Json(error_body(msg))).into_response(),
+        // honest answer is that no valid document does. Serving a voided or
+        // SUPERSEDED report's PDF would hand out a certificate that no
+        // longer stands but still reads as evidence of conformity.
+        E::NotCurrent(_) => (StatusCode::CONFLICT, Json(error_body(msg))).into_response(),
         E::Other(err) => internal_error("qc_report_route", err),
     }
 }
@@ -31408,6 +31525,161 @@ mod tests {
             msg.contains("do NOT"),
             "and must say not to run it, got: {msg}"
         );
+    }
+
+    /// A `QcReport` shaped only for [`report_recency_key`] — every field the
+    /// key does not read is a placeholder.
+    fn recency_fixture(qcr_id: &str, report_number: &str, created_at: &str) -> aberp_qa::QcReport {
+        aberp_qa::QcReport {
+            qcr_id: qcr_id.into(),
+            report_number: report_number.into(),
+            report_kind: aberp_qa::QcReportKind::DimensionalInspection,
+            template: aberp_qa::QcReportTemplate::AbenStandard,
+            state: aberp_qa::QcReportState::Issued,
+            wo_id: "wo_1".into(),
+            product_id: "prd_1".into(),
+            dsp_id: None,
+            partner_id: "ptr_1".into(),
+            source_quote_id: None,
+            drawing_number: None,
+            drawing_rev: None,
+            qty_reported: 1,
+            serial_range: None,
+            heat_lot_reference: None,
+            mill_cert_id: None,
+            machine_id: None,
+            program_id: None,
+            disposition: aberp_qa::Disposition::Accept,
+            characteristics_required: 1,
+            characteristics_measured: 1,
+            characteristics_passed: 1,
+            characteristics_failed: 0,
+            characteristics_unaccounted: 0,
+            rendered_sha256: None,
+            renderer_version: None,
+            issued_at_utc: Some(created_at.into()),
+            issued_by: Some("ervin".into()),
+            superseded_by_qcr_id: None,
+            created_at: created_at.into(),
+            created_by: "ervin".into(),
+            notes: None,
+            customer_name: None,
+            customer_address_line: None,
+            customer_purchase_order: None,
+        }
+    }
+
+    /// **The recency key orders by the parsed instant, and `report_number`
+    /// breaks a tie the id would break WRONGLY** (round 3, B1-b).
+    ///
+    /// Asserted on the key itself rather than through a fixture, because
+    /// both halves are otherwise decided by luck:
+    ///
+    /// * the sub-second half needs a strict-prefix `created_at` pair, which
+    ///   only appears when two reports are frozen inside the same second;
+    /// * the tiebreak half needs the `qcr_id` order INVERTED against the
+    ///   `report_number` order, and `qcr_id` is a ULID whose ordering a test
+    ///   cannot choose. A DB-level test passes whenever the ULIDs happen to
+    ///   agree with the report numbers — which, minted milliseconds apart,
+    ///   they usually do. That is a coin flip, not a pin.
+    #[test]
+    fn report_recency_key_orders_by_instant_then_report_number() {
+        // (a) The trimmed sub-second inversion, stated as the raw hazard.
+        assert!(
+            "2026-08-23T12:00:00Z" > "2026-08-23T12:00:00.5Z",
+            "precondition: as STRINGS the earlier timestamp sorts higher"
+        );
+        let early = recency_fixture("qcr_A", "QCR-2026-0001", "2026-08-23T12:00:00Z");
+        let late = recency_fixture("qcr_B", "QCR-2026-0002", "2026-08-23T12:00:00.5Z");
+        assert!(
+            report_recency_key(&late) > report_recency_key(&early),
+            "the report frozen half a second LATER must rank as newer"
+        );
+
+        // (b) Equal instants: `report_number` decides, and it must decide
+        // AGAINST the id order — `qcr_Z…` sorts above `qcr_A…`, so an
+        // id-only tiebreak would pick the older report.
+        let older = recency_fixture("qcr_ZZZZ", "QCR-2026-0001", "2026-08-23T12:00:00Z");
+        let newer = recency_fixture("qcr_AAAA", "QCR-2026-0002", "2026-08-23T12:00:00Z");
+        assert!(
+            older.qcr_id.as_str() > newer.qcr_id.as_str(),
+            "precondition: the ids are inverted against the report numbers"
+        );
+        assert!(
+            report_recency_key(&newer) > report_recency_key(&older),
+            "with equal instants the higher report_number is the current one"
+        );
+
+        // (c) An unreadable timestamp is not silently promoted to newest.
+        let unreadable = recency_fixture("qcr_C", "QCR-2026-9999", "not-a-timestamp");
+        assert!(
+            report_recency_key(&unreadable) < report_recency_key(&early),
+            "a row nothing can date must not outrank a dated one"
+        );
+        // …and the gate refuses to decide on it at all.
+        assert!(
+            refuse_unparseable_report_timestamps(&[&early, &unreadable]).is_err(),
+            "the gate refuses rather than ranking an unreadable timestamp"
+        );
+        assert!(
+            refuse_unparseable_report_timestamps(&[&early, &late]).is_ok(),
+            "…and does not refuse a pair it can read"
+        );
+    }
+
+    /// **Every block reason names its own cause, and `plan_drift` names
+    /// BOTH of its causes** (round 3).
+    ///
+    /// The 409 body is the only thing the operator sees. `plan_drift` said
+    /// only that a required characteristic "was added"; since round 3 the
+    /// same block also fires for one PROMOTED from optional to required, and
+    /// an operator sent looking for a new plan row that does not exist is
+    /// worse served than one told nothing.
+    #[test]
+    fn every_qc_report_block_reason_names_its_cause() {
+        let d = |r| qc_report_block_detail(r, Some("qcr_42"));
+
+        let no_report = qc_report_block_detail(QcReportBlockReason::NoIssuedReport, None);
+        assert!(no_report.contains("no QC inspection report has been issued"));
+        assert!(
+            !no_report.contains("(unknown)"),
+            "the no-report case has no report to name, so it must not print a placeholder"
+        );
+
+        assert!(d(QcReportBlockReason::Incomplete).contains("incomplete"));
+        assert!(d(QcReportBlockReason::Rejected).contains("REJECT"));
+
+        let drift = d(QcReportBlockReason::PlanDrift);
+        assert!(
+            drift.contains("added"),
+            "the added-characteristic cause stays named: {drift}"
+        );
+        assert!(
+            drift.contains("promoted from optional to required"),
+            "the promotion cause must be named too: {drift}"
+        );
+        assert!(
+            drift.contains("no measurement"),
+            "…and what is actually missing is a MEASUREMENT: {drift}"
+        );
+
+        // Each reason that has a report names it, and the four sentences are
+        // distinct — a copy-paste that gave two reasons the same wording
+        // would leave the operator unable to tell them apart.
+        let all = [
+            QcReportBlockReason::NoIssuedReport,
+            QcReportBlockReason::Incomplete,
+            QcReportBlockReason::Rejected,
+            QcReportBlockReason::PlanDrift,
+        ];
+        let msgs: Vec<String> = all.iter().map(|r| d(*r)).collect();
+        for (r, m) in all.iter().zip(&msgs) {
+            if !matches!(r, QcReportBlockReason::NoIssuedReport) {
+                assert!(m.contains("qcr_42"), "{r:?} must name the report: {m}");
+            }
+        }
+        let distinct: std::collections::BTreeSet<&str> = msgs.iter().map(String::as_str).collect();
+        assert_eq!(distinct.len(), all.len(), "two reasons share wording");
     }
 
     /// S434 — the demo sample-data seed migrates the demo DB and inserts 3

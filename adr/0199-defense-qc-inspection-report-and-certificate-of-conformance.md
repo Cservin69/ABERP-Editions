@@ -1059,14 +1059,21 @@ and the renderer call cannot drift between them.
   non-test caller. This is delta 3 restated with a sharper name; it needs
   the invoice→dispatch→WO→report join, which is real scope. Tracked in
   `docs/BACKLOG-designed-to-live.md`.
-- **A characteristic PROMOTED from optional to required does not trip
-  `plan_drift`.** `qc_report_lines` does not persist `required` —
-  `parse_line_row` reconstructs it as `true` — so the frozen row cannot say
-  whether the characteristic counted toward accountability when it froze.
-  Detecting promotion needs an additive `is_required` column on
-  `qc_report_lines` and is a separate change. The *added*-characteristic
-  case, which is the one the review named, is closed.
-- **A VOID-stamped rendering** for auditors, as above.
+- ~~**A characteristic PROMOTED from optional to required does not trip
+  `plan_drift`.**~~ **Closed in round 3 — and this advisory's reasoning was
+  wrong.** It claimed detection needed an additive `is_required` column on
+  `qc_report_lines`. It does not. `required` is not persisted, but
+  `accountability` is, and an unmeasured characteristic's frozen row is an
+  `Accountability::NotMeasured` accountability row. Excluding those rows
+  from the gate's `covered` set closes the promotion case with no schema
+  change. See §D6 round 3.
+- **A VOID/SUPERSEDED-stamped rendering** for auditors, as above — now
+  covering both non-current states.
+- **No operator-facing repair path for an unreadable stored timestamp.**
+  Both instant-ordering call sites refuse rather than guess (§D6 round 3);
+  neither is reachable without an out-of-band write, and neither offers the
+  operator anything but the error. Tracked in
+  `docs/BACKLOG-designed-to-live.md`.
 
 ### Round-2 behaviours pinned by mutation testing
 
@@ -1081,9 +1088,108 @@ and the renderer call cannot drift between them.
   pass vacuously.
 - **(f) the document's self-description** — pinned by
   `a_voided_report_refuses_to_render`,
-  `an_issued_pdf_cites_its_chain_entry_and_is_not_stamped_draft` (which
-  also asserts a supersede leaves the bytes untouched), and
-  `a_draft_pdf_says_it_is_a_draft` as the other direction.
+  `an_issued_pdf_cites_its_chain_entry_and_is_not_stamped_draft`, and
+  `a_draft_pdf_says_it_is_a_draft` as the other direction. (Round 3 moved
+  the "a supersede leaves the bytes untouched" half of the middle test to
+  `qc_report::tests::render_canonical_is_byte_identical_across_a_supersede`,
+  because `render_report` now refuses a superseded report outright.)
+
+### Round-3 behaviours pinned by mutation testing
+
+Round 3 closed two BLOCKING bypasses that both ended in the same place — a
+part that should not ship, shipping — plus a third of the same class found
+while pinning the second.
+
+- **(g) an OPTIONAL characteristic PROMOTED to required must re-block.**
+  `freeze_report` writes a line for EVERY enabled plan, optional ones
+  included; an unmeasured one is an `Accountability::NotMeasured`
+  accountability row, printed with a blank actual and deliberately never
+  omitted. The gate's `covered` set was a bare name-set over the frozen
+  lines, so it counted that blank row as coverage: promote the
+  characteristic via `PUT /api/inspection-plans/:id` and the gate released
+  a shipment over a required characteristic that was never measured. A name
+  is now covered only when NO line for it is `NotMeasured`. This cannot
+  false-block — a characteristic required AT FREEZE and unmeasured counts as
+  `unaccounted`, so the report is already `incomplete` and never reaches the
+  drift arm. Pinned by
+  `an_optional_characteristic_promoted_to_required_re_blocks_the_shipment`,
+  whose second half measures the promoted characteristic and re-issues, so
+  "block everything" does not pass.
+- **(g′) …and the same bypass one UNIT over.** Found by the round-3
+  self-adversarial, against (g) as first written. Filtering out the
+  `NotMeasured` LINES is not enough, because lines are PER UNIT: measure an
+  optional characteristic on unit 1, leave unit 2 blank, and unit 1's
+  surviving `Measured` line re-adds the name to `covered`. Promote it and
+  unit 2 ships with no measurement for something now required. Hence the
+  SUBTRACTION (`covered = all names − names with any NotMeasured line`)
+  rather than a line filter. The one-unit test cannot separate the two
+  rules; `a_characteristic_measured_on_only_some_units_is_not_covered_for_the_rest`
+  is the two-unit case that does, and it carries its own counter-direction.
+- **(h) report recency must be ordered by the parsed INSTANT.**
+  `created_at` is `time`-formatted Rfc3339, which emits sub-second digits
+  only when non-zero and trims trailing zeros — so `…12:00:00Z` and
+  `…12:00:00.5Z` are a strict-prefix pair and a byte compare ranks the
+  EARLIER report higher (`Z` 0x5A > `.` 0x2E). Every such pair inverts, and
+  the `report_number` tiebreak cannot catch it: that term is only consulted
+  when the first terms compare EQUAL. The effect re-opened round 2's (d) —
+  a later `reject` sorting below an earlier `accept`. Pinned by
+  `a_later_reject_outranks_an_earlier_accept_across_a_trimmed_subsecond`,
+  which asserts the string inversion directly so the test cannot go vacuous
+  if `time` ever stops trimming.
+- **(i) the SAME defect one layer down, in `latest_measurement`.** Found
+  while writing (h): the measurement that represents a characteristic was
+  also chosen by a string compare on `measured_at_utc`. This one is worse —
+  it corrupts the report itself rather than the choice between reports. A
+  part re-measured out-of-tolerance within the same second was reported on
+  its earlier passing measurement, so the report computed `accept` and the
+  gate, which reads the report and not the measurements, had nothing to
+  refuse on. Ordered by the parsed instant now, pinned by
+  `a_sub_second_re_measurement_still_represents_the_characteristic`.
+- **Neither instant-ordering fix silently demotes an unreadable row.**
+  `Option<OffsetDateTime>` sorts `None` lowest, which would quietly rank a
+  row nothing can date as oldest — and demoting the `reject` is exactly how
+  a bad part ships. So both call sites REFUSE instead:
+  `refuse_unparseable_report_timestamps` fails the gate, and `freeze_report`
+  returns `QcError::Validation`. Every such timestamp is minted through one
+  `rfc3339` helper, so both are unreachable without an out-of-band write;
+  the refusals are backstops, not expected paths.
+- **(j) a SUPERSEDED report refuses to render, like a void.** The §D7
+  residual, decided conservatively. `void_report` picks `Superseded` over
+  `Voided` purely from whether a `superseded_by_qcr_id` was supplied — same
+  route, same meaning to a reader — and because the page cannot carry
+  `state`, the superseded report re-rendered as a clean, unmarked
+  certificate. It is the sharper hazard of the two: the report a supersede
+  replaces is typically the flattering early `accept` a later `reject`
+  corrected, which is the very document (d) stops the gate from shipping
+  on. `QcReportError::Voided` is renamed `NotCurrent` to stop the variant
+  name from lying; the 409 is unchanged. Pinned by
+  `a_superseded_report_refuses_to_render`. The §D7 byte-form invariant is
+  NOT weakened — it moved to
+  `render_canonical_is_byte_identical_across_a_supersede`, where it is
+  asserted on the byte-form itself rather than through a route that now
+  refuses. The two claims are independent: currency decides whether the
+  bytes may be SERVED, the byte-form decides whether the pin still
+  VERIFIES. A row whose `state` still says `issued` while
+  `superseded_by_qcr_id` names a replacement refuses too — the two are
+  written by one statement so they cannot disagree through the application,
+  and if one ever does, the pointer to the replacement is the honest signal.
+
+### Round-3 residuals, stated
+
+- **The list routes still order reports by the `created_at` STRING.**
+  `list_reports_for_wo` / `list_reports_for_dispatch` carry
+  `ORDER BY created_at`, which inverts on the same trimmed-fraction pairs
+  as (h). This is left as-is deliberately: the ordering there is a DISPLAY
+  order, and no decision reads it — the shipment gate re-sorts in-process
+  precisely so it does not depend on another crate's `ORDER BY`, and
+  issuance and void address a report by id. Two reports frozen inside the
+  same second may list in the wrong order; nothing ships on it.
+- **`freeze_report`'s timestamp refusal scans every supplied inspection**,
+  including measurements for characteristics not in the report's scope. A
+  corrupt row for an unrelated plan therefore blocks the freeze. That is
+  the over-blocking direction of an out-of-band-only condition, and
+  narrowing the scan would mean re-deriving the join the refusal exists to
+  protect.
 
 ---
 

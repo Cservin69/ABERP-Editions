@@ -52,10 +52,11 @@ pub enum QcReportError {
     /// This build is not allowed to produce QC reports (ADR-0199 §D9).
     #[error("{0}")]
     NotPermitted(String),
-    /// The report exists but has been VOIDED — there is no valid document
-    /// to hand out. Surfaced as 409, never as bytes.
+    /// The report exists but is no longer CURRENT — voided, or superseded
+    /// by a later report. There is no valid document to hand out.
+    /// Surfaced as 409, never as bytes.
     #[error("{0}")]
-    Voided(String),
+    NotCurrent(String),
     /// Everything else — surfaced as 500.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -530,6 +531,9 @@ fn customer_info(
 /// Re-render an existing report from its frozen rows. **Read-only** — the
 /// caller decides whether to append a `qcr.report_rendered` entry.
 ///
+/// Refuses a report that is no longer current (`Voided` / `Superseded`)
+/// with [`QcReportError::NotCurrent`] — see the body for why.
+///
 /// Returns the bytes and the SHA-256, plus whether the SHA matched the one
 /// pinned at issuance — `None` when the report is still a draft and has no
 /// pin. `Some(false)` is the tamper signal: the frozen rows no longer
@@ -543,24 +547,56 @@ pub fn render_report(
         .map_err(|e| QcReportError::NotPermitted(e.to_string()))?;
     let report = aberp_qa::get_report(conn, tenant, qcr_id)?
         .ok_or_else(|| QcReportError::NotFound(format!("QC report {qcr_id}")))?;
-    // **A VOIDED report is not rendered at all.**
+    // **A report that is no longer CURRENT is not rendered at all.**
     //
     // The rendered page cannot carry `state` (it is post-issuance-mutable,
-    // and printing it breaks the §D7 pin), so a voided report would come
-    // out looking exactly like a valid issued one — a repudiated document
-    // that still reads as evidence of conformity. Refusing is the honest
-    // answer: the report, its void reason and its superseding id are all
-    // still on `GET /api/qc-reports/:id`, and the void is a chain entry.
-    // Handing an auditor a VOID-stamped copy would be strictly better and
-    // is flagged in the ADR as Phase 2 — it needs the stamp drawn OUTSIDE
-    // the hashed byte-form, which is a renderer change, not a route one.
-    if report.state == aberp_qa::QcReportState::Voided {
-        return Err(QcReportError::Voided(format!(
-            "QC report {qcr_id} was voided{} — no document is issued for it",
+    // and printing it breaks the §D7 pin), so a `Voided` or `Superseded`
+    // report would come out looking exactly like a valid issued one — a
+    // document that no longer stands, still reading as evidence of
+    // conformity. Refusing is the honest answer: the report, its reason and
+    // its superseding id are all still on `GET /api/qc-reports/:id`, and the
+    // transition is a chain entry.
+    //
+    // **Round 3 — `Superseded` refuses on the same footing as `Voided`.**
+    // The two arrive through the SAME route (`void_report` picks the state
+    // from whether a `superseded_by_qcr_id` was supplied) and mean the same
+    // thing to a reader: this is not the document that stands. Superseded is
+    // if anything the sharper hazard, because the report it replaces is
+    // typically the FLATTERING one — the early `accept` that a later
+    // `reject` corrected. That is the very pair the round-2 gate fix exists
+    // to stop shipping on, and serving its clean, unmarked PDF hands an
+    // auditor exactly the document the gate refused to ship on. Whether
+    // "it was what was issued" makes an unmarked re-render defensible is not
+    // a question worth resolving in the direction that can mislead.
+    //
+    // Handing an auditor a VOID/SUPERSEDED-stamped copy would be strictly
+    // better and is flagged in the ADR as Phase 2 — it needs the stamp drawn
+    // OUTSIDE the hashed byte-form, which is a renderer change, not a route
+    // one.
+    //
+    // This refusal is a CURRENCY check, not a byte-form change: the §D7
+    // invariant that a state transition perturbs no byte of the document is
+    // unaffected and still pinned, on `render_canonical` itself — see
+    // `render_canonical_is_byte_identical_across_a_supersede`.
+    //
+    // The `superseded_by_qcr_id.is_some()` arm is a belt on the braces: it
+    // is written by `void_report` in the SAME statement that sets `state`,
+    // so the two cannot disagree through the application. If a row ever does
+    // disagree, the pointer to a replacement is the honest signal and the
+    // stale `state` is the one to distrust.
+    let not_current = match report.state {
+        aberp_qa::QcReportState::Voided => Some("was voided"),
+        aberp_qa::QcReportState::Superseded => Some("has been superseded"),
+        _ if report.superseded_by_qcr_id.is_some() => Some("has been superseded"),
+        _ => None,
+    };
+    if let Some(what) = not_current {
+        return Err(QcReportError::NotCurrent(format!(
+            "QC report {qcr_id} {what}{} — no document is issued for it",
             report
                 .superseded_by_qcr_id
                 .as_deref()
-                .map(|s| format!(" and superseded by {s}"))
+                .map(|s| format!(" by {s}"))
                 .unwrap_or_default(),
         )));
     }
@@ -665,7 +701,10 @@ mod tests {
             superseded_by_qcr_id: Some("qcr_Y".into()),
             created_at: "2026-08-23T11:00:00Z".into(),
             created_by: "ervin".into(),
-            notes: None,
+            // Non-default for the same reason `disposition` is: `None` is
+            // this field's default, so a fixture that left it `None` could
+            // not detect `canonical_for_render` over-normalising it away.
+            notes: Some("first article, re-run after rework".into()),
             customer_name: Some("Prime Aerospace Kft.".into()),
             customer_address_line: Some("1117 Budapest, Fő utca 1., HU".into()),
             customer_purchase_order: Some("PO-2026-889".into()),
@@ -716,6 +755,97 @@ mod tests {
         assert_eq!(c.issued_by, r.issued_by);
         assert_eq!(c.issued_at_utc, r.issued_at_utc);
         assert_eq!(c.renderer_version, r.renderer_version);
+        assert_eq!(c.notes, r.notes);
+        assert_eq!(c.customer_name, r.customer_name);
+        assert_eq!(c.customer_address_line, r.customer_address_line);
+        assert_eq!(c.customer_purchase_order, r.customer_purchase_order);
+    }
+
+    /// One frozen line, enough to give the renderer a table to draw.
+    fn sample_line() -> QcReportLine {
+        QcReportLine {
+            qcrl_id: "qcrl_1".into(),
+            qcr_id: "qcr_X".into(),
+            line_no: 1,
+            part_serial: Some("SN-001".into()),
+            part_uid: Some("uid_SN-001".into()),
+            characteristic_number: Some("1".into()),
+            characteristic_name: "Bore D".into(),
+            characteristic_designator: None,
+            characteristic_type: aberp_qa::CharacteristicType::Dimensional,
+            inspection_method: Some(aberp_qa::InspectionMethod::OnMachineProbe),
+            sheet_zone: Some("1/B4".into()),
+            nominal_value: Some(25.0),
+            upper_tol: Some(0.05),
+            lower_tol: Some(-0.05),
+            units: Some("mm".into()),
+            actual_value: Some(25.012),
+            deviation: Some(0.012),
+            verdict: Some(aberp_qa::Verdict::Pass),
+            accountability: aberp_qa::Accountability::Measured,
+            qci_id: Some("qci_x".into()),
+            measured_at_utc: Some("2026-08-23T10:00:00Z".into()),
+            measured_by: Some("ervin".into()),
+            probe_serial: Some("RMP600-007".into()),
+            created_at: "2026-08-23T11:00:00Z".into(),
+            required: true,
+        }
+    }
+
+    /// **A supersede (or a void) perturbs no byte of the document** —
+    /// ADR-0199 §D7's load-bearing invariant, pinned on the byte-form
+    /// itself.
+    ///
+    /// This claim used to be asserted at the end of the integration test
+    /// `an_issued_pdf_cites_its_chain_entry_and_is_not_stamped_draft`, by
+    /// superseding a real report and re-rendering it through
+    /// [`render_report`]. Round 3 made `render_report` REFUSE a non-current
+    /// report — the right answer for a route that hands out documents, but
+    /// it would have taken this invariant down with it. So the invariant
+    /// moves here, to the layer it is actually about: `render_canonical`
+    /// normalises `state` and `superseded_by_qcr_id` away, so the bytes (and
+    /// therefore the pinned SHA) are identical across the transition, and a
+    /// correctly issued report never reports itself as tampered.
+    ///
+    /// The two claims are independent and both matter: the CURRENCY check
+    /// decides whether the bytes may be served, and the BYTE-FORM check
+    /// decides whether the pin still verifies. Pinning them separately is
+    /// what stops a future edit from "fixing" one by weakening the other.
+    #[test]
+    fn render_canonical_is_byte_identical_across_a_supersede() {
+        let lines = vec![sample_line()];
+
+        let mut issued = sample_report();
+        issued.state = aberp_qa::QcReportState::Issued;
+        issued.superseded_by_qcr_id = None;
+        issued.dsp_id = None;
+        let before = render_canonical(&issued, &lines).expect("render the issued report");
+
+        // The two transitions that move `state` off `Issued`, plus the
+        // `dsp_id` binding that `mark_shipped` performs after issuance.
+        for (state, superseded_by) in [
+            (aberp_qa::QcReportState::Superseded, Some("qcr_Y")),
+            (aberp_qa::QcReportState::Voided, None),
+        ] {
+            let mut moved = issued.clone();
+            moved.state = state;
+            moved.superseded_by_qcr_id = superseded_by.map(str::to_string);
+            moved.dsp_id = Some("dsp_77".into());
+            let after = render_canonical(&moved, &lines).expect("render after the transition");
+            assert_eq!(
+                after, before,
+                "moving state to {state:?} perturbed the hashed byte-form; every \
+                 already-issued report's SHA pin would stop verifying"
+            );
+        }
+
+        // Not vacuous: the fixture really does render something.
+        assert!(
+            before.len() > 512,
+            "the fixture produced {} bytes — too small to be a real document, so \
+             the equality above would prove nothing",
+            before.len()
+        );
     }
 
     /// The canonical form is idempotent — canonicalising an already-issued,

@@ -884,23 +884,62 @@ the round-2 fix. Each is scope, not an oversight.
    decides which reports belong in an invoice-scoped slice.
    *Size:* small-to-medium, and it is the last thing between AC10 and a
    genuinely auditor-ready export.
-2. **`plan_drift` cannot see a characteristic PROMOTED from optional to
-   required.** The gate blocks when a required characteristic is *added*
-   after a releasing report froze, by comparing name sets. It cannot see a
-   promotion, because `qc_report_lines` does not persist `required` —
-   `parse_line_row` reconstructs it as `true` — so the frozen row cannot
-   say whether the characteristic counted toward accountability when it
-   froze. Needs an additive `is_required` column on `qc_report_lines` plus
-   the freeze-side write.
-   *Size:* small.
-3. **A VOID-stamped rendering for auditors.** A voided report is currently
+2. ~~**`plan_drift` cannot see a characteristic PROMOTED from optional to
+   required.**~~ **CLOSED in round 3, and the round-2 reasoning above it
+   was wrong.** The note claimed detection needed an additive `is_required`
+   column on `qc_report_lines`. It does not. `required` is indeed not
+   persisted (`parse_line_row` reconstructs it as `true`), but
+   `accountability` *is* persisted and read back — and an unmeasured
+   characteristic's frozen row is exactly an
+   `Accountability::NotMeasured` accountability row. Excluding those rows
+   from the gate's `covered` set closes the promotion case with no schema
+   change: a promoted-but-never-measured characteristic is required today
+   and not covered by the report, so `plan_drift` fires. Pinned by
+   `an_optional_characteristic_promoted_to_required_re_blocks_the_shipment`
+   and — for the PER-UNIT form of the same bypass, which the one-unit test
+   cannot separate —
+   `a_characteristic_measured_on_only_some_units_is_not_covered_for_the_rest`.
+3. **A VOID/SUPERSEDED-stamped rendering for auditors.** A report that is
+   no longer current — `Voided`, or `Superseded` by a later one — is
    refused with a 409 rather than rendered, because `state` cannot appear
-   in the hashed bytes and a voided report would otherwise look exactly
-   like a valid certificate. A VOID-stamped copy is strictly better, but
-   the stamp has to be drawn OUTSIDE the byte-form the SHA is taken over —
-   a renderer change, not a route one.
+   in the hashed bytes and it would otherwise look exactly like a valid
+   certificate. Round 3 extended the refusal from `Voided` to `Superseded`
+   on the same reasoning, and the superseded case is the sharper one: the
+   report a supersede replaces is typically the flattering early `accept`
+   that a later `reject` corrected, which is precisely the document the
+   shipment gate refuses to ship on. A stamped copy is strictly better than
+   a refusal for both, but the stamp has to be drawn OUTSIDE the byte-form
+   the SHA is taken over — a renderer change, not a route one. Until then
+   the full record stays available on `GET /api/qc-reports/:id` and in the
+   chain; only the *unmarked PDF* is withheld.
    *Size:* small, but it needs a design decision on how the stamp and the
    hash coexist.
+4. **An unparseable stored timestamp fails the operation loud, rather than
+   being repaired.** Round 3 found the same string-vs-instant ordering
+   defect in two places — the gate's report recency
+   (`report_recency_key`) and the report's own measurement selection
+   (`latest_measurement`) — and fixed both to order by the parsed instant.
+   An `Option<OffsetDateTime>` sorts `None` lowest, which would silently
+   DEMOTE a row nothing can date; since demoting the `reject` is how a bad
+   part ships, both call sites now refuse instead
+   (`refuse_unparseable_report_timestamps` at the gate,
+   a `QcError::Validation` in `freeze_report`). Both are unreachable by
+   construction today — every such timestamp is minted through one
+   `rfc3339` helper — so the refusal is a backstop against rows written
+   outside the application. What is *not* built is any operator-facing way
+   to see or repair such a row: today it is a 409/500 an operator must
+   escalate.
+   *Size:* small; it is a diagnostic surface, not a mechanism.
+5. **The QC-report LIST routes order by the `created_at` string.**
+   `list_reports_for_wo` / `list_reports_for_dispatch` carry
+   `ORDER BY created_at`, which inverts on exactly the trimmed-fraction
+   pairs round 3 fixed in the two places that DECIDE. Deliberately left:
+   the shipment gate re-sorts in-process (so it does not depend on another
+   crate's `ORDER BY`), and issuance and void address a report by id — so
+   this is a display order only, and two reports frozen inside the same
+   second may list the wrong way round. Worth fixing when the list gets a
+   real operator surface.
+   *Size:* small.
 
 ---
 

@@ -168,6 +168,34 @@ fn seed_plan(conn: &Connection, feature: &str, number: &str, required: bool) -> 
     .plan_id
 }
 
+/// Promote an existing plan row from optional to required, leaving every
+/// other field as `seed_plan` wrote it. This is what
+/// `PUT /api/inspection-plans/:id` does.
+fn promote_plan_to_required(conn: &Connection, plan_id: &str, feature: &str, number: &str) {
+    aberp_qa::update_inspection_plan(
+        conn,
+        T,
+        plan_id,
+        NewInspectionPlan {
+            product_id: "prd_bracket".into(),
+            feature_name: feature.into(),
+            nominal_value: 25.0,
+            upper_tol: 0.05,
+            lower_tol: -0.05,
+            units: "mm".into(),
+            optional_probe_cycle_id: None,
+            enabled: true,
+            characteristic_number: Some(number.into()),
+            characteristic_designator: None,
+            characteristic_type: Some(CharacteristicType::Dimensional),
+            inspection_method: Some(InspectionMethod::OnMachineProbe),
+            sheet_zone: None,
+            is_required: Some(true),
+        },
+    )
+    .unwrap();
+}
+
 fn measure(conn: &mut Connection, plan_id: &str, part_uid: &str, actual: f64) {
     let m = meta();
     let plan = aberp_qa::get_inspection_plan(conn, T, plan_id)
@@ -240,6 +268,18 @@ fn measure_at(
 
 /// Freeze + issue a report for `wo-def`, returning `(qcr_id, disposition)`.
 fn issue_report_for(conn: &mut Connection, units: &[ReportUnit]) -> (String, Disposition) {
+    issue_report_for_at(conn, units, now())
+}
+
+/// `issue_report_for`, but with the report's `created_at` under the test's
+/// control. `freeze_report` formats the supplied instant through `time`'s
+/// `Rfc3339`, so this is what lets a test produce the sub-second shapes the
+/// recency ordering has to survive.
+fn issue_report_for_at(
+    conn: &mut Connection,
+    units: &[ReportUnit],
+    at: OffsetDateTime,
+) -> (String, Disposition) {
     let m = meta();
     let plans = list_inspection_plans(conn, T, Some("prd_bracket"), false).unwrap();
     let inspections = list_inspections_for_wo(conn, T, "wo-def").unwrap();
@@ -261,7 +301,7 @@ fn issue_report_for(conn: &mut Connection, units: &[ReportUnit]) -> (String, Dis
             customer: ReportCustomer::default(),
             created_by: "ervin",
         },
-        now(),
+        at,
     )
     .unwrap();
     let issued = issue_report(
@@ -271,7 +311,7 @@ fn issue_report_for(conn: &mut Connection, units: &[ReportUnit]) -> (String, Dis
         "deadbeef",
         "aberp-qc-pdf@0.0.0",
         "ervin",
-        now(),
+        at,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -1009,6 +1049,373 @@ fn a_superseded_rejection_does_not_block_the_corrected_report() {
     );
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// ROUND 3 — the two bypasses that still let a bad part ship.
+// ═════════════════════════════════════════════════════════════════════
+
+/// **B1-a — an OPTIONAL characteristic PROMOTED to required after issuance
+/// re-blocks the shipment.**
+///
+/// The bypass: `freeze_report` writes a line for EVERY enabled plan,
+/// optional ones included. An unmeasured optional characteristic gets an
+/// `Accountability::NotMeasured` accountability row — printed with a blank
+/// actual, deliberately never omitted — and, being optional, it does not
+/// count as `unaccounted`, so the report still issues as `accept`. The
+/// drift check then compared a bare name-SET and saw that blank row as
+/// coverage. Promote the characteristic to required via
+/// `PUT /api/inspection-plans/:id` and the gate passed a shipment over a
+/// required characteristic that was never measured at all.
+///
+/// The fix excludes `NotMeasured` lines from `covered`. Note what makes
+/// this test sharp: the promoted characteristic is NEVER measured, so
+/// nothing but the accountability row can make it look covered — the
+/// assertion cannot pass because a measurement happened to exist.
+///
+/// Its sibling `a_required_characteristic_added_after_issuance_re_blocks_the_shipment`
+/// covers the ADDED case; this one covers the PROMOTED case, which is the
+/// one the round-2 review recorded as out of reach.
+#[test]
+fn an_optional_characteristic_promoted_to_required_re_blocks_the_shipment() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+
+    // One required characteristic, measured in tolerance …
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    measure_at(&mut conn, &p1, &units[0].part_uid, 25.0, now());
+    // … and one OPTIONAL characteristic, never measured.
+    let p2 = seed_plan(&conn, "Face Z", "2", false);
+
+    let (qcr_id, d1) = issue_report_for(&mut conn, &units);
+    assert_eq!(
+        d1,
+        Disposition::Accept,
+        "precondition: an unmeasured OPTIONAL characteristic does not make the \
+         report incomplete — that is what makes this the promotion case and not \
+         the incomplete case"
+    );
+
+    // The accountability row really is there and really is unmeasured —
+    // otherwise the bypass this test pins would not exist to close.
+    let lines = aberp_qa::list_report_lines(&conn, T, &qcr_id).unwrap();
+    let face_z = lines
+        .iter()
+        .find(|l| l.characteristic_name == "Face Z")
+        .expect("the optional characteristic got a frozen line");
+    assert_eq!(
+        face_z.accountability,
+        aberp_qa::Accountability::NotMeasured,
+        "precondition: the optional line is an unmeasured accountability row"
+    );
+
+    // Positive control: as things stand, it ships.
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the report releases while Face Z is optional"
+    );
+
+    // Engineering PROMOTES the optional characteristic to required, after
+    // the report froze. Nothing else about the plan changes.
+    promote_plan_to_required(&conn, &p2, "Face Z", "2");
+    let promoted = aberp_qa::get_inspection_plan(&conn, T, &p2)
+        .unwrap()
+        .unwrap();
+    assert!(
+        promoted.counts_toward_accountability(),
+        "precondition: the promotion really did take"
+    );
+
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason, qcr_id: id, ..
+        } => {
+            assert_eq!(
+                reason,
+                QcReportBlockReason::PlanDrift,
+                "a part with an unmeasured REQUIRED characteristic must not ship"
+            );
+            assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
+        }
+        other => panic!("an unmeasured required characteristic shipped: {other:?}"),
+    }
+
+    // The counter-direction, so the fix is not just "block more": measure
+    // the now-required characteristic, issue a fresh report, and the
+    // shipment releases again. Without this, narrowing `covered` all the
+    // way to the empty set would satisfy the assertion above.
+    measure_at(&mut conn, &p2, &units[0].part_uid, 25.0, now());
+    let (qcr2, d2) = issue_report_for(&mut conn, &units);
+    assert_eq!(d2, Disposition::Accept, "both characteristics now measured");
+    assert_ne!(qcr2, qcr_id);
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "a MEASURED characteristic stays covered — the block is caused by the \
+         missing measurement, not by the gate simply refusing everything"
+    );
+}
+
+/// **B1-a, per unit — a characteristic measured on SOME units is not
+/// covered for the others.**
+///
+/// Found by the round-3 self-adversarial, on the fix as first written.
+/// Excluding only the `NotMeasured` LINES is not enough, because lines are
+/// PER UNIT: measure an optional characteristic on unit 1, leave unit 2
+/// blank, and unit 1's surviving `Measured` line re-adds the name to
+/// `covered`. Promote the characteristic and unit 2 ships with no
+/// measurement for something now required — the same bypass, one unit over.
+///
+/// So a name is covered only when NO line for it is `NotMeasured`.
+///
+/// The sibling `an_optional_characteristic_promoted_to_required_re_blocks_the_shipment`
+/// uses ONE unit, where the two rules coincide; only a second unit
+/// separates them.
+#[test]
+fn a_characteristic_measured_on_only_some_units_is_not_covered_for_the_rest() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "2");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 2);
+
+    // One required characteristic, measured on BOTH units.
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    measure_at(&mut conn, &p1, &units[0].part_uid, 25.0, now());
+    measure_at(&mut conn, &p1, &units[1].part_uid, 25.0, now());
+
+    // One OPTIONAL characteristic, measured on unit 1 only.
+    let p2 = seed_plan(&conn, "Face Z", "2", false);
+    measure_at(&mut conn, &p2, &units[0].part_uid, 25.0, now());
+
+    let (qcr_id, d1) = issue_report_for(&mut conn, &units);
+    assert_eq!(
+        d1,
+        Disposition::Accept,
+        "precondition: an optional gap does not make the report incomplete"
+    );
+
+    // The shape that makes this test sharp: Face Z has BOTH a Measured and
+    // a NotMeasured line. A rule that only drops the NotMeasured lines would
+    // keep the name via the Measured one.
+    let lines = aberp_qa::list_report_lines(&conn, T, &qcr_id).unwrap();
+    let face_z: Vec<_> = lines
+        .iter()
+        .filter(|l| l.characteristic_name == "Face Z")
+        .collect();
+    assert_eq!(face_z.len(), 2, "one Face Z line per unit");
+    assert!(
+        face_z
+            .iter()
+            .any(|l| l.accountability == aberp_qa::Accountability::Measured)
+            && face_z
+                .iter()
+                .any(|l| l.accountability == aberp_qa::Accountability::NotMeasured),
+        "precondition: Face Z is measured on one unit and blank on the other"
+    );
+
+    // Positive control: it ships while Face Z is optional.
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the report releases while Face Z is optional"
+    );
+
+    promote_plan_to_required(&conn, &p2, "Face Z", "2");
+
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason, qcr_id: id, ..
+        } => {
+            assert_eq!(
+                reason,
+                QcReportBlockReason::PlanDrift,
+                "unit 2 has no measurement for a now-required characteristic"
+            );
+            assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
+        }
+        other => panic!("a partially measured characteristic released a shipment: {other:?}"),
+    }
+
+    // Counter-direction: measure the second unit, re-issue, and it releases.
+    measure_at(&mut conn, &p2, &units[1].part_uid, 25.0, now());
+    let (_, d2) = issue_report_for(&mut conn, &units);
+    assert_eq!(d2, Disposition::Accept);
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "with every unit measured the characteristic is covered again — the block \\
+         is caused by the missing unit, not by the gate refusing everything"
+    );
+}
+
+/// **B1-b — a later `reject` outranks an earlier `accept` even when the
+/// two timestamps differ only in a trimmed sub-second fraction.**
+///
+/// `created_at` is written by `time`'s `Rfc3339` formatter, which emits
+/// sub-second digits only when non-zero and trims trailing zeros. So a
+/// report frozen at `…12:00:00Z` and one frozen half a second LATER at
+/// `…12:00:00.5Z` are stored with the first being a strict PREFIX of the
+/// second, and a byte compare ranks `Z` (0x5A) above `.` (0x2E) — putting
+/// the EARLIER report on top. The `report_number` tiebreak could not catch
+/// it: that term is only consulted when the first terms compare EQUAL, and
+/// these compare unequal-and-backwards.
+///
+/// The consequence is exactly what round 2 fixed and this re-opened: the
+/// stale `accept` becomes `current`, and a part that FAILED final
+/// inspection ships. The fix orders by the parsed instant.
+///
+/// `a_stale_accept_does_not_outrank_the_current_reject` is the same claim
+/// with EQUAL timestamps (where `report_number` decides); this one is the
+/// unequal-but-inverted case, which that test cannot reach.
+#[test]
+fn a_later_reject_outranks_an_earlier_accept_across_a_trimmed_subsecond() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+
+    // Whole second — formats as `…12:00:00Z`, no fraction at all.
+    let t_accept = now();
+    measure_at(&mut conn, &p1, &units[0].part_uid, 25.0, t_accept);
+    let (accept_id, d1) = issue_report_for_at(&mut conn, &units, t_accept);
+    assert_eq!(
+        d1,
+        Disposition::Accept,
+        "precondition: the early report releases"
+    );
+
+    // Half a second LATER — formats as `…12:00:00.5Z`.
+    let t_reject = t_accept + time::Duration::milliseconds(500);
+    measure_at(&mut conn, &p1, &units[0].part_uid, 99.0, t_reject);
+    let (reject_id, d2) = issue_report_for_at(&mut conn, &units, t_reject);
+    assert_eq!(d2, Disposition::Reject, "precondition: the part failed");
+    assert_ne!(accept_id, reject_id);
+
+    // The trap, asserted directly: the stored strings really do invert
+    // under a byte compare. If `time` ever stops trimming, this assertion
+    // fails and tells the next reader the hazard is gone rather than
+    // leaving a test that silently proves nothing.
+    let a = aberp_qa::get_report(&conn, T, &accept_id).unwrap().unwrap();
+    let r = aberp_qa::get_report(&conn, T, &reject_id).unwrap().unwrap();
+    assert_eq!(a.created_at, "2026-08-23T12:00:00Z");
+    assert_eq!(r.created_at, "2026-08-23T12:00:00.5Z");
+    assert!(
+        a.created_at.as_str() > r.created_at.as_str(),
+        "precondition: as STRINGS the earlier accept sorts above the later reject \
+         ({} vs {}) — that inversion is the bug",
+        a.created_at,
+        r.created_at
+    );
+
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason,
+            qcr_id,
+            disposition,
+            ..
+        } => {
+            assert_eq!(
+                reason,
+                QcReportBlockReason::Rejected,
+                "the part failed final inspection half a second after the accept"
+            );
+            assert_eq!(
+                qcr_id.as_deref(),
+                Some(reject_id.as_str()),
+                "the gate must name the LATER report, not the flattering one"
+            );
+            assert_eq!(disposition.as_deref(), Some("reject"));
+        }
+        other => panic!("a rejected part shipped on a trimmed sub-second: {other:?}"),
+    }
+}
+
+/// **The gate REFUSES rather than ranking a report it cannot date.**
+///
+/// The recency key parses `created_at` into an instant, and an unparseable
+/// one yields `None` — which `Option`'s ordering sorts BELOW every `Some`.
+/// Left alone that silently demotes the offending report, and demoting the
+/// `reject` is exactly how a bad part ships. So the gate refuses the whole
+/// decision instead.
+///
+/// The row is corrupted with direct SQL because nothing in the application
+/// can produce it: every `created_at` is minted through `aberp_qa`'s one
+/// `rfc3339` helper. That is the point — the refusal is a backstop against
+/// a row written outside the application, and a backstop nobody tests is a
+/// backstop that quietly stops working.
+#[test]
+fn the_gate_refuses_a_report_it_cannot_date_rather_than_demoting_it() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    measure_at(&mut conn, &p1, &units[0].part_uid, 25.0, now());
+    let (qcr_id, d1) = issue_report_for(&mut conn, &units);
+    assert_eq!(d1, Disposition::Accept);
+
+    // Positive control: it ships while the timestamp is readable.
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the report releases before the row is corrupted"
+    );
+
+    conn.execute(
+        "UPDATE qc_reports SET created_at = 'not-a-timestamp'
+         WHERE tenant_id = ?1 AND qcr_id = ?2",
+        params![T, &qcr_id],
+    )
+    .unwrap();
+
+    let d = dispatch(&conn, "dsp-def");
+    let err = resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON)
+        .expect_err("the gate must refuse, not decide, on an unreadable timestamp");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&qcr_id) && msg.contains("created_at"),
+        "the refusal names the report and the field: {msg}"
+    );
+}
+
 /// **A required characteristic ADDED after an accept re-blocks the
 /// shipment.** The releasing report enumerated two characteristics; the
 /// plan now demands three, so its release covers evidence that was never
@@ -1236,14 +1643,122 @@ fn a_voided_report_refuses_to_render() {
 
     let conn = handle.read().unwrap();
     match aberp::qc_report::render_report(&conn, T, &qcr_id) {
-        Err(aberp::qc_report::QcReportError::Voided(msg)) => {
+        Err(aberp::qc_report::QcReportError::NotCurrent(msg)) => {
             assert!(msg.contains(&qcr_id), "the refusal names the report: {msg}");
+            assert!(
+                msg.contains("voided"),
+                "the refusal says WHICH way it stopped being current: {msg}"
+            );
         }
         Ok((_, bytes, _, _)) => panic!(
             "a voided report rendered {} bytes of valid-looking certificate",
             bytes.len()
         ),
-        Err(other) => panic!("expected Voided, got {other:?}"),
+        Err(other) => panic!("expected NotCurrent, got {other:?}"),
+    }
+}
+
+/// **A SUPERSEDED report is refused too, on the same footing as a void.**
+///
+/// Round 3's residual, decided conservatively. `void_report` picks
+/// `Superseded` over `Voided` purely from whether the caller supplied a
+/// `superseded_by_qcr_id` — same route, same meaning to a reader: this is
+/// not the document that stands. And because the page cannot carry `state`,
+/// the superseded report re-rendered as a clean, unmarked certificate.
+///
+/// It is the sharper hazard of the two. The report a supersede replaces is
+/// typically the FLATTERING one — the early `accept` that a later `reject`
+/// corrected — which is exactly the pair
+/// `a_stale_accept_does_not_outrank_the_current_reject` stops the gate from
+/// shipping on. Serving its PDF handed an auditor the very document the
+/// gate refused to ship on.
+///
+/// The §D7 byte-form invariant this test used to also carry — that a state
+/// transition perturbs no byte — is NOT dropped; it moved to
+/// `qc_report::tests::render_canonical_is_byte_identical_across_a_supersede`,
+/// which asserts it at the layer it is about instead of through the route
+/// that now refuses.
+#[test]
+fn a_superseded_report_refuses_to_render() {
+    if !aberp::build_profile::qc_reporting_allowed() {
+        return;
+    }
+    let db = setup();
+    let (handle, _tenant, _partner_id, qcr_id, _pinned) = issue_one_through_the_app(&db);
+
+    // Positive control: it renders while it is the current document.
+    {
+        let conn = handle.read().unwrap();
+        assert!(aberp::qc_report::render_report(&conn, T, &qcr_id).is_ok());
+    }
+
+    {
+        let mut guard = handle.write().unwrap();
+        let m = meta();
+        let tx = guard.transaction().unwrap();
+        aberp_qa::void_report(&tx, &ctx(&m), &qcr_id, "reworked", Some("qcr_later")).unwrap();
+        tx.commit().unwrap();
+    }
+
+    let conn = handle.read().unwrap();
+    // Precondition: the row really moved to `Superseded`, not `Voided` —
+    // otherwise this test would be re-asserting the void case.
+    assert_eq!(
+        aberp_qa::get_report(&conn, T, &qcr_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        aberp_qa::QcReportState::Superseded,
+        "precondition: the supersede really did move the state"
+    );
+    match aberp::qc_report::render_report(&conn, T, &qcr_id) {
+        Err(aberp::qc_report::QcReportError::NotCurrent(msg)) => {
+            assert!(msg.contains(&qcr_id), "the refusal names the report: {msg}");
+            assert!(
+                msg.contains("superseded") && msg.contains("qcr_later"),
+                "the refusal says it was superseded and by which report: {msg}"
+            );
+        }
+        Ok((_, bytes, _, _)) => panic!(
+            "a superseded report rendered {} bytes of clean, unmarked certificate",
+            bytes.len()
+        ),
+        Err(other) => panic!("expected NotCurrent, got {other:?}"),
+    }
+
+    // The belt on the braces: `state` and `superseded_by_qcr_id` are written
+    // by ONE statement, so a row where `state` says `issued` while a
+    // replacement id is present cannot come from the application. If one ever
+    // does, the pointer to the replacement is the honest signal — the refusal
+    // must still fire on it rather than trust the stale `state`.
+    drop(conn);
+    {
+        let guard = handle.write().unwrap();
+        guard
+            .execute(
+                "UPDATE qc_reports SET state = 'issued'
+                 WHERE tenant_id = ?1 AND qcr_id = ?2",
+                params![T, &qcr_id],
+            )
+            .unwrap();
+    }
+    let conn = handle.read().unwrap();
+    let row = aberp_qa::get_report(&conn, T, &qcr_id).unwrap().unwrap();
+    assert_eq!(
+        row.state,
+        aberp_qa::QcReportState::Issued,
+        "precondition: the row now disagrees with itself"
+    );
+    assert_eq!(row.superseded_by_qcr_id.as_deref(), Some("qcr_later"));
+    match aberp::qc_report::render_report(&conn, T, &qcr_id) {
+        Err(aberp::qc_report::QcReportError::NotCurrent(msg)) => {
+            assert!(msg.contains("superseded"), "{msg}");
+        }
+        Ok((_, bytes, _, _)) => panic!(
+            "a row naming its own replacement rendered {} bytes as a current document",
+            bytes.len()
+        ),
+        Err(other) => panic!("expected NotCurrent, got {other:?}"),
     }
 }
 
@@ -1285,28 +1800,16 @@ fn an_issued_pdf_cites_its_chain_entry_and_is_not_stamped_draft() {
         "`state` is post-issuance-mutable and must not be on the page"
     );
 
-    // And the sharp form of the same claim: SUPERSEDING the report changes
-    // `state` on the row and must not change one byte of the document.
-    {
-        drop(conn);
-        let mut guard = handle.write().unwrap();
-        let m = meta();
-        let tx = guard.transaction().unwrap();
-        aberp_qa::void_report(&tx, &ctx(&m), &qcr_id, "reworked", Some("qcr_later")).unwrap();
-        tx.commit().unwrap();
-    }
-    let conn = handle.read().unwrap();
-    let (report, after, _, matches) = aberp::qc_report::render_report(&conn, T, &qcr_id).unwrap();
-    assert_eq!(
-        report.state,
-        aberp_qa::QcReportState::Superseded,
-        "precondition: the supersede really did mutate the row"
-    );
-    assert_eq!(
-        after, bytes,
-        "a state change must not perturb the hashed byte-form"
-    );
-    assert_eq!(matches, Some(true));
+    // The `state`-off-the-page claim above is what makes the round-3
+    // refusal necessary rather than optional: with no state on the page,
+    // a superseded report is indistinguishable from a current one, so the
+    // route has to refuse it. That refusal is pinned by
+    // `a_superseded_report_refuses_to_render`; the §D7 byte-form invariant
+    // it displaces — a state transition perturbs no byte — is pinned by
+    // `qc_report::tests::render_canonical_is_byte_identical_across_a_supersede`.
+    // Neither claim is dropped; they are asserted at the layer each is about.
+    drop(conn);
+    let _ = bytes;
 }
 
 /// The other direction: a DRAFT preview says so. Without this, dropping

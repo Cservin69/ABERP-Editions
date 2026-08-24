@@ -276,6 +276,14 @@ fn characteristic_sort_key(plan: &InspectionPlan) -> (u8, i64, String, String, S
     }
 }
 
+/// Parse a stored measurement instant. The ONE parse of
+/// `QcInspection::measured_at_utc`, so [`latest_measurement`]'s ordering and
+/// [`freeze_report`]'s refusal can never disagree about which strings are
+/// readable.
+fn measured_at_instant(i: &QcInspection) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(&i.measured_at_utc, &Rfc3339).ok()
+}
+
 /// Pick the measurement that represents a (unit, characteristic) pair.
 ///
 /// **The latest measurement wins**, by `measured_at_utc` then `qci_id`.
@@ -287,6 +295,29 @@ fn characteristic_sort_key(plan: &InspectionPlan) -> (u8, i64, String, String, S
 /// chain when it happened, so "re-measure until it passes" remains visible
 /// to an auditor walking the ledger even though the report shows the
 /// accepted value.
+///
+/// **Ordered by the parsed INSTANT, not by the stored string** (round 3).
+/// `measured_at_utc` is written by `time`'s `Rfc3339` formatter, which emits
+/// sub-second digits only when non-zero and trims trailing zeros. So a
+/// measurement at `…12:00:00Z` and a RE-measurement half a second later at
+/// `…12:00:00.5Z` are stored with the first being a strict PREFIX of the
+/// second, and a byte compare ranks `Z` (0x5A) above `.` (0x2E) — putting
+/// the EARLIER measurement on top. Every strict-prefix pair inverts the same
+/// way, and the `qci_id` tiebreak cannot catch it: that term is only
+/// consulted when the first terms compare EQUAL, and these compare
+/// unequal-and-backwards.
+///
+/// The consequence is the worst one this module has: a part re-measured
+/// out-of-tolerance within the same second is REPORTED on its earlier
+/// passing measurement, so the report is computed `accept` and the shipment
+/// gate — which reads the report, not the measurements — has nothing to
+/// refuse on. This is the same defect class as the report-recency ordering
+/// in `resolve_qc_report_gate`, one layer down.
+///
+/// An unparseable `measured_at_utc` yields `None`, which `Option`'s ordering
+/// puts below every `Some`. That case never decides anything in practice:
+/// [`freeze_report`] refuses the whole freeze when any supplied measurement
+/// carries a timestamp it cannot read, rather than silently demoting it.
 fn latest_measurement<'a>(
     inspections: &'a [QcInspection],
     plan_id: &str,
@@ -303,8 +334,8 @@ fn latest_measurement<'a>(
             lot_level || i.linked_part_uid.as_deref() == unit_uid
         })
         .max_by(|a, b| {
-            a.measured_at_utc
-                .cmp(&b.measured_at_utc)
+            measured_at_instant(a)
+                .cmp(&measured_at_instant(b))
                 .then_with(|| a.qci_id.cmp(&b.qci_id))
         })
 }
@@ -637,6 +668,25 @@ pub fn freeze_report(
             "template {} does not produce a {} report",
             inputs.template.as_str(),
             inputs.report_kind.as_str()
+        )));
+    }
+
+    // A measurement nothing can date cannot be ranked against its siblings,
+    // and freezing a report on an arbitrary pick is worse than refusing.
+    // `record_inspection` formats every `measured_at_utc` through `rfc3339`,
+    // so an unreadable one means the row was written outside the
+    // application — exactly the case where guessing is wrong. This is the
+    // refusal that keeps `latest_measurement`'s `None` arm from ever
+    // deciding which measurement represents a characteristic.
+    if let Some(bad) = inputs
+        .inspections
+        .iter()
+        .find(|i| measured_at_instant(i).is_none())
+    {
+        return Err(QcError::Validation(format!(
+            "inspection {} has an unparseable measured_at_utc ({:?}); refusing to \
+             freeze a report that cannot order its own measurements",
+            bad.qci_id, bad.measured_at_utc
         )));
     }
 
@@ -1715,6 +1765,97 @@ mod tests {
         let lines = build_report_lines(&plans, &inspections, &[unit("SN-001", "uid1")]);
         assert_eq!(lines[0].accountability, Accountability::NotMeasured);
         assert_eq!(summarise(&lines).unaccounted, 1);
+    }
+
+    /// **A re-measurement half a second later still wins** — the ordering
+    /// is over the parsed instant, not the stored string.
+    ///
+    /// `measured_at_utc` is `time`-formatted Rfc3339, which trims sub-second
+    /// zeros, so `…10:00:00Z` and `…10:00:00.5Z` are a strict-prefix pair
+    /// and a byte compare ranks the EARLIER one higher (`Z` 0x5A > `.`
+    /// 0x2E). The direction that matters is this one: the later measurement
+    /// FAILS, so a string ordering reports the part on its earlier passing
+    /// value and the report computes `accept` for a part that is out of
+    /// tolerance. The shipment gate reads the report, not the measurements,
+    /// so it has nothing left to refuse on.
+    ///
+    /// The sibling above uses timestamps four hours apart, where no prefix
+    /// relation exists — which is why it passed throughout.
+    #[test]
+    fn a_sub_second_re_measurement_still_represents_the_characteristic() {
+        // The trap, asserted directly: as STRINGS the earlier one sorts
+        // higher. If `time` ever stops trimming, this fails and tells the
+        // next reader the hazard is gone rather than leaving a test that
+        // silently proves nothing.
+        assert!(
+            "2026-08-02T10:00:00Z" > "2026-08-02T10:00:00.5Z",
+            "precondition: the trimmed-fraction inversion is what this pins"
+        );
+
+        let plans = vec![plan("p1", "Bore D", Some("1"), Some(true))];
+        let inspections = vec![
+            measurement(
+                "q1",
+                "p1",
+                Some("uid1"),
+                25.01,
+                Verdict::Pass,
+                "2026-08-02T10:00:00Z",
+            ),
+            measurement(
+                "q2",
+                "p1",
+                Some("uid1"),
+                25.9,
+                Verdict::Major,
+                "2026-08-02T10:00:00.5Z",
+            ),
+        ];
+        let lines = build_report_lines(&plans, &inspections, &[unit("SN-001", "uid1")]);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].qci_id.as_deref(),
+            Some("q2"),
+            "the LATER measurement represents the characteristic"
+        );
+        assert_eq!(lines[0].verdict, Some(Verdict::Major));
+        assert_eq!(
+            compute_disposition(summarise(&lines), false),
+            Disposition::Reject,
+            "a part that failed its re-measurement must not compute as accept"
+        );
+
+        // The tiebreak, in the direction that matters: two measurements
+        // recorded at the SAME instant are ordered by `qci_id`, later wins.
+        //
+        // Note the ORDER of the vec. `Iterator::max_by` returns the LAST of
+        // several equal maxima, so listing `q2` second would make the
+        // assertion pass with the tiebreak DELETED — a vacuous test. Listing
+        // `q2` first means only the `qci_id` comparison can select it.
+        let tied = vec![
+            measurement(
+                "q2",
+                "p1",
+                Some("uid1"),
+                25.9,
+                Verdict::Major,
+                "2026-08-02T10:00:00Z",
+            ),
+            measurement(
+                "q1",
+                "p1",
+                Some("uid1"),
+                25.01,
+                Verdict::Pass,
+                "2026-08-02T10:00:00Z",
+            ),
+        ];
+        let tied_lines = build_report_lines(&plans, &tied, &[unit("SN-001", "uid1")]);
+        assert_eq!(
+            tied_lines[0].qci_id.as_deref(),
+            Some("q2"),
+            "an equal-instant tie is broken on qci_id, later wins"
+        );
     }
 
     /// The LATEST measurement wins — the rework path (measure → fail →
