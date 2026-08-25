@@ -850,3 +850,85 @@ fn a_duplicate_seq_cannot_offset_a_hole_into_agreement() {
         ),
     }
 }
+
+/// ROUND 6 — and `COUNT(DISTINCT seq)` is not the WHOLE cardinality half either.
+///
+/// Its sibling above pins one direction of the pair: a duplicate that offsets a
+/// hole, which only `COUNT(DISTINCT seq)` can see. This pins the OTHER: a
+/// duplicate with NO hole behind it — `db = [1, 2, 2, 3, 4, 5]` against
+/// `mirror = [1..=5]`. The head hash matches, every seq in `[1..=5]` is present,
+/// and `COUNT(DISTINCT seq)` is exactly 5. Only `COUNT(*)` (6) dissents.
+///
+/// That shape is not hypothetical bookkeeping. `audit_ledger` carries no
+/// `UNIQUE(seq)` (S341 dropped that ART index over duckdb#23046 / S332), so a
+/// second writer that samples a stale head and re-assigns a sequence already
+/// committed by the first lands EXACTLY here: two rows at one seq, no gap. It is
+/// the two-writer seq fork this whole ADR exists for, with the S186 signature.
+/// A reconciler that reports `Unchanged` on it certifies a forked ledger as
+/// healthy — and the divergence is durable in the DB while the mirror shows only
+/// one of the two entries.
+///
+/// Mutation that kills this (MUT-F): drop the `COUNT(*)` half of
+/// `read_db_seq_counts_up_to`'s comparison, keeping `COUNT(DISTINCT seq)`. All
+/// 11 other tests on this branch stay green and the pair reconciles `Unchanged`.
+/// The two aggregates are load-bearing in BOTH directions; neither alone is the
+/// proof.
+#[test]
+fn a_duplicate_seq_with_no_hole_behind_it_is_still_a_fork() {
+    let t = Tmp::new("dupnohole");
+    let db = t.db();
+    let h = handle(&db);
+    for at in ["a", "b", "c", "d", "e"] {
+        beat(&h, at);
+    }
+    let mirror = mirror_path_for(&db);
+    assert_eq!(mirror_seqs(&mirror), vec![1, 2, 3, 4, 5]);
+
+    // A second writer re-assigns a seq the first already committed: an exact
+    // duplicate row at seq 2, and NOTHING deleted. Every entry_hash — head
+    // included — is untouched, and no seq in [1..=5] is missing.
+    {
+        let g = h.write().unwrap();
+        g.execute_batch("INSERT INTO audit_ledger SELECT * FROM audit_ledger WHERE seq = 2;")
+            .unwrap();
+    }
+    drop(h);
+
+    let conn = duckdb::Connection::open(&db).unwrap();
+    let (rows, distinct): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT seq) FROM audit_ledger WHERE seq <= 5",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (rows, distinct),
+        (6, 5),
+        "the shape only matters because COUNT(DISTINCT seq) still reads as 5 — that is why \
+         dropping the COUNT(*) half passes this fork"
+    );
+    assert_eq!(
+        db_rows(&db).iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        vec![1, 2, 2, 3, 4, 5],
+        "one duplicate, no hole"
+    );
+
+    match ensure_consistent_with_db(&conn, &mirror) {
+        Err(AppendError::MirrorDivergedFromDb {
+            first_divergent_seq,
+            ..
+        }) => assert_eq!(
+            first_divergent_seq, 5,
+            "with no hole, every mirror entry finds a hash-matching DB row, so the earliest \
+             disagreement the locator can name is the head itself — the refusal is what \
+             matters, and the operator still gets a seq to start from"
+        ),
+        other => panic!(
+            "a DB carrying two committed rows at seq 2 was reported as {other:?}. Without a \
+             UNIQUE(seq) that is a two-writer sequence fork sitting durably in the ledger, and \
+             COUNT(DISTINCT seq) alone cannot see it — it counts 5 distinct seqs over a \
+             6-row table and calls the pair healthy."
+        ),
+    }
+}

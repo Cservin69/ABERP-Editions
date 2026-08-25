@@ -439,6 +439,18 @@ open(p,"w").write(s)
 PYIN
 expect_fail "$c" "ADR-0098 R7 regression" "CHECK 10L — opener+sync_mirror replanted in change_status is caught"
 
+echo "[CHECK 10L] ROUND 6 — the SAME re-fork spelled with round 5's new name, sync_mirror_lockstep. 10L-a's seam token was name-keyed (a bare sync_mirror( ) and this walked straight through it"
+c="$(fresh)"
+python3 - "$c/apps/aberp/src/incoming_invoices.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+needle='    ensure_schema(&guard).context("ensure ap_invoice schema (status change)")?;'
+assert needle in s, "change_status anchor moved — probe is stale"
+s=s.replace(needle, needle+'\n    let _r6 = Ledger::open(db_path, tenant.clone(), binary_hash); let _m = aberp_audit_ledger::sync_mirror_lockstep(std::path::Path::new("/x")); // round-6 negative probe', 1)
+open(p,"w").write(s)
+PYIN
+expect_fail "$c" "REGREW a direct sync_mirror" "CHECK 10L-a — the sync_mirror_lockstep SPELLING of the re-fork is caught (the seam token matches the sync_mirror PREFIX, not one name)"
+
 echo "[CHECK 10L] a BRAND-NEW runtime fn with opener + sync_mirror (a new fork-capable site) must grow the frozen mirror-fork set — red"
 c="$(fresh)"
 printf '\nfn _r7_new_fork_site() {\n    let _c = duckdb::Connection::open("/x");\n    let _m = _c.map(|c| c.sync_mirror(std::path::Path::new("/y")));\n}\n' >> "$c/apps/aberp/src/quality.rs"
@@ -629,6 +641,11 @@ echo "[CHECK 10P] B4/scope — the same mirror writer planted inside crates/aber
 c="$(fresh)"
 printf 'pub fn _adr0099r2_probe_snapshot_scope(p: &std::path::Path) {\n    let conn = duckdb::Connection::open(p).unwrap();\n    let mp = aberp_audit_ledger::mirror_path_for(p);\n    let _ = aberp_audit_ledger::ensure_consistent_with_db(&conn, &mp);\n}\n' > "$c/crates/aberp-snapshot/src/zz_adr0099r2_probe_scope.rs"
 expect_fail "$c" "NON-SHARED audit writer appeared outside the frozen residual" "CHECK 10P — a non-shared ledger writer inside crates/aberp-snapshot (outside every other check's corpus) is caught"
+
+echo "[CHECK 10P] ROUND 6 — a db.read() clone whose MIRROR write uses round 5's new name, sync_mirror_lockstep. 10P's B4 token was name-keyed, so this second mirror writer produced NO record at all"
+c="$(fresh)"
+printf 'fn _adr0099r6_probe_lockstep_read_clone(db: &aberp_db::HandleArc, p: &std::path::Path) {\n    let conn = db.read().unwrap();\n    let mp = aberp_audit_ledger::mirror_path_for(p);\n    let _ = aberp_audit_ledger::sync_mirror_lockstep(&conn, todo!(), &mp);\n}\n' > "$c/apps/aberp/src/zz_adr0099r6_probe_lockstep.rs"
+expect_fail "$c" "NON-SHARED audit writer appeared outside the frozen residual" "CHECK 10P — the sync_mirror_lockstep SPELLING of a mirror write is a ledger write (B4 stays closed across a rename)"
 
 echo "[CHECK 10P] B2 — a SPLIT fork: the independent opener here, the append one call away behind a &mut Connection parameter (the qc_inspection shape). The taint fixpoint must classify the OPENER's fn."
 c="$(fresh)"

@@ -27,7 +27,7 @@
 //!   **same** instance (shared buffer cache, no second OS open). Nothing else
 //!   opens the live path at runtime.
 //! * **1b — durable, lockstep post-commit.** After every committed write the
-//!   [`WriteGuard`] runs a **lockstep** [`aberp_audit_ledger::sync_mirror`]
+//!   [`WriteGuard`] runs a **lockstep** [`aberp_audit_ledger::sync_mirror_lockstep`]
 //!   (the mirror tracks the DB continuously — this also closes ADR-0098
 //!   Gap 2b at the source) and a **debounced** validated
 //!   [`aberp_snapshot::live_durable_checkpoint`] (≤ 1/min + on idle, D2). The
@@ -94,7 +94,7 @@
 //! Per the ADR-0098 Decision, this crate invents **no** durability primitive.
 //! It reuses, verbatim: [`aberp_snapshot::live_durable_checkpoint`] /
 //! `durable_checkpoint` / `atomic_install` / the verified-good markers /
-//! `ensure_not_prod_path`, and [`aberp_audit_ledger::sync_mirror`] /
+//! `ensure_not_prod_path`, and [`aberp_audit_ledger::sync_mirror_lockstep`] /
 //! [`aberp_audit_ledger::LedgerMeta`]. It only *routes* access through one
 //! instance and *calls* those primitives at the post-commit point.
 
@@ -294,7 +294,7 @@ pub struct Handle {
     /// all nine probes. Recording it is what makes it assertable.
     synced_dirs: Mutex<Vec<PathBuf>>,
     /// Built **once** per process (S341 semantics): tenant + binary hash. The
-    /// lockstep [`aberp_audit_ledger::sync_mirror`] needs it on every commit.
+    /// lockstep [`aberp_audit_ledger::sync_mirror_lockstep`] needs it on every commit.
     meta: LedgerMeta,
     /// Plain-string tenant for [`aberp_snapshot::live_durable_checkpoint`].
     tenant: String,

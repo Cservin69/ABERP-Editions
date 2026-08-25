@@ -759,7 +759,10 @@ R7_FN_AWK
       flag10L "✗ $file::$fn REGREW an independent live-DB opener — the ADR-0098 R7 boot re-fork seam must stay on the shared Handle (db.write()):"
       printf '%s\n' "$opn" | sed 's/^/      /'
     fi
-    mir="$(printf '%s\n' "$body" | grep -nE 'sync_mirror[[:space:]]*\(' || true)"
+    # ROUND 6 — `sync_mirror` PREFIX, matching CHECK 10L-b's r7 awk. Round 5 added
+    # the `sync_mirror_lockstep` spelling; a bare `sync_mirror(` token here would
+    # have let a rogue opener paired with the new name walk through the seam check.
+    mir="$(printf '%s\n' "$body" | grep -nE 'sync_mirror[A-Za-z0-9_]*[[:space:]]*\(' || true)"
     if [[ -n "$mir" ]]; then
       flag10L "✗ $file::$fn REGREW a direct sync_mirror — the post-commit mirror must come from the Handle WriteGuard drop, never a separate opener (ADR-0098 R7):"
       printf '%s\n' "$mir" | sed 's/^/      /'
@@ -1086,6 +1089,14 @@ else
   printf 'fn h(db: &Db) {\n    let mut l = Ledger::open(p, t, b).unwrap();\n    l.sync_mirror(&mp).unwrap();\n}\n' > "$aw_probe"
   awk -f "$aw_scan" "$aw_probe" | grep -q 'INDEP_OPENER' \
     || { flag10P "✗ HARNESS: scanner no longer treats a MIRROR write as a ledger write (blind spot B4 reopened)"; }
+  # ROUND 6 — the mirror token must match EVERY spelling of the entry point, not
+  # just the bare one. Round 5 split the per-commit path into `sync_mirror_lockstep`
+  # and this scanner's narrow `sync_mirror(` token silently stopped matching it, so
+  # aberp-db's WriteGuard::drop produced no record at all and 10P-2 offered its live
+  # residual up for deletion. A rename must never be able to quiet the gate.
+  printf 'fn h(db: &Db) {\n    let mut l = Ledger::open(p, t, b).unwrap();\n    l.sync_mirror_lockstep(&mp).unwrap();\n}\n' > "$aw_probe"
+  awk -f "$aw_scan" "$aw_probe" | grep -q 'INDEP_OPENER' \
+    || { flag10P "✗ HARNESS: scanner no longer matches the sync_mirror_lockstep spelling of the MIRROR write — the mirror token is name-keyed again (round 6; blind spot B4 reopened by rename)"; }
   rm -f "$aw_probe"
 
   # 10P-1 — iterate to a FIXPOINT over the caller-owned-tx set (blind spot B2).

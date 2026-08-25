@@ -124,7 +124,17 @@ function eval_stmt(   src,bind,inh,isw){
   # B4 — the MIRROR half of the ledger. `sync_mirror` is internally atomic under
   # its own flock, but WHICH connection it reads is still a provenance question:
   # a stale non-shared instance mirrors a stale head.
-  if (stmt ~ /sync_mirror[ \t]*\(/ || stmt ~ /ensure_consistent_with_db[ \t]*\(/ \
+  #
+  # ROUND 6 — matched on the `sync_mirror` PREFIX, not a bare `sync_mirror(`.
+  # Round 5 split the per-commit path out under a NEW public name,
+  # `sync_mirror_lockstep`, and the narrow token stopped matching it: the
+  # `aberp-db` WriteGuard `drop` that mirrors every committed write went from
+  # `UNCLASSIFIED` to producing NO record at all, and 10P-2 reported it as a
+  # residual that had "migrated off" — an invitation to delete a live entry
+  # from the frozen manifest. A gate that goes quiet because a function was
+  # RENAMED is the name-keyed-bypass class ADR-0111 R2 was bitten by; the
+  # prefix form is what CHECK 10L-b already uses. Pinned by 10P-0.
+  if (stmt ~ /sync_mirror[A-Za-z0-9_]*[ \t]*\(/ || stmt ~ /ensure_consistent_with_db[ \t]*\(/ \
       || stmt ~ /replay_mirror_delta[ \t]*\(/) isw=1
   if (n_taint>0 && calls_tainted(stmt)) isw=1
   if (stmt ~ /with_ledger[ \t]*\(/) cur_withledger=1

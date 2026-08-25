@@ -548,9 +548,9 @@ fn trim_mirror_to_inner(
 /// as the returned `File`).
 ///
 /// The mirror is half of the audit ledger, and it had TWO writers with no shared
-/// serialization: the lockstep [`sync_mirror`] fired from `aberp_db`'s
+/// serialization: the lockstep [`sync_mirror_lockstep`] fired from `aberp_db`'s
 /// `WriteGuard::drop`, and the reconciler [`ensure_consistent_with_db`] run by
-/// the snapshot daemon on its own connection. `sync_mirror` was internally
+/// the snapshot daemon on its own connection. The lockstep path was internally
 /// atomic (it locks, then reads the head it appends after). The reconciler was
 /// NOT: it sampled the DB head and the mirror head with NO lock held and only
 /// locked inside the append helper, so a lockstep append landing in that window
@@ -1037,7 +1037,7 @@ fn sync_mirror_locked(
 /// What boot-time reconciliation did to make the mirror consistent
 /// with the DB. Session 152b — the mirror is a derivable cache, not a
 /// source of truth: between processes, boot restores the invariant
-/// instead of letting the next post-commit [`sync_mirror`] 500.
+/// instead of letting the next post-commit [`sync_mirror_lockstep`] 500.
 ///
 /// Each variant carries the entry count so the boot log names the
 /// magnitude loudly per CLAUDE.md rule 12.
@@ -1066,7 +1066,7 @@ pub enum RecoveryAction {
 /// Boot-time reconciliation of the mirror against the DB. Session
 /// 152b / Part A. Called once per process at serve boot AFTER
 /// [`crate::ensure_schema`] succeeds, and BEFORE any request can
-/// trigger a per-write [`sync_mirror`].
+/// trigger a per-write [`sync_mirror_lockstep`].
 ///
 /// The DB is the source of truth; the mirror is a derivable cache.
 /// This function restores the between-process invariant
