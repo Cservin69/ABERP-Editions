@@ -25,6 +25,7 @@ jobs:
     name: ADR-0093 DB-isolation cut-gate
     runs-on: ubuntu-latest
     # ADR-0098 R6: raised 5 -> 15. ADR-0105: raised 15 -> 30.
+    # ADR-0099 R6: raised 30 -> 75.
     #
     # The gate itself runs in ~15 s. The cost is the negative-probe harness
     # (tools/cut_gate_negative_probes.sh), which fresh()-copies the whole tree
@@ -49,7 +50,22 @@ jobs:
     # plant applied via overlay) would take this back to a couple of minutes and
     # remove the standing cap risk. Until then, every new probe costs ~17.5 s and
     # the cap must be re-checked when probes are added.
-    timeout-minutes: 30
+    #
+    # ADR-0099 R6 (2026-08-25): the *per-run* cost of the gate itself tripled.
+    # R6 added ~145 gate lines, the 313-line tools/adr0099_audit_writer_scan.awk
+    # behind CHECK 10P, and widened the R6 scan scope to the whole crates/ tree.
+    # The harness multiplies that: probe_count (56) x one_full_gate_run, so a
+    # ~3x per-run regression lands as ~46 min against a 30-min cap. The v0.6.1
+    # cut attempt died exactly there: every probe PASSED and the gate exited 0,
+    # but the job was CANCELLED by the cap — a false red on a REQUIRED check.
+    #
+    # 30 -> 75 is pure timeout accommodation and gates strictly MORE than
+    # before: it is what lets the FULL suite (all 56 probes + every ENFORCE_*
+    # check) actually run to completion. No probe dropped, no gate logic
+    # touched. The real fix — shard the harness across matrix jobs, or cut the
+    # per-probe full-gate cost — is filed in SAW-OFF.md (see "Cut-gate cost");
+    # a timeout must not become the ceiling on how much we are allowed to gate.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v5
 

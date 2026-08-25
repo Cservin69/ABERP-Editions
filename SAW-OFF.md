@@ -364,3 +364,56 @@ baseline commit**. Both refs carry the **identical tree `2d612811…`** (the
 content anchor). So there is **no commit-object discrepancy**: commit =
 `f7519b4…` (baseline) and content = `2d612811…` (baseline) ⇒ **prod untouched**.
 **No action taken on prod** (read-only verification only).
+
+## Cut-gate cost — the harness multiplies the gate (BACKLOG, do not close by dropping probes)
+
+**Filed 2026-08-25, at the v0.6.1 cut.** The required check
+`ADR-0093 DB-isolation cut-gate` was CANCELLED by its `timeout-minutes` cap —
+*not* by a failing probe. Every probe passed and the gate exited 0; the job
+was killed mid-suite and surfaced as a false red on a REQUIRED check. The cap
+was raised 30 → 75 to unblock the cut, which gates strictly **more** than
+before (the full suite now actually runs to completion). That is
+accommodation, not a fix.
+
+**The shape of the cost.** Two multiplying factors:
+
+1. *Per-run cost tripled at ADR-0099 R6.* R6 added ~145 lines of gate script,
+   a new 313-line scanner (`tools/adr0099_audit_writer_scan.awk`) behind
+   CHECK 10P, and widened the R6 scan scope to the whole `crates/` tree. The
+   awk scans now dominate a single gate run.
+2. *The negative-probe harness re-runs the whole gate once per probe.*
+   `tools/cut_gate_negative_probes.sh` is O(probes × (full-tree-copy +
+   full-gate-run)) — 56 probes at the time of filing. So a 3× per-run
+   regression arrives at CI as a 3× regression on the **whole job**: ~46 min
+   against what was a 30-min cap.
+
+**Why this is urgent even though the cap now fits.** The cap is the wrong
+control surface. Left as is, the next scanner or the next batch of probes
+puts us back here, and the cheapest way out of a red will look like dropping
+a probe or narrowing a scan scope. That trade must never be taken: a probe is
+what proves the corresponding check has teeth, and a narrowed scope is a
+silent de-gate. **The timeout must not become the ceiling on how much we are
+allowed to gate.**
+
+**Directions, in preference order — all of them preserve every probe:**
+
+- **Shard the harness across matrix jobs.** The probes are independent by
+  construction (each plants its violation in a throwaway copy). A matrix over
+  N shards divides wall-clock by N with zero change to what is checked. The
+  required-check *context* name must be preserved — either keep one job that
+  depends on the shards, or update branch protection to require all shard
+  contexts, or the required check silently stops existing.
+- **Cut the per-probe fixed cost.** The long-standing v0.2.6 flag above
+  `timeout-minutes` still applies: `fresh()` copies the whole tree per probe.
+  A `git archive` export, a shared read-only tree with the plant applied as an
+  overlay, or one copy reused across probes would take the fixed cost to near
+  zero.
+- **Cut the per-run scan cost.** The R6 scanners walk the whole `crates/`
+  tree per invocation. Scope narrowing is **not** acceptable, but a single
+  pass that feeds several checks, or a file-list computed once and reused, is.
+
+**Acceptance for closing this entry:** the full suite — every probe, every
+`ENFORCE_*` check, at the current or wider scope — completes with margin
+against a cap well under 75 minutes, and `timeout-minutes` is lowered again in
+the same change. Closing it by removing a probe, skipping a check, or
+narrowing a scan scope does not count and should be rejected in review.
