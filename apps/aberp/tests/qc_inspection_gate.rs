@@ -20,11 +20,18 @@ use aberp::part_marking::{
 };
 use aberp::partners::{create_partner, CustomerType, PartnerInputs, PartnerKind};
 use aberp::qc_inspection::{record_manual_inspection, ManualInspectionRequest};
-use aberp::serve::{resolve_open_ncr_gate, OpenNcrGate};
+use aberp::serve::{
+    resolve_open_ncr_gate, resolve_qc_report_gate_with_capability, OpenNcrGate, QcReportGate,
+};
 
-use aberp_audit_ledger::{ensure_schema as audit_ensure_schema, BinaryHash, TenantId};
+use aberp_audit_ledger::{
+    ensure_schema as audit_ensure_schema, Actor, BinaryHash, LedgerMeta, TenantId,
+};
+use aberp_inventory::ActorKind;
 use aberp_qa::{
-    create_inspection_plan, ensure_schema as ensure_qa_schema, NewInspectionPlan, QcSource, Verdict,
+    create_inspection_plan, ensure_schema as ensure_qa_schema, Disposition, FreezeReportInputs,
+    NewInspectionPlan, QcReportKind, QcReportTemplate, QcSource, QcWriteContext, ReportCustomer,
+    ReportTraceability, ReportUnit, Verdict,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -325,4 +332,199 @@ fn calibration_stale_measurement_spawns_no_ncr() {
         resolve_open_ncr_gate(&conn, T, &dispatch(&conn, "dsp-stale")).unwrap(),
         OpenNcrGate::Pass,
     );
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Round 6, B-2 — the COMPOSED release path.
+// ═════════════════════════════════════════════════════════════════════
+
+/// Freeze + issue a QC report for `wo_id` through the SHARED Handle, so it
+/// lands on the same instance `record_manual_inspection` writes through.
+fn issue_report_for(fx: &Fixture, wo_id: &str, units: &[ReportUnit]) -> (String, Disposition) {
+    let mut guard = fx.handle.write().unwrap();
+    let plans = aberp_qa::list_inspection_plans(&guard, T, Some("prd_1"), false).unwrap();
+    let inspections = aberp_qa::list_inspections_for_wo(&guard, T, wo_id).unwrap();
+    let ledger_meta = LedgerMeta::new(TenantId::new(T).unwrap(), BinaryHash::from_bytes([0u8; 32]));
+    let ctx = QcWriteContext {
+        tenant: T,
+        actor: ActorKind::SpaOperator {
+            operator_login: "ervin".into(),
+        },
+        ledger_meta: &ledger_meta,
+        ledger_actor: Actor::from_local_cli("qc-composed-session".into(), "ervin"),
+    };
+    let tx = guard.transaction().unwrap();
+    let (report, _) = aberp_qa::freeze_report(
+        &tx,
+        &ctx,
+        FreezeReportInputs {
+            report_kind: QcReportKind::DimensionalInspection,
+            template: QcReportTemplate::AbenStandard,
+            wo_id,
+            product_id: "prd_1",
+            partner_id: "ptr_x",
+            plans: &plans,
+            inspections: &inspections,
+            units,
+            open_ncr_against_reported_part: false,
+            traceability: ReportTraceability::default(),
+            customer: ReportCustomer::default(),
+            created_by: "ervin",
+        },
+        now(),
+    )
+    .unwrap();
+    let issued = aberp_qa::issue_report(
+        &tx,
+        &ctx,
+        &report.qcr_id,
+        "deadbeef",
+        "aberp-qc-pdf@0.0.0",
+        "ervin",
+        now(),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    (issued.qcr_id, issued.disposition)
+}
+
+/// **A failing measurement recorded AFTER issuance, naming no part UID,
+/// must still refuse the shipment.**
+///
+/// Two behaviours that were filed as separate backlog items compose into a
+/// live release:
+///
+/// 1. The QC-report gate reads the ISSUED REPORT, not the measurements, so
+///    a failure recorded after issuance leaves that gate at `Pass`. The
+///    report is a frozen document and is *supposed* to be immutable; that
+///    is not the bug.
+/// 2. An auto-NCR carries exactly what the measurement carried —
+///    `qc_inspection.rs` builds `affected_part_uids` from `req.part_uid`,
+///    an `Option`. A batch / lot-level / first-article measurement names no
+///    unit, so the NCR's part-UID list is EMPTY, and the open-NCR belt
+///    joined only on part UIDs.
+///
+/// Composed: measure the unit, issue an `accept` report, then record the
+/// failing lot-level measurement. A real, Open, Critical NCR stands against
+/// the order, and nothing in the building refused the shipment.
+///
+/// The belt now also joins on the WORK ORDER, which both the dispatch and
+/// the failing measurement always name. This test walks the whole
+/// composition and asserts the refusal at the end — including that the QC
+/// report gate is still `Pass`, so the block is coming from the belt and
+/// not from something else quietly covering for it.
+#[test]
+fn a_failing_lot_level_measurement_after_issuance_still_blocks_the_shipment() {
+    let fx = setup();
+    let conn = Connection::open(&fx.db_path).unwrap();
+    let buyer = create_partner(&conn, T, &partner_inputs("Def Co", CustomerType::Defense)).unwrap();
+    seed_wo(&conn, "wo-comp");
+    seed_dispatch(&conn, "dsp-comp", "wo-comp", &buyer.id);
+    let part_uid = mark_one_unit(&conn, "wo-comp");
+    drop(conn);
+
+    let plan_id = seed_plan(&fx);
+
+    // 1. The unit is measured and passes.
+    let ok = record_manual_inspection(
+        &fx.db_path,
+        &fx.handle,
+        fx.tenant.clone(),
+        fx.hash,
+        "ervin",
+        now(),
+        86400,
+        ManualInspectionRequest {
+            plan_id: plan_id.clone(),
+            actual_value: 10.005,
+            source: QcSource::Manual,
+            units: None,
+            source_event_id: None,
+            probe_serial: None,
+            last_calibration_at: None,
+            wo_id: Some("wo-comp".into()),
+            part_uid: Some(part_uid.clone()),
+            heat_lot: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(ok.inspection.verdict, Verdict::Pass);
+
+    // 2. A clean report is issued over that evidence.
+    let units = vec![ReportUnit {
+        part_serial: "SN-1".into(),
+        part_uid: part_uid.clone(),
+    }];
+    let (_qcr, disp) = issue_report_for(&fx, "wo-comp", &units);
+    assert_eq!(disp, Disposition::Accept);
+
+    // 3. …and BOTH shipment gates are open at this point.
+    let conn = Connection::open(&fx.db_path).unwrap();
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &dispatch(&conn, "dsp-comp"), true)
+            .unwrap(),
+        QcReportGate::Pass
+    );
+    assert_eq!(
+        resolve_open_ncr_gate(&conn, T, &dispatch(&conn, "dsp-comp")).unwrap(),
+        OpenNcrGate::Pass
+    );
+    drop(conn);
+
+    // 4. AFTER issuance, a batch measurement fails — and names no unit.
+    let bad = record_manual_inspection(
+        &fx.db_path,
+        &fx.handle,
+        fx.tenant.clone(),
+        fx.hash,
+        "ervin",
+        now(),
+        86400,
+        ManualInspectionRequest {
+            plan_id,
+            actual_value: 10.500, // > 2× half-width → Critical
+            source: QcSource::Manual,
+            units: None,
+            source_event_id: None,
+            probe_serial: None,
+            last_calibration_at: None,
+            wo_id: Some("wo-comp".into()),
+            part_uid: None, // the whole point: no unit named
+            heat_lot: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(bad.inspection.verdict, Verdict::Critical);
+    let ncr = bad.auto_ncr.expect("a Critical verdict auto-spawns an NCR");
+    assert!(
+        ncr.affected_part_uids.is_empty(),
+        "the measurement named no unit, so neither does the NCR"
+    );
+    assert_eq!(ncr.affected_wo_ids, vec!["wo-comp".to_string()]);
+
+    // 5. The report gate is STILL Pass — the frozen document has not
+    //    changed and is not supposed to. The refusal has to come from the
+    //    NCR belt, and it does.
+    let conn = Connection::open(&fx.db_path).unwrap();
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &dispatch(&conn, "dsp-comp"), true)
+            .unwrap(),
+        QcReportGate::Pass,
+        "the issued report is immutable; this half of the composition stands"
+    );
+    match resolve_open_ncr_gate(&conn, T, &dispatch(&conn, "dsp-comp")).unwrap() {
+        OpenNcrGate::Blocked {
+            work_order_id,
+            customer_type,
+            blocking_ncr_ids,
+        } => {
+            assert_eq!(work_order_id, "wo-comp");
+            assert_eq!(customer_type, "defense");
+            assert_eq!(blocking_ncr_ids, vec![ncr.ncr_id]);
+        }
+        other => panic!(
+            "an Open Critical NCR stands against wo-comp; the shipment must \
+             be refused: {other:?}"
+        ),
+    }
 }

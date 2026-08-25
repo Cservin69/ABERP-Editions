@@ -1405,6 +1405,145 @@ same time — which needs no normalisation trick at all.
   `refuse_unparseable_report_timestamps`: a refusal only an out-of-band write
   reaches, kept because stopping beats guessing.
 
+### Round-6 behaviours pinned by mutation testing
+
+The round-5 adversarial confirmed the identity fix closed (all three
+archived/renamed-plan variants block, both coverage terms non-subsuming,
+31/31) and found one undisclosed blocker plus the composition of two
+residuals the previous round had recorded separately.
+
+- **(B-1) `characteristic_type` was an editable field that decides the
+  ACCOUNTABILITY ARITHMETIC.** `build_report_lines` partitions the plan list
+  on `is_lot_level`: `Material` / `Process` report ONCE for the whole
+  shipment (`part_serial = None`), everything else reports once per
+  serialised unit. One ordinary `PUT /api/inspection-plans/:id` changing only
+  that field — same `plan_id`, same feature name, still required — therefore
+  re-partitioned an existing row. Measured on real DuckDB with two units
+  marked and only SN-001 measured: BEFORE the edit the report is
+  `incomplete` and the gate blocks; AFTER it the two per-serial lines
+  collapse to one lot-level line, that line matched SN-001's measurement
+  (`latest_measurement(.., lot_level = true)` accepted ANY measurement of the
+  characteristic), `unaccounted` fell 1 → 0, and the report came out
+  `accept` while `serial_range` still read `"SN-001 … SN-002 (2 units)"`.
+
+  **Neither of the round-5 coverage terms could catch this, and that is the
+  shape of the defect, not an oversight in them.** `compute_disposition`
+  itself flipped, so `permits_shipment()` was already true when the gate
+  reached the coverage arms — and once the single line is `Measured`, the
+  name join and the identity join are satisfied *by construction*. The gate
+  never got to decide.
+
+  Root cause of the invisibility: **the lot-level partition was covered only
+  in the direction that could not fail.** Exactly one test built a `Material`
+  plan (`a_lot_level_characteristic_renders_once_for_the_whole_shipment`),
+  and it supplied a genuine lot measurement carrying no `linked_part_uid` —
+  which passes under BOTH the old rule and the new one. `Process` was never
+  constructed at all. So every mutation of the lot-line evidence filter
+  survived silently, and the partition's failing direction — a per-unit
+  measurement standing in for the lot — had no probe pointed at it. Round 6
+  adds six probes to it: four in the pure core (one per member of the
+  partition, the flip itself, and a control that the permissive
+  no-marked-units arm stays permissive), plus the end-to-end flip through
+  the gate and its positive control.
+
+- **Two belts, deliberately, because they answer different questions.**
+
+  1. *The reporting rule* (`qc/reports.rs`). The `lot_level: bool` flag is
+     replaced by a typed `Evidence` rule with three arms, and the arm used
+     for a lot-level line in a report that HAS units is now `LotOnly`: only
+     a measurement recorded as a lot fact (`linked_part_uid` absent) may
+     back it. A line that stands for N units has to be backed by a fact
+     about N units; a measurement taken on SN-001 is evidence about SN-001.
+     With the flip applied, the lot line finds nothing, stays
+     `NotMeasured`, and the report is `incomplete`.
+  2. *The mutation guard* (`qc/plans.rs`). `update_plan` refuses to change
+     `characteristic_type` at all once the plan has any `qc_inspections`
+     row. Re-classifying evidence after it was recorded is what an AS9100
+     auditor reads as a rewritten record, whatever disposition falls out.
+     The remedy is the honest one and the system already rewards it:
+     archive the characteristic and create the new one, which mints a fresh
+     `plan_id` and must therefore be measured on its own account under the
+     round-5 identity term.
+
+  Neither belt subsumes the other. The guard is name-blind to out-of-band
+  writes (a direct `UPDATE` reaches past it, which is how the second belt is
+  tested); the reporting rule cannot stop a re-classification from
+  relabelling a frozen document's characteristic.
+
+- **What the fix deliberately does NOT tighten.** The third `Evidence` arm,
+  `AnyOfCharacteristic`, stays permissive for the no-marked-units
+  degradation, where every characteristic reports once. Tightening it would
+  not produce a stricter report but an EMPTY one — vacuously "complete", the
+  failure this module exists to prevent — and the unit-scope mismatch it
+  admits is already refused one layer up by round 4's `UnitDrift` arm.
+  Tightening here would also move that refusal's REASON and blind the test
+  that pins it.
+
+- **This refuses more than it used to, and the direction was chosen
+  deliberately.** A lot-level characteristic whose measurement was entered
+  against a unit no longer accounts for the lot; the remedy is to record it
+  as what it is (`part_uid` omitted — the field is already `Option` on
+  `ManualInspectionRequest`). And a mis-set `characteristic_type` on a
+  measured plan is no longer editable in place. No shipped flow relied on
+  either reading: `Material` / `Process` plans are creatable but unused,
+  which is exactly why the partition had no coverage. The guard compares
+  the EFFECTIVE type (`unwrap_or_default()`), so a pre-ADR-0199 client that
+  omits the field entirely is not treated as a re-classification — the
+  alternative would 400 every legacy edit of a measured dimensional plan.
+
+- **(B-2) The two round-5 residuals COMPOSE into a live release path.** Filed
+  separately they each looked like a belt with braces elsewhere; together
+  they release a failed part:
+
+  1. a failing measurement recorded AFTER issuance leaves the QC-report gate
+     at `Pass` — the frozen report is immutable by design, and that is not
+     the bug;
+  2. the auto-NCR that failure spawns carries
+     `affected_part_uids: req.part_uid.clone().into_iter().collect()`, so a
+     measurement naming no unit produces an `Open` NCR with an EMPTY part
+     list, and `open_ncr_ids_blocking_part_uids` joined only on part UIDs.
+
+  Composed: measure the unit, issue an `accept` report, then record the
+  failing batch measurement. A real, Open, Critical nonconformity stands
+  against the order and nothing refuses the shipment.
+
+  Closed exactly as round 5 predicted, in the pure helper: the new
+  `open_ncr_ids_blocking_wo` matches an NCR naming one of the WO's marked
+  units **or** naming the WORK ORDER, which is the one key both the dispatch
+  and the failing measurement always carry (`qc_inspection.rs` already writes
+  `affected_wo_ids`; `resolve_open_ncr_gate` already holds `dispatch.wo_id`).
+  The second arm round 5 named is closed with it: the
+  `part_uids.is_empty() → Pass` early exit is gone, because an unmarked WO is
+  precisely the shape a lot-level nonconformity is raised against. The
+  Defense path still refuses an unmarked WO at `resolve_part_uid_gate`, so
+  removing the exit costs nothing there. **No new `EventKind` and no new gate
+  reason** — the block reuses `OpenNcrGate::Blocked` and its existing
+  `ncr.wo_blocked_by_open_ncr` audit row; `ALL_KINDS_COUNT` stays **195**.
+
+- **A footgun fixed in passing.** `record_part_marks` guards `AlreadyMarked`
+  on the `wo_id` PARAMETER but inserted `m.wo_id` from each mark. The route
+  hard-sets `m.wo_id` from the path, so the two agree today and no caller is
+  affected; the insert now uses the guarded parameter so a future internal
+  caller cannot make them disagree and write marks onto a WO the guard never
+  checked.
+
+### Round-6 residuals, stated
+
+- **An NCR that names NEITHER a part UID nor a WO still blocks nothing.**
+  There is no key left to join on, and inventing one (heat lot, product)
+  would refuse shipments the operator never associated with this order.
+  Every auto-NCR from `record_manual_inspection` names at least the WO
+  whenever the measurement did.
+- **`open_ncr_against` (the `accept_with_ncr` disposition arm in
+  `qc_report.rs`) still matches on part UIDs only.** It is deliberately left
+  alone: it decides how a report is LABELLED, not whether a shipment leaves,
+  and `AcceptWithNcr` permits shipment either way. The refusal that matters
+  is the belt, and the belt now sees the WO.
+- **A characteristic's type is now immutable once measured, with no
+  override.** An operator who mis-sets it must archive and re-create. That
+  is one more step than an edit, and it is the step that makes the new
+  characteristic measurable on its own identity.
+
 ---
 
 ## Acceptance criteria (for the Phase-1 implementation session)

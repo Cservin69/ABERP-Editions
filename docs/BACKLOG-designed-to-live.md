@@ -1019,7 +1019,72 @@ case where they are never active at the same time.
    calling `(product, feature_name)` "the plan table's own uniqueness key",
    true only among currently-active rows — are corrected in the same change.
 
-#### Still owed after round 5
+#### Closed in round 6 (2026-08-25)
+
+The round-5 adversarial confirmed the identity fix closed (all three
+archived/renamed-plan variants block; both coverage terms non-subsuming;
+31/31) and found one undisclosed blocker plus the COMPOSITION of two items
+this list had recorded separately.
+
+11. **The NCR belt matched on PART UIDs only — and composed with item 8 it
+    released a failed part.** `open_ncr_ids_blocking_part_uids` intersected an
+    open NCR's `affected_part_uids` with the WO's marked units, while an
+    auto-NCR carries exactly what the measurement carried
+    (`req.part_uid.clone().into_iter().collect()`). A batch / first-article /
+    lot-level measurement names no unit, so a failing one spawns an `Open`
+    NCR with an EMPTY part list and the intersection matched nothing.
+    Composed with item 8 — the report is frozen at issuance and a later
+    failure does not re-open the QC-report gate — the live sequence is:
+    measure the unit, issue an `accept` report, record the failing batch
+    measurement, ship. A real Open Critical nonconformity stood against the
+    order and nothing refused it. Closed exactly where round 5 said it would
+    be, in the pure helper: `open_ncr_ids_blocking_wo` matches an NCR naming
+    one of the WO's marked units **or** naming the WORK ORDER, which is the
+    one key both the dispatch and the failing measurement always carry. The
+    second arm round 5 flagged is closed with it — the
+    `part_uids.is_empty() → Pass` early exit is gone, since an unmarked WO is
+    precisely the shape a lot-level nonconformity is raised against (the
+    Defense path still refuses an unmarked WO at `resolve_part_uid_gate`).
+    **No new EventKind and no new gate reason** — the block reuses
+    `OpenNcrGate::Blocked` and the existing `ncr.wo_blocked_by_open_ncr` row;
+    `ALL_KINDS_COUNT` stays **195**. Pinned by
+    `a_failing_lot_level_measurement_after_issuance_still_blocks_the_shipment`
+    (the whole composition, ending in the refusal, and asserting the
+    QC-report gate is still `Pass` so the block cannot be coming from
+    somewhere else) plus two counter-direction unit tests.
+12. **`characteristic_type` was an editable field that decided the
+    accountability ARITHMETIC.** `build_report_lines` partitions on
+    `is_lot_level`: `Material` / `Process` report ONCE for the whole
+    shipment, everything else once per serialised unit. One ordinary
+    `PUT /api/inspection-plans/:id` changing only that field — same
+    `plan_id`, same name, still required — re-partitioned an existing row.
+    With two units marked and only SN-001 measured: before, `incomplete` →
+    gate `Blocked`; after, the two lines collapse to one, that line swallowed
+    SN-001's measurement, `unaccounted` fell 1 → 0, and the report came out
+    `accept` while `serial_range` still read *SN-001 … SN-002 (2 units)*.
+    **Neither round-5 coverage term could catch it** — `compute_disposition`
+    itself flipped, so the gate had already passed `permits_shipment()` and
+    both terms are satisfied by construction once the single line is
+    `Measured`. Root cause of the invisibility: the lot-level partition was
+    covered only in the direction that could not fail — the one test that
+    built a `Material` plan supplied a genuine LOT measurement, which passes
+    under both the old rule and the new one, and `Process` was never
+    constructed at all. Closed
+    with two belts — a typed `Evidence` rule (a lot-level line in a
+    unit-scoped report is backed only by a measurement recorded as a lot
+    fact, i.e. carrying no `linked_part_uid`) and a refusal in `update_plan`
+    to change `characteristic_type` at all once the plan has recorded
+    inspections. The permissive no-marked-units arm is deliberately
+    unchanged: tightening it yields an EMPTY report, not a stricter one, and
+    that case is already `UnitDrift`'s. **No new EventKind** —
+    `ALL_KINDS_COUNT` stays **195**.
+13. **`record_part_marks` inserted `m.wo_id`, not the `wo_id` it guarded
+    on.** The `AlreadyMarked` guard counts marks on the `wo_id` PARAMETER;
+    the insert wrote each mark's own copy. Not client-reachable — the route
+    hard-sets `m.wo_id` from the path — but it made the guard bypassable by a
+    future internal caller. The insert now uses the guarded parameter.
+
+#### Still owed after round 6
 
 8. **The report does not re-open on a LATE measurement.** `UnitDrift`
    compares the unit scope and the round-3 subtraction compares the
@@ -1028,6 +1093,10 @@ case where they are never active at the same time.
    — by design, since the report is a frozen record and a live
    re-derivation is what the §D7 hash pin forbids. The remedy today is to
    supersede the report, which is a manual operator step with no prompt.
+   **Round 6 removed its teeth without closing it:** the failure a late
+   measurement records now spawns an NCR the belt sees (item 11), so the
+   shipment is refused even though the report still says `accept`. What
+   remains is that the DOCUMENT is stale, and an operator has to notice.
    *Size:* small; it is a nudge on the report surface, not a mechanism.
 10. **`UnitDrift` compares the RENDERED range string, not the unit set.**
     (Stated in ADR-0199's round-4 residuals; recorded here so the backlog and
@@ -1044,23 +1113,26 @@ case where they are never active at the same time.
     every characteristic is lot-level.
     *Size:* small, but it needs the enumeration to come from somewhere other
     than the printed string.
-11. **The NCR belt matches on PART UIDs only, so a lot-level failure does not
-    block.** `open_ncr_ids_blocking_part_uids` intersects an open NCR's
-    `affected_part_uids` with the WO's marked units. A measurement recorded
-    with `linked_part_uid = None` — the first-article or lot-level check —
-    spawns an auto-NCR whose `affected_part_uids` is empty, so the
-    intersection is empty and the NCR does not block the shipment while it is
-    `Open`. The QC-report gate covers the case where such a failure is *in the
-    report* (a failing verdict makes the report `reject`), so this bites when
-    the failing measurement lands AFTER issuance — where the report is frozen
-    by design and the NCR is the only live signal. **The data is already
-    there:** the same call site writes `affected_wo_ids` from `req.wo_id`, and
-    `resolve_open_ncr_gate` already holds `dispatch.wo_id`; it just never
-    consults either. Second arm to revisit with it: that resolver returns
-    `Pass` outright when the WO has no marked units.
-    *Size:* small — widen the pure helper to match the WO as well as the
-    units. Owned by the NCR gate (ADR-0090 / S439), not by ADR-0199, and it
-    wants its own counter-direction tests since it widens a shipment gate.
+14. **An NCR that names NEITHER a part UID nor a WO still blocks nothing.**
+    There is no key left to join on, and inventing one (heat lot, product)
+    would refuse shipments the operator never associated with the order.
+    Every auto-NCR from `record_manual_inspection` names at least the WO
+    whenever the measurement did, so this is a shape only a hand-written NCR
+    reaches.
+    *Size:* not a defect so much as the belt's outer edge; revisit if a real
+    NCR surface starts producing unattributed rows.
+15. **`open_ncr_against` — the `accept_with_ncr` disposition arm in
+    `qc_report.rs` — still matches on part UIDs only.** Deliberately left:
+    it decides how a report is LABELLED, not whether a shipment leaves, and
+    `AcceptWithNcr` permits shipment either way. Widening it would change a
+    printed document's wording, which wants its own review.
+    *Size:* small.
+16. **A characteristic's type is immutable once measured, with no override.**
+    An operator who mis-sets it must archive the characteristic and create a
+    new one. That is one step more than an edit, and it is the step that
+    makes the replacement measurable on its own identity — but there is no
+    operator-facing prompt saying so; today it is a 400 with a message.
+    *Size:* small; it is a UX nudge on the plan form.
 
 ---
 

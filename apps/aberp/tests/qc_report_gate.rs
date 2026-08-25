@@ -299,8 +299,12 @@ fn measure_at(
 /// A measurement attributed to the CHARACTERISTIC but to no part UID — the
 /// first-article check taken before any unit carries a mark. With no marked
 /// units, `build_report_lines` degrades every characteristic to one
-/// lot-level line and `latest_measurement(.., lot_level = true)` accepts
-/// this row, which is what makes the round-4 B-2 fixture a clean `accept`.
+/// lot-level line and `latest_measurement(.., Evidence::AnyOfCharacteristic)`
+/// accepts this row, which is what makes the round-4 B-2 fixture a clean
+/// `accept`. It is ALSO the only shape that accounts for a genuinely
+/// lot-level characteristic once units ARE marked (round 6): there the rule
+/// is `Evidence::LotOnly`, and a measurement carrying a `part_uid` no longer
+/// stands in for the lot.
 fn measure_lot_level(conn: &mut Connection, plan_id: &str, actual: f64) {
     let m = meta();
     let plan = aberp_qa::get_inspection_plan(conn, T, plan_id)
@@ -2601,5 +2605,177 @@ fn demoting_the_measured_plan_frees_its_name_but_not_its_coverage() {
         resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
         QcReportGate::Pass,
         "measuring the newly required characteristic releases the shipment"
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Round 6, B-1 — re-classifying a characteristic must not release a
+// shipment the same fixture was blocked on.
+// ═════════════════════════════════════════════════════════════════════
+
+/// **The blocker, end to end.**
+///
+/// One ordinary `PUT /api/inspection-plans/:id` that changes ONLY
+/// `characteristic_type` — same `plan_id`, same feature name, still
+/// required — used to convert a blocked shipment into a passing one.
+/// `build_report_lines` partitions on that field: `Material`/`Process` are
+/// lot-level and report ONCE for the whole shipment, everything else
+/// reports once per serialised unit. So on a WO with two marked units and
+/// only SN-001 measured, `Dimensional` → `Process` collapsed two lines to
+/// one, the one line swallowed SN-001's measurement, `unaccounted` fell
+/// from 1 to 0, and `compute_disposition` ITSELF returned `accept` while
+/// the header still read "SN-001 … SN-002 (2 units)".
+///
+/// That is why neither of the gate's coverage terms caught it: with the
+/// disposition already permitting shipment, the single `Measured` line
+/// satisfies the name join and the identity join by construction. The gate
+/// never got to decide.
+///
+/// Two belts now stand. `update_plan` refuses the edit outright once the
+/// plan has recorded inspections (asserted here through the same function
+/// the route calls), and the reporting rule refuses to back a lot-level
+/// line with a per-unit measurement. This test drives the SECOND belt by
+/// reaching past the first with a direct write, the same posture
+/// `refuse_unparseable_report_timestamps` and the `UnitDrift` equality arm
+/// already take: a refusal only an out-of-band write can reach is kept
+/// because guessing there is worse than stopping.
+#[test]
+fn re_classifying_a_measured_characteristic_as_lot_level_does_not_release_the_shipment() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(&conn, T, &partner_inputs("Def Co", CustomerType::Defense)).unwrap();
+    seed_wo(&conn, "wo-def", "2");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 2);
+    let plan_id = seed_plan(&conn, "Bore D", "1", true);
+
+    // SN-001 measured, SN-002 not.
+    measure(&mut conn, &plan_id, &units[0].part_uid, 25.0);
+
+    let (qcr_a, disp_a) = issue_report_for(&mut conn, &units);
+    assert_eq!(disp_a, Disposition::Incomplete);
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason, qcr_id: id, ..
+        } => {
+            assert_eq!(reason, QcReportBlockReason::Incomplete);
+            assert_eq!(id.as_deref(), Some(qcr_a.as_str()));
+        }
+        other => panic!("SN-002 is unmeasured; the shipment must be blocked: {other:?}"),
+    }
+
+    // ── Belt 1: the route refuses the re-classification outright. ──
+    let refused = aberp_qa::update_inspection_plan(
+        &conn,
+        T,
+        &plan_id,
+        NewInspectionPlan {
+            product_id: "prd_bracket".into(),
+            feature_name: "Bore D".into(),
+            nominal_value: 25.0,
+            upper_tol: 0.05,
+            lower_tol: -0.05,
+            units: "mm".into(),
+            optional_probe_cycle_id: None,
+            enabled: true,
+            characteristic_number: Some("1".into()),
+            characteristic_designator: None,
+            characteristic_type: Some(CharacteristicType::Process),
+            inspection_method: Some(InspectionMethod::OnMachineProbe),
+            sheet_zone: None,
+            is_required: Some(true),
+        },
+    );
+    match refused {
+        Err(aberp_qa::QcError::Validation(m)) => assert!(
+            m.contains("characteristic_type"),
+            "the refusal must name the field: {m}"
+        ),
+        other => panic!("the re-classification must be refused, got {other:?}"),
+    }
+
+    // ── Belt 2: reach past belt 1 and re-issue. ──
+    conn.execute(
+        "UPDATE qc_inspection_plans SET characteristic_type = 'process'
+         WHERE tenant_id = ?1 AND plan_id = ?2",
+        params![T, &plan_id],
+    )
+    .unwrap();
+
+    let (qcr_b, disp_b) = issue_report_for_at(&mut conn, &units, now() + time::Duration::hours(1));
+    assert_ne!(
+        disp_b,
+        Disposition::Accept,
+        "the flip collapses two lines into one; that one line must NOT be \
+         accounted for by SN-001's measurement"
+    );
+    assert_eq!(disp_b, Disposition::Incomplete);
+
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason, qcr_id: id, ..
+        } => {
+            assert_eq!(reason, QcReportBlockReason::Incomplete);
+            assert_eq!(id.as_deref(), Some(qcr_b.as_str()));
+        }
+        other => panic!(
+            "SN-002 is still unmeasured; re-classifying the characteristic \
+             must not release it: {other:?}"
+        ),
+    }
+}
+
+/// The positive control for the same rule: a genuinely lot-level
+/// characteristic, measured as a LOT fact (no `part_uid`), still releases
+/// the shipment. Without this the fix could be "lot-level never passes",
+/// which would refuse a correct AS9102 material/process certification.
+#[test]
+fn a_lot_level_characteristic_measured_as_a_lot_fact_releases_the_shipment() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(&conn, T, &partner_inputs("Def Co", CustomerType::Defense)).unwrap();
+    seed_wo(&conn, "wo-def", "2");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 2);
+
+    // A lot-level plan from the start — no re-classification anywhere.
+    let plan_id = create_inspection_plan(
+        &conn,
+        T,
+        NewInspectionPlan {
+            product_id: "prd_bracket".into(),
+            feature_name: "Heat lot conformity".into(),
+            nominal_value: 25.0,
+            upper_tol: 0.05,
+            lower_tol: -0.05,
+            units: "mm".into(),
+            optional_probe_cycle_id: None,
+            enabled: true,
+            characteristic_number: Some("90".into()),
+            characteristic_designator: None,
+            characteristic_type: Some(CharacteristicType::Material),
+            inspection_method: Some(InspectionMethod::Visual),
+            sheet_zone: None,
+            is_required: Some(true),
+        },
+    )
+    .unwrap()
+    .plan_id;
+
+    // Measured against the characteristic, attributed to no unit.
+    measure_lot_level(&mut conn, &plan_id, 25.0);
+
+    let (_, disp) = issue_report_for(&mut conn, &units);
+    assert_eq!(
+        disp,
+        Disposition::Accept,
+        "a lot fact, recorded as a lot fact, accounts for the lot"
+    );
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass
     );
 }

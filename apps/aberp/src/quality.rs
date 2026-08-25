@@ -1278,6 +1278,10 @@ fn append_event(
 /// The ids of the NCRs in an `Open`/`Contained` state whose `affected_part_uids`
 /// intersect a WO's marked units. Pure helper for the shipment gate (the
 /// dispatch-aware resolver lives in `serve.rs`, mirroring `resolve_part_uid_gate`).
+///
+/// **Part UIDs only.** A defect that names no unit is invisible here — see
+/// [`open_ncr_ids_blocking_wo`], which is what the shipment gate actually
+/// calls.
 pub fn open_ncr_ids_blocking_part_uids(ncrs: &[Ncr], wo_part_uids: &[String]) -> Vec<String> {
     ncrs.iter()
         .filter(|n| n.state.blocks_shipment())
@@ -1285,6 +1289,51 @@ pub fn open_ncr_ids_blocking_part_uids(ncrs: &[Ncr], wo_part_uids: &[String]) ->
             n.affected_part_uids
                 .iter()
                 .any(|u| wo_part_uids.iter().any(|w| w == u))
+        })
+        .map(|n| n.ncr_id.clone())
+        .collect()
+}
+
+/// The blocking NCRs for a shipment: those naming one of the WO's marked
+/// units **or** naming the WORK ORDER itself (round 6, B-2).
+///
+/// ## Why the `wo_id` term exists
+///
+/// `open_ncr_ids_blocking_part_uids` asks only "does an open NCR name one of
+/// these units?", and an auto-spawned NCR carries exactly what the
+/// measurement carried: `qc_inspection.rs` builds `affected_part_uids` from
+/// `req.part_uid` and `affected_wo_ids` from `req.wo_id`, both `Option`. A
+/// failing inspection recorded WITHOUT a part UID — a lot-level check, a
+/// first-article measurement, any of the paths where the operator measures
+/// the batch rather than a serial — therefore spawns a real, `Open`,
+/// shipment-blocking NCR whose `affected_part_uids` is `[]`. The part-UID
+/// term matched nothing and the shipment left.
+///
+/// That was one half of a live release path. The other half is that the QC
+/// report gate reads the ISSUED REPORT, not the measurements, so a failure
+/// recorded AFTER issuance leaves the report — and therefore that gate — at
+/// `Pass`. Composed: measure the unit, issue an `accept` report, then record
+/// the failing lot-level measurement, and nothing in the building refused the
+/// shipment. Blocking on the WO closes the composition, because the WO is the
+/// one thing both the dispatch and the failing measurement always name.
+///
+/// The `wo_id` term cannot false-block a shipment the part-UID term would
+/// have passed on legitimately: an NCR naming this WO IS a nonconformity
+/// raised against this WO's output, and the remedy is the same one the 409
+/// already names — resolve or escalate the NCR.
+///
+/// Residual, deliberately not closed here: an NCR that names NEITHER a part
+/// UID nor a WO still blocks nothing. There is no key left to join on, and
+/// inventing one (heat lot, product) would refuse shipments the operator
+/// never associated with this order.
+pub fn open_ncr_ids_blocking_wo(ncrs: &[Ncr], wo_id: &str, wo_part_uids: &[String]) -> Vec<String> {
+    ncrs.iter()
+        .filter(|n| n.state.blocks_shipment())
+        .filter(|n| {
+            n.affected_part_uids
+                .iter()
+                .any(|u| wo_part_uids.iter().any(|w| w == u))
+                || n.affected_wo_ids.iter().any(|w| w == wo_id)
         })
         .map(|n| n.ncr_id.clone())
         .collect()
@@ -1498,6 +1547,81 @@ mod tests {
             blocking,
             vec!["ncr_open".to_string(), "ncr_contained".to_string()]
         );
+    }
+
+    /// **Round 6, B-2 — an NCR that names no part UID still blocks.**
+    ///
+    /// A failing measurement recorded without a `part_uid` (a lot-level
+    /// check, a first article, any batch measurement) auto-spawns an NCR
+    /// with `affected_part_uids: []` and `affected_wo_ids: [wo]`. The
+    /// part-UID join matched nothing, so a real Open nonconformity against
+    /// the order released the shipment.
+    #[test]
+    fn open_ncr_gate_blocks_on_the_work_order_when_no_part_uid_is_named() {
+        let mk = |id: &str, state: NcrState, uids: &[&str], wos: &[&str]| Ncr {
+            ncr_id: id.into(),
+            discovered_at_utc: "2026-06-16T00:00:00Z".into(),
+            discovered_by_operator: "op".into(),
+            severity: NcrSeverity::Major,
+            category: NcrCategory::Workmanship,
+            description: "d".into(),
+            affected_part_uids: uids.iter().map(|s| s.to_string()).collect(),
+            affected_wo_ids: wos.iter().map(|s| s.to_string()).collect(),
+            affected_heat_lots: vec![],
+            photos: vec![],
+            state,
+            closed_at_utc: None,
+            closed_by_operator: None,
+        };
+        let ncrs = vec![
+            // The composed path: open, this WO, NO part uid at all.
+            mk("ncr_lot", NcrState::Open, &[], &["wo-1"]),
+            // A closed one on the same WO must NOT block.
+            mk("ncr_done", NcrState::Closed, &[], &["wo-1"]),
+            // Another order's problem is not this order's.
+            mk("ncr_elsewhere", NcrState::Open, &[], &["wo-2"]),
+            // The part-UID term still works on its own.
+            mk("ncr_unit", NcrState::Contained, &["dp-A"], &[]),
+        ];
+        let wo_uids = vec!["dp-A".to_string()];
+
+        // The old helper is blind to the lot-level NCR — that is the defect.
+        assert_eq!(
+            open_ncr_ids_blocking_part_uids(&ncrs, &wo_uids),
+            vec!["ncr_unit".to_string()]
+        );
+        // The gate's helper sees both, and only both.
+        assert_eq!(
+            open_ncr_ids_blocking_wo(&ncrs, "wo-1", &wo_uids),
+            vec!["ncr_lot".to_string(), "ncr_unit".to_string()]
+        );
+    }
+
+    /// An unmarked WO is not a free pass: the `wo_id` term has to work with
+    /// an EMPTY part-UID list, which is the shape the gate's removed
+    /// `part_uids.is_empty()` early exit used to hide.
+    #[test]
+    fn the_work_order_term_blocks_even_with_no_marked_units() {
+        let ncr = Ncr {
+            ncr_id: "ncr_lot".into(),
+            discovered_at_utc: "2026-06-16T00:00:00Z".into(),
+            discovered_by_operator: "op".into(),
+            severity: NcrSeverity::Critical,
+            category: NcrCategory::Workmanship,
+            description: "d".into(),
+            affected_part_uids: vec![],
+            affected_wo_ids: vec!["wo-1".into()],
+            affected_heat_lots: vec![],
+            photos: vec![],
+            state: NcrState::Open,
+            closed_at_utc: None,
+            closed_by_operator: None,
+        };
+        assert_eq!(
+            open_ncr_ids_blocking_wo(std::slice::from_ref(&ncr), "wo-1", &[]),
+            vec!["ncr_lot".to_string()]
+        );
+        assert!(open_ncr_ids_blocking_wo(&[ncr], "wo-other", &[]).is_empty());
     }
 
     fn temp_db() -> (std::path::PathBuf, HandleArc, TenantId, BinaryHash) {

@@ -284,6 +284,76 @@ fn measured_at_instant(i: &QcInspection) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(&i.measured_at_utc, &Rfc3339).ok()
 }
 
+/// **What counts as evidence for one report line** (round 6, B-1).
+///
+/// The three rules are not interchangeable, and the difference between the
+/// last two is the whole of round 6's blocker. A measurement is recorded
+/// against a characteristic and, optionally, against ONE unit
+/// (`linked_part_uid`); which of those a line may consume depends on what
+/// the line claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence<'a> {
+    /// A per-serial line: only a measurement attributed to THIS unit. One
+    /// measured part must never account for its neighbours.
+    Unit(&'a str),
+    /// A lot-level line in a report that HAS serialised units: only a
+    /// measurement recorded as a LOT fact, i.e. carrying no
+    /// `linked_part_uid` at all.
+    ///
+    /// A lot-level characteristic (`Material` / `Process`) states something
+    /// about the batch — heat conformity, coating, heat-treat certification
+    /// — and is deliberately reported ONCE for N units ([`is_lot_level`]).
+    /// That one line therefore accounts for every unit in scope, so what
+    /// backs it has to be a fact about every unit in scope. A measurement
+    /// taken on SN-001 is not: it is evidence about SN-001.
+    ///
+    /// Letting a per-unit measurement back a lot-level line is what turned
+    /// an ordinary `PUT /api/inspection-plans/:id` into a release. Flipping
+    /// one required characteristic from `Dimensional` to `Process` on a WO
+    /// with two marked units and only SN-001 measured re-partitions the
+    /// SAME plan row from two per-serial lines to one lot-level line; the
+    /// lot line then swallowed SN-001's measurement, `unaccounted` fell
+    /// from 1 to 0, and `compute_disposition` itself returned `Accept`
+    /// while the header still read "SN-001 … SN-002 (2 units)". Because the
+    /// DISPOSITION flipped, the shipment gate never got to decide — both of
+    /// its coverage terms are satisfied by construction once the single
+    /// line is `Measured`.
+    ///
+    /// Demanding a genuine lot measurement makes the flip inert: the lot
+    /// line finds nothing, stays `NotMeasured`, and the report is
+    /// `Incomplete`. **This refuses more than it used to** — a lot-level
+    /// characteristic whose measurement was entered against a unit no
+    /// longer accounts for the lot, and the remedy is to record it as what
+    /// it is (`part_uid` omitted; the field is already `Option` on
+    /// `ManualInspectionRequest`). Refusing is the conservative direction,
+    /// and no shipped flow relied on the old reading: `Material` /
+    /// `Process` plans are creatable but unused, which is why the only
+    /// existing test of this partition supplied a genuine lot measurement
+    /// — the one direction that passes under either rule.
+    LotOnly,
+    /// A report with NO marked units, where every characteristic degrades
+    /// to a single line: any measurement of the characteristic counts.
+    ///
+    /// Kept deliberately permissive. The alternative to a permissive match
+    /// here is not a stricter report but an EMPTY one, and a report with
+    /// zero rows is vacuously "complete" — the failure this module exists
+    /// to prevent. The unit-scope mismatch this admits is caught one layer
+    /// up, by the gate's `UnitDrift` arm (round 4, B-2), which refuses a
+    /// shipment whose marks are not the marks the report froze over.
+    AnyOfCharacteristic,
+}
+
+impl Evidence<'_> {
+    /// Whether a measurement carrying `linked_part_uid` may back this line.
+    fn admits(self, linked_part_uid: Option<&str>) -> bool {
+        match self {
+            Evidence::Unit(uid) => linked_part_uid == Some(uid),
+            Evidence::LotOnly => linked_part_uid.is_none(),
+            Evidence::AnyOfCharacteristic => true,
+        }
+    }
+}
+
 /// Pick the measurement that represents a (unit, characteristic) pair.
 ///
 /// **The latest measurement wins**, by `measured_at_utc` then `qci_id`.
@@ -321,18 +391,12 @@ fn measured_at_instant(i: &QcInspection) -> Option<OffsetDateTime> {
 fn latest_measurement<'a>(
     inspections: &'a [QcInspection],
     plan_id: &str,
-    unit_uid: Option<&str>,
-    lot_level: bool,
+    rule: Evidence<'_>,
 ) -> Option<&'a QcInspection> {
     inspections
         .iter()
         .filter(|i| i.inspection_plan_id == plan_id)
-        .filter(|i| {
-            // A lot-level line accepts any measurement of the
-            // characteristic; a per-serial line demands the measurement be
-            // attributed to THAT unit.
-            lot_level || i.linked_part_uid.as_deref() == unit_uid
-        })
+        .filter(|i| rule.admits(i.linked_part_uid.as_deref()))
         .max_by(|a, b| {
             measured_at_instant(a)
                 .cmp(&measured_at_instant(b))
@@ -416,7 +480,10 @@ fn line_from(
 ///
 /// - Per-serial characteristics produce one line per unit in `units`.
 /// - Lot-level characteristics ([`is_lot_level`]) produce exactly one
-///   line, with `part_serial = None`.
+///   line, with `part_serial = None`. That line is backed ONLY by a
+///   measurement recorded as a lot fact (no `linked_part_uid`) — a
+///   per-unit measurement is evidence about that unit, not about the
+///   lot the single line stands for (round 6, B-1).
 /// - When `units` is empty (a WO with no marked parts) every
 ///   characteristic degrades to a single lot-level line rather than
 ///   producing nothing — a report with zero rows would be vacuously
@@ -448,7 +515,7 @@ pub fn build_report_lines(
         // No marked units: every characteristic reports once, at lot level.
         for plan in serial_plans.iter().chain(lot_plans.iter()) {
             line_no += 1;
-            let m = latest_measurement(inspections, &plan.plan_id, None, true);
+            let m = latest_measurement(inspections, &plan.plan_id, Evidence::AnyOfCharacteristic);
             lines.push(line_from(line_no, plan, None, m));
         }
         return lines;
@@ -460,15 +527,17 @@ pub fn build_report_lines(
             let m = latest_measurement(
                 inspections,
                 &plan.plan_id,
-                Some(unit.part_uid.as_str()),
-                false,
+                Evidence::Unit(unit.part_uid.as_str()),
             );
             lines.push(line_from(line_no, plan, Some(unit), m));
         }
     }
     for plan in &lot_plans {
         line_no += 1;
-        let m = latest_measurement(inspections, &plan.plan_id, None, true);
+        // `LotOnly`, NOT `AnyOfCharacteristic`: this report enumerates
+        // serialised units, so the one line standing for all of them must be
+        // backed by a fact about all of them (round 6, B-1 — see [`Evidence`]).
+        let m = latest_measurement(inspections, &plan.plan_id, Evidence::LotOnly);
         lines.push(line_from(line_no, plan, None, m));
     }
     lines
@@ -1418,6 +1487,15 @@ mod tests {
         p
     }
 
+    /// The OTHER half of the lot-level partition. `is_lot_level` matches
+    /// `Material` *and* `Process`, and a test that only ever built
+    /// `Material` would leave half the arm unproven.
+    fn process_plan(id: &str, feature: &str) -> InspectionPlan {
+        let mut p = plan(id, feature, Some("91"), Some(true));
+        p.characteristic_type = Some(CharacteristicType::Process);
+        p
+    }
+
     fn measurement(
         qci: &str,
         plan_id: &str,
@@ -1987,6 +2065,172 @@ mod tests {
                 unit("SN-002", "u2"),
             ]),
             Some("SN-001 … SN-003 (3 units)".to_string())
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // Round 6, B-1 — the lot-level partition, which had NO coverage at
+    // all before this round. `is_lot_level` decides whether a plan row
+    // becomes N per-serial lines or ONE lot line, and nothing pinned
+    // what that one line is allowed to consume.
+    // ═════════════════════════════════════════════════════════════════
+
+    /// **A measurement taken on ONE unit does not account for the LOT.**
+    ///
+    /// Two units marked, one measured, and the required characteristic is
+    /// lot-level. The single lot line stands for both units, so backing it
+    /// with SN-001's measurement would report SN-002 as accounted-for on
+    /// evidence that was never about SN-002 — and, because the line is the
+    /// only one, would make the whole report `accept`.
+    #[test]
+    fn a_lot_level_line_is_not_accounted_for_by_a_measurement_on_one_unit() {
+        let plans = vec![lot_plan("p9", "Heat lot conformity")];
+        let inspections = vec![measurement(
+            "q1",
+            "p9",
+            Some("uid1"), // attributed to SN-001, not to the lot
+            1.0,
+            Verdict::Pass,
+            "2026-08-02T10:00:00Z",
+        )];
+        let units = vec![unit("SN-001", "uid1"), unit("SN-002", "uid2")];
+        let lines = build_report_lines(&plans, &inspections, &units);
+
+        assert_eq!(lines.len(), 1, "a lot-level characteristic reports once");
+        assert_eq!(lines[0].accountability, Accountability::NotMeasured);
+        let counts = summarise(&lines);
+        assert_eq!(counts.required, 1);
+        assert_eq!(counts.unaccounted, 1);
+        assert_eq!(
+            compute_disposition(counts, false),
+            Disposition::Incomplete,
+            "a required lot-level characteristic with no LOT measurement \
+             must not disposition accept"
+        );
+    }
+
+    /// The same, for `Process` — the other member of the lot-level
+    /// partition. Both arms of `is_lot_level` are proven, not one.
+    #[test]
+    fn a_process_characteristic_is_lot_level_and_needs_lot_evidence() {
+        let plans = vec![process_plan("p8", "Heat treat")];
+        let inspections = vec![measurement(
+            "q1",
+            "p8",
+            Some("uid1"),
+            1.0,
+            Verdict::Pass,
+            "2026-08-02T10:00:00Z",
+        )];
+        let units = vec![unit("SN-001", "uid1"), unit("SN-002", "uid2")];
+        let lines = build_report_lines(&plans, &inspections, &units);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].characteristic_type, CharacteristicType::Process);
+        assert_eq!(lines[0].accountability, Accountability::NotMeasured);
+        assert_eq!(
+            compute_disposition(summarise(&lines), false),
+            Disposition::Incomplete
+        );
+
+        // …and a genuine LOT measurement does account for it, so the rule
+        // refuses the wrong evidence rather than refusing all evidence.
+        let lot = vec![measurement(
+            "q2",
+            "p8",
+            None,
+            1.0,
+            Verdict::Pass,
+            "2026-08-02T10:05:00Z",
+        )];
+        let lines = build_report_lines(&plans, &lot, &units);
+        assert_eq!(lines[0].accountability, Accountability::Measured);
+        assert_eq!(
+            compute_disposition(summarise(&lines), false),
+            Disposition::Accept
+        );
+    }
+
+    /// **THE round-6 blocker, at the layer it lives on.**
+    ///
+    /// One ordinary `PUT /api/inspection-plans/:id` changing
+    /// `characteristic_type` from `Dimensional` to `Process` — same
+    /// `plan_id`, same name, still required — used to re-partition the SAME
+    /// row from two per-serial lines to one lot line, which then swallowed
+    /// SN-001's measurement. `unaccounted` fell 1 → 0 and the report's
+    /// computed disposition went `Incomplete` → `Accept`, so the shipment
+    /// gate never got to decide: both of its coverage terms are satisfied
+    /// by construction once the single line is `Measured`.
+    ///
+    /// `update_plan` now refuses this edit outright once the plan has
+    /// measurements (`plans::has_recorded_evidence`). This test asserts the
+    /// second belt: even applied out of band, the flip must not turn
+    /// `Incomplete` into `Accept`.
+    #[test]
+    fn flipping_a_measured_characteristic_to_lot_level_does_not_convert_incomplete_to_accept() {
+        let mut p = plan("p1", "Bore D", Some("1"), Some(true));
+        let inspections = vec![measurement(
+            "q1",
+            "p1",
+            Some("uid1"),
+            25.0,
+            Verdict::Pass,
+            "2026-08-02T10:00:00Z",
+        )];
+        let units = vec![unit("SN-001", "uid1"), unit("SN-002", "uid2")];
+
+        // Before: two per-serial lines, one measured → incomplete.
+        let before = build_report_lines(std::slice::from_ref(&p), &inspections, &units);
+        assert_eq!(before.len(), 2);
+        assert_eq!(summarise(&before).unaccounted, 1);
+        assert_eq!(
+            compute_disposition(summarise(&before), false),
+            Disposition::Incomplete
+        );
+
+        // The flip. Nothing else about the row changes.
+        p.characteristic_type = Some(CharacteristicType::Process);
+
+        let after = build_report_lines(std::slice::from_ref(&p), &inspections, &units);
+        assert_eq!(after.len(), 1, "the flip does collapse the lines");
+        assert_eq!(
+            after[0].accountability,
+            Accountability::NotMeasured,
+            "SN-001's measurement is evidence about SN-001, not about the lot"
+        );
+        let counts = summarise(&after);
+        assert_eq!(counts.unaccounted, 1);
+        assert_ne!(
+            compute_disposition(counts, false),
+            Disposition::Accept,
+            "re-classifying a partially-measured characteristic as lot-level \
+             must NOT release the shipment"
+        );
+        assert_eq!(compute_disposition(counts, false), Disposition::Incomplete);
+    }
+
+    /// The permissive arm stays permissive, on purpose. With NO marked
+    /// units every characteristic degrades to one line matched against ANY
+    /// measurement — the alternative is an EMPTY report, which is vacuously
+    /// complete. The unit-scope mismatch this admits is the gate's
+    /// `UnitDrift` arm (round 4, B-2), one layer up, and tightening here
+    /// would move that refusal's reason and blind the test that pins it.
+    #[test]
+    fn with_no_marked_units_any_measurement_of_the_characteristic_still_counts() {
+        let plans = vec![plan("p1", "Bore D", Some("1"), Some(true))];
+        let inspections = vec![measurement(
+            "q1",
+            "p1",
+            Some("uid1"),
+            25.0,
+            Verdict::Pass,
+            "2026-08-02T10:00:00Z",
+        )];
+        let lines = build_report_lines(&plans, &inspections, &[]);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].accountability, Accountability::Measured);
+        assert_eq!(
+            compute_disposition(summarise(&lines), false),
+            Disposition::Accept
         );
     }
 }

@@ -17540,11 +17540,21 @@ pub fn resolve_open_ncr_gate(
             .into_iter()
             .map(|m| m.part_uid)
             .collect();
-    if part_uids.is_empty() {
-        return Ok(OpenNcrGate::Pass);
-    }
     let ncrs = crate::quality::list_ncrs(conn, tenant, &crate::quality::NcrFilter::default())?;
-    let blocking = crate::quality::open_ncr_ids_blocking_part_uids(&ncrs, &part_uids);
+    // Round 6, B-2 — block on the WORK ORDER as well as on its marked units.
+    //
+    // The `part_uids.is_empty()` early `Pass` that used to stand here is gone
+    // with the same change, and for the same reason: it read "no marked units"
+    // as "nothing to gate on", when an unmarked WO is precisely the shape a
+    // lot-level nonconformity is raised against. The unmarked case is still
+    // refused by `resolve_part_uid_gate` on the Defense path, so removing the
+    // exit costs nothing there and closes it here.
+    //
+    // See `open_ncr_ids_blocking_wo` for the release path this shuts: an
+    // auto-NCR spawned by a failing measurement that carried no `part_uid`
+    // has `affected_part_uids: []`, so the unit join matched nothing while a
+    // real Open NCR stood against the order.
+    let blocking = crate::quality::open_ncr_ids_blocking_wo(&ncrs, &dispatch.wo_id, &part_uids);
     if blocking.is_empty() {
         Ok(OpenNcrGate::Pass)
     } else {
@@ -17855,8 +17865,11 @@ pub fn resolve_qc_report_gate_with_capability(
         //   freeze + issue a report while NO parts are marked
         //     → `build_report_lines` sees `units.is_empty()` and degrades
         //       every characteristic to ONE lot-level line, matched by
-        //       `latest_measurement(.., lot_level = true)` against ANY
-        //       measurement of that characteristic
+        //       `latest_measurement(.., Evidence::AnyOfCharacteristic)`
+        //       against ANY measurement of that characteristic — the one
+        //       arm round 6 deliberately left permissive, because the
+        //       alternative here is an EMPTY report, and this drift is
+        //       exactly what the check below refuses
         //     → the report is a clean `accept`, `serial_range` is `None`,
         //       `qty_reported` is 1
         //   THEN mark N parts and ship

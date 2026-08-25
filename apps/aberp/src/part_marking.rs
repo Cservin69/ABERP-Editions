@@ -284,7 +284,14 @@ pub fn record_part_marks(
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 tenant,
-                m.wo_id,
+                // The GUARDED `wo_id`, not `m.wo_id`. `AlreadyMarked` above
+                // counts the marks on the `wo_id` PARAMETER, so writing the
+                // mark's own copy of it means the row could land on a WO
+                // this call never checked. The route hard-sets `m.wo_id`
+                // from the path today, so the two agree and no caller is
+                // affected; the point is that a future internal caller
+                // cannot make them disagree and walk past the guard.
+                wo_id,
                 m.unit_index as i64,
                 m.part_uid,
                 m.serial_number,

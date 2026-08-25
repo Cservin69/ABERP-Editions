@@ -347,7 +347,15 @@ fn a_frozen_report_is_immune_to_later_plan_edits() {
     let before = list_report_lines(&conn, TEST_TENANT, &qcr_id).unwrap();
     let report_before = get_report(&conn, TEST_TENANT, &qcr_id).unwrap().unwrap();
 
-    // Now mutate the master data underneath it.
+    // Now mutate the master data underneath it. Everything an operator can
+    // edit on a measured plan moves: nominal, both tolerances, balloon
+    // number, method, zone, and the required flag.
+    //
+    // `characteristic_type` deliberately does NOT move — round 6 made it
+    // un-editable once a plan has measurements (it decides whether the
+    // characteristic reports per-serial or once for the lot, so re-reading
+    // existing evidence under a new classification is a rewritten record).
+    // The refusal is asserted below, against these same frozen lines.
     update_inspection_plan(
         &conn,
         TEST_TENANT,
@@ -363,7 +371,7 @@ fn a_frozen_report_is_immune_to_later_plan_edits() {
             enabled: true,
             characteristic_number: Some("999".into()),
             characteristic_designator: None,
-            characteristic_type: Some(CharacteristicType::Note),
+            characteristic_type: Some(CharacteristicType::Dimensional),
             inspection_method: Some(InspectionMethod::Visual),
             sheet_zone: Some("9/Z9".into()),
             is_required: Some(false),
@@ -380,6 +388,152 @@ fn a_frozen_report_is_immune_to_later_plan_edits() {
     );
     assert_eq!(report_before, report_after);
     assert_eq!(after.len(), 2, "the archived characteristic's row remains");
+
+    // ── Round 6, B-1 — and the ONE edit that is now refused outright. ──
+    //
+    // `characteristic_type` is not a label; `build_report_lines` partitions
+    // on it, so `Dimensional` → `Process` re-reads the SAME plan row from N
+    // per-serial lines to ONE lot-level line. On a partially-measured WO
+    // that collapse dropped `unaccounted` to 0 and turned the computed
+    // disposition from `incomplete` into `accept` — the release happened
+    // below the shipment gate, which only ever reads the disposition.
+    let refused = update_inspection_plan(
+        &conn,
+        TEST_TENANT,
+        &p1,
+        NewInspectionPlan {
+            product_id: "prd_bracket".into(),
+            feature_name: "Bore D".into(),
+            nominal_value: 99.0,
+            upper_tol: 5.0,
+            lower_tol: -5.0,
+            units: "mm".into(),
+            optional_probe_cycle_id: None,
+            enabled: true,
+            characteristic_number: Some("999".into()),
+            characteristic_designator: None,
+            characteristic_type: Some(CharacteristicType::Process),
+            inspection_method: Some(InspectionMethod::Visual),
+            sheet_zone: Some("9/Z9".into()),
+            is_required: Some(false),
+        },
+    );
+    match refused {
+        Err(aberp_qa::QcError::Validation(m)) => {
+            assert!(
+                m.contains("characteristic_type"),
+                "the refusal must name the field it refused: {m}"
+            );
+        }
+        other => panic!("expected a Validation refusal, got {other:?}"),
+    }
+    // The refused edit persisted nothing.
+    let plan_now = aberp_qa::get_inspection_plan(&conn, TEST_TENANT, &p1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        plan_now.characteristic_type,
+        Some(CharacteristicType::Dimensional)
+    );
+}
+
+/// The type IS editable while the characteristic has no evidence — the
+/// guard keys on measurements, not on the plan's age. Without this the
+/// refusal could be "always refuse", which would break plan setup.
+#[test]
+fn characteristic_type_is_editable_until_the_first_measurement() {
+    let mut conn = setup_db();
+    let p1 = seed_plan(&conn, "Coating", "7", true);
+
+    // No measurement yet → the re-classification goes through.
+    let edited = update_inspection_plan(
+        &conn,
+        TEST_TENANT,
+        &p1,
+        NewInspectionPlan {
+            product_id: "prd_bracket".into(),
+            feature_name: "Coating".into(),
+            nominal_value: 25.0,
+            upper_tol: 0.05,
+            lower_tol: -0.05,
+            units: "mm".into(),
+            optional_probe_cycle_id: None,
+            enabled: true,
+            characteristic_number: Some("7".into()),
+            characteristic_designator: None,
+            characteristic_type: Some(CharacteristicType::Process),
+            inspection_method: Some(InspectionMethod::Visual),
+            sheet_zone: None,
+            is_required: Some(true),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        edited.characteristic_type,
+        Some(CharacteristicType::Process)
+    );
+
+    // After a measurement, an ordinary edit that leaves the type alone
+    // still works — only the re-classification is refused.
+    measure(&mut conn, &p1, "uid1", 25.0);
+    let ordinary = update_inspection_plan(
+        &conn,
+        TEST_TENANT,
+        &p1,
+        NewInspectionPlan {
+            product_id: "prd_bracket".into(),
+            feature_name: "Coating".into(),
+            nominal_value: 25.0,
+            upper_tol: 0.10,
+            lower_tol: -0.10,
+            units: "mm".into(),
+            optional_probe_cycle_id: None,
+            enabled: true,
+            characteristic_number: Some("7".into()),
+            characteristic_designator: None,
+            characteristic_type: Some(CharacteristicType::Process),
+            inspection_method: Some(InspectionMethod::Visual),
+            sheet_zone: None,
+            is_required: Some(true),
+        },
+    )
+    .unwrap();
+    assert_eq!(ordinary.upper_tol, 0.10);
+}
+
+/// A pre-ADR-0199 client omits `characteristic_type` entirely, and
+/// `None` READS as `Dimensional`. The guard compares EFFECTIVE types, so
+/// a legacy body editing a measured dimensional plan is not a
+/// re-classification and must not 400 — the commonest edit there is.
+#[test]
+fn a_legacy_body_omitting_the_type_is_not_a_reclassification() {
+    let mut conn = setup_db();
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    measure(&mut conn, &p1, "uid1", 25.0);
+    let edited = update_inspection_plan(
+        &conn,
+        TEST_TENANT,
+        &p1,
+        NewInspectionPlan {
+            product_id: "prd_bracket".into(),
+            feature_name: "Bore D".into(),
+            nominal_value: 25.0,
+            upper_tol: 0.08,
+            lower_tol: -0.08,
+            units: "mm".into(),
+            optional_probe_cycle_id: None,
+            enabled: true,
+            characteristic_number: None,
+            characteristic_designator: None,
+            characteristic_type: None, // the legacy body
+            inspection_method: None,
+            sheet_zone: None,
+            is_required: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(edited.upper_tol, 0.08);
+    assert_eq!(edited.characteristic_type, None);
 }
 
 // ─────────────────────────────────────────────────────────────────────

@@ -262,6 +262,30 @@ pub fn create_plan(
         .ok_or_else(|| QcError::Storage(anyhow::anyhow!("plan vanished after insert")))
 }
 
+/// Whether this plan already has EVIDENCE recorded against it — any
+/// `qc_inspections` row taken on it.
+///
+/// The frozen `qc_report_lines` half of the question needs no separate
+/// query: a line identifies its plan only through `qci_id`
+/// (`parse_line_row` carries no `plan_id`), so a frozen line that names
+/// this plan implies an inspection row that names it too. The unmeasured
+/// accountability rows carry no `qci_id` at all and identify no plan.
+fn has_recorded_evidence(conn: &Connection, tenant: &str, plan_id: &str) -> Result<bool, QcError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT 1 FROM qc_inspections
+             WHERE tenant_id = ? AND inspection_plan_id = ? LIMIT 1;",
+        )
+        .map_err(|e| QcError::Storage(anyhow::anyhow!("prepare evidence-check: {e}")))?;
+    let mut rows = stmt
+        .query(params![tenant, plan_id])
+        .map_err(|e| QcError::Storage(anyhow::anyhow!("query evidence-check: {e}")))?;
+    Ok(rows
+        .next()
+        .map_err(|e| QcError::Storage(anyhow::anyhow!("read evidence-check: {e}")))?
+        .is_some())
+}
+
 /// Edit an existing (non-archived) plan in place.
 pub fn update_plan(
     conn: &Connection,
@@ -273,6 +297,54 @@ pub fn update_plan(
     let existing = get_plan(conn, tenant, plan_id)?.ok_or(QcError::NotFound)?;
     if existing.archived_at.is_some() {
         return Err(QcError::Validation("cannot edit an archived plan".into()));
+    }
+    // ── Round 6, B-1 — a characteristic's TYPE stops being editable once
+    // it has been measured. ───────────────────────────────────────────
+    //
+    // `characteristic_type` is not a label on the row; it decides how the
+    // characteristic is REPORTED. `build_report_lines` partitions on it:
+    // `Material`/`Process` are lot-level and produce ONE line for the whole
+    // shipment, everything else produces one line PER serialised unit. So a
+    // single ordinary edit that changes only this field silently re-reads
+    // the evidence already on file — on a WO with two marked units and one
+    // measured, `Dimensional` → `Process` collapsed two lines to one,
+    // dropped `unaccounted` from 1 to 0, and turned the report's computed
+    // disposition from `Incomplete` into `Accept`. The shipment gate reads
+    // the disposition, so the release happened a layer below it.
+    //
+    // The evidence layer is fixed too ([`Evidence::LotOnly`] in `reports`),
+    // and that fix alone is enough to stop the release. This guard is the
+    // other half, and it is kept because the two answer different
+    // questions: the reporting rule decides what a lot-level line may
+    // consume, while this refuses to RE-CLASSIFY a characteristic whose
+    // measurements were taken, and whose already-frozen report lines were
+    // written, under the old classification. Re-labelling measured evidence
+    // after the fact is the thing an AS9100 auditor reads as a rewritten
+    // record, whatever the disposition comes out as.
+    //
+    // Compared on the EFFECTIVE type, not the raw `Option`. A pre-ADR-0199
+    // SPA body omits the field entirely and `effective_type` reads `None`
+    // as `Dimensional`, so an old client editing a tolerance on a
+    // dimensional plan is unchanged — the alternative would 400 every
+    // legacy edit of a measured plan, which is a false block on the
+    // commonest path there is.
+    //
+    // Untouched plans stay fully editable, and a plan WITH measurements
+    // stays editable in every other field. Only the re-classification is
+    // refused, and the remedy is the honest one: archive this
+    // characteristic and create the new one, which mints a fresh `plan_id`
+    // and therefore has to be measured on its own account (the identity
+    // coverage term the gate already enforces).
+    let old_kind = existing.characteristic_type.unwrap_or_default();
+    let new_kind = input.characteristic_type.unwrap_or_default();
+    if new_kind != old_kind && has_recorded_evidence(conn, tenant, plan_id)? {
+        return Err(QcError::Validation(format!(
+            "cannot change characteristic_type from {} to {} on a plan that \
+             has recorded inspections — archive this characteristic and \
+             create a new one",
+            old_kind.as_str(),
+            new_kind.as_str()
+        )));
     }
     ensure_unique(
         conn,
