@@ -196,6 +196,36 @@ fn promote_plan_to_required(conn: &Connection, plan_id: &str, feature: &str, num
     .unwrap();
 }
 
+/// Rewrite an existing plan row's NAME, balloon number and required flag,
+/// leaving nominal/tolerances as `seed_plan` wrote them. The generalisation
+/// of `promote_plan_to_required` — same route
+/// (`PUT /api/inspection-plans/:id`), same in-place edit, so the row keeps
+/// its `plan_id`.
+fn rewrite_plan(conn: &Connection, plan_id: &str, feature: &str, number: &str, required: bool) {
+    aberp_qa::update_inspection_plan(
+        conn,
+        T,
+        plan_id,
+        NewInspectionPlan {
+            product_id: "prd_bracket".into(),
+            feature_name: feature.into(),
+            nominal_value: 25.0,
+            upper_tol: 0.05,
+            lower_tol: -0.05,
+            units: "mm".into(),
+            optional_probe_cycle_id: None,
+            enabled: true,
+            characteristic_number: Some(number.into()),
+            characteristic_designator: None,
+            characteristic_type: Some(CharacteristicType::Dimensional),
+            inspection_method: Some(InspectionMethod::OnMachineProbe),
+            sheet_zone: None,
+            is_required: Some(required),
+        },
+    )
+    .unwrap();
+}
+
 fn measure(conn: &mut Connection, plan_id: &str, part_uid: &str, actual: f64) {
     let m = meta();
     let plan = aberp_qa::get_inspection_plan(conn, T, plan_id)
@@ -2273,4 +2303,303 @@ fn a_report_covering_only_some_marked_units_does_not_release_the_rest() {
         }
         other => panic!("an unenumerated third unit shipped: {other:?}"),
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Round 5, B-1 — the plan-identity coverage collapse.
+//
+// Round 4 shut the case where two ACTIVE plans collapse onto one stored
+// name, at source, in `ensure_unique`. It could not shut the deeper one:
+// `ensure_unique` ranges only over NON-archived rows, a stored name is
+// freed by archiving AND by renaming, and a frozen `qc_report_lines` row
+// outlives both — while `line_from` copies `characteristic_name` from the
+// MEASUREMENT's snapshot, never from the live plan. So the gate's
+// name-keyed join let one plan's measurement stand in for a DIFFERENT
+// plan's required characteristic, with no normalisation trick at all.
+//
+// Three sequences reach it. Each is pinned below, each must BLOCK, and
+// each carries its own positive control so "always blocks" cannot pass.
+//
+// **The mutation for all three:** delete the `identity_covered &&` term
+// from the coverage `if` in `resolve_qc_report_gate_with_capability`. Every
+// one of them then returns `Pass` and every `Blocked` assertion goes red.
+// ═════════════════════════════════════════════════════════════════════
+
+/// **B-1, variant 1 — archive, then re-create under the freed name.**
+///
+/// Plan A "Bore D" is required and measured; the report is frozen, issued
+/// `accept`, and releases the shipment. Engineering then archives A and
+/// creates plan B under the SAME name with a tighter band — `ensure_unique`
+/// cannot see the archived A, so B is accepted — and never measures it.
+///
+/// `required_now` is {"Bore D"} (plan B) and `covered` is {"Bore D"} (plan
+/// A's frozen line, measured against the OLD band), so the name join said
+/// covered and a required, never-measured characteristic shipped.
+#[test]
+fn an_archived_plans_measurement_cannot_cover_its_recreated_namesake() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+
+    let plan_a = seed_plan(&conn, "Bore D", "1", true);
+    measure(&mut conn, &plan_a, &units[0].part_uid, 25.0);
+    let (qcr_a, disp) = issue_report_for(&mut conn, &units);
+    assert_eq!(
+        disp,
+        Disposition::Accept,
+        "precondition: the report releases"
+    );
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the shipment is released before the plan is replaced"
+    );
+
+    // The drawing is revised. A is archived; B takes its name and its
+    // balloon, with a tighter band, and is never measured.
+    aberp_qa::archive_inspection_plan(&conn, T, &plan_a).unwrap();
+    let plan_b = create_inspection_plan(
+        &conn,
+        T,
+        NewInspectionPlan {
+            product_id: "prd_bracket".into(),
+            feature_name: "Bore D".into(),
+            nominal_value: 25.0,
+            upper_tol: 0.01,
+            lower_tol: -0.01,
+            units: "mm".into(),
+            optional_probe_cycle_id: None,
+            enabled: true,
+            characteristic_number: Some("1".into()),
+            characteristic_designator: None,
+            characteristic_type: Some(CharacteristicType::Dimensional),
+            inspection_method: Some(InspectionMethod::OnMachineProbe),
+            sheet_zone: None,
+            is_required: Some(true),
+        },
+    )
+    .expect("archiving frees the name — ensure_unique is scoped to active rows")
+    .plan_id;
+    assert_ne!(plan_b, plan_a, "a re-created plan is a NEW identity");
+
+    // The name-keyed join alone cannot tell these two apart: both sides of
+    // it read "Bore D". Pin that, so the assertion below is unambiguously
+    // about identity and not about some incidental difference.
+    let names_now: Vec<String> = list_inspection_plans(&conn, T, Some("prd_bracket"), false)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.feature_name)
+        .collect();
+    assert_eq!(
+        names_now,
+        vec!["Bore D".to_string()],
+        "the live plan set is one characteristic, named exactly as the frozen line is"
+    );
+
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason, qcr_id: id, ..
+        } => {
+            assert_eq!(
+                reason,
+                QcReportBlockReason::PlanDrift,
+                "a required characteristic nothing ever measured must not ship"
+            );
+            assert_eq!(id.as_deref(), Some(qcr_a.as_str()));
+        }
+        other => panic!(
+            "plan {plan_b} is required and was NEVER measured, yet report {qcr_a} — which \
+             measured the ARCHIVED plan {plan_a} against a wider band — released the \
+             shipment: {other:?}"
+        ),
+    }
+
+    // Positive control: measure the characteristic that is actually
+    // required today, issue a fresh report, and the shipment releases. The
+    // block is caused by the gap, not by the gate refusing on principle.
+    measure(&mut conn, &plan_b, &units[0].part_uid, 25.0);
+    let (_, disp_b) = issue_report_for_at(&mut conn, &units, now() + time::Duration::hours(1));
+    assert_eq!(disp_b, Disposition::Accept);
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "measuring the plan that is required TODAY releases the shipment"
+    );
+}
+
+/// **B-1, variant 2 — rename an existing plan onto the freed name.**
+///
+/// No new plan row at all. Plan A "Bore D" is required and measured; plan C
+/// "Face Z" is OPTIONAL and never measured, so the report still issues
+/// `accept` (an optional blank is an accountability row, not an
+/// `unaccounted`). Archive A, then rename C onto "Bore D" and promote it —
+/// `ensure_unique` sees no active "Bore D", so the edit is accepted.
+///
+/// C is now a required characteristic with no measurement anywhere, and the
+/// name join reads C's requirement as covered by A's frozen line.
+#[test]
+fn a_plan_renamed_onto_an_archived_name_is_not_covered_by_its_measurement() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+
+    let plan_a = seed_plan(&conn, "Bore D", "1", true);
+    let plan_c = seed_plan(&conn, "Face Z", "7", false);
+    measure(&mut conn, &plan_a, &units[0].part_uid, 25.0);
+
+    let (qcr_a, disp) = issue_report_for(&mut conn, &units);
+    assert_eq!(
+        disp,
+        Disposition::Accept,
+        "precondition: an unmeasured OPTIONAL characteristic does not make the report incomplete"
+    );
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the shipment is released before the rename"
+    );
+
+    aberp_qa::archive_inspection_plan(&conn, T, &plan_a).unwrap();
+    rewrite_plan(&conn, &plan_c, "Bore D", "1", true);
+
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason, qcr_id: id, ..
+        } => {
+            assert_eq!(reason, QcReportBlockReason::PlanDrift);
+            assert_eq!(id.as_deref(), Some(qcr_a.as_str()));
+        }
+        other => panic!(
+            "plan {plan_c} was renamed onto the archived plan {plan_a}'s name and promoted to \
+             required without ever being measured, yet report {qcr_a} released the shipment: \
+             {other:?}"
+        ),
+    }
+
+    // Positive control.
+    measure(&mut conn, &plan_c, &units[0].part_uid, 25.0);
+    let (_, disp_c) = issue_report_for_at(&mut conn, &units, now() + time::Duration::hours(1));
+    assert_eq!(disp_c, Disposition::Accept);
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "measuring the renamed characteristic releases the shipment"
+    );
+}
+
+/// **B-1, variant 3 — free the name with no archival at all.**
+///
+/// The one that needs nothing unusual: plan A "Bore D" is required and
+/// measured, the report releases. A is then RENAMED to "Bore X" and demoted
+/// to optional — both ordinary `PUT /api/inspection-plans/:id` edits — which
+/// frees "Bore D" among ACTIVE rows. Plan B is created under it, required,
+/// never measured, and `ensure_unique` has nothing to object to.
+///
+/// A drops out of `required_now` (it is optional now) and B enters it, while
+/// `covered` still reads "Bore D" from A's frozen line — because the line
+/// carries the measurement's snapshot of the name, which the rename does not
+/// touch. Neither `ensure_unique` nor the archived-row question is involved.
+#[test]
+fn demoting_the_measured_plan_frees_its_name_but_not_its_coverage() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+
+    let plan_a = seed_plan(&conn, "Bore D", "1", true);
+    measure(&mut conn, &plan_a, &units[0].part_uid, 25.0);
+    let (qcr_a, disp) = issue_report_for(&mut conn, &units);
+    assert_eq!(
+        disp,
+        Disposition::Accept,
+        "precondition: the report releases"
+    );
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the shipment is released before the edits"
+    );
+
+    rewrite_plan(&conn, &plan_a, "Bore X", "1", false);
+    let plan_b = seed_plan(&conn, "Bore D", "2", true);
+    assert_ne!(plan_b, plan_a);
+
+    // Nothing is archived here — both plans are live — and the frozen line
+    // still reads "Bore D" because it snapshots the MEASUREMENT's name.
+    let live: Vec<(bool, String)> = list_inspection_plans(&conn, T, Some("prd_bracket"), false)
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.counts_toward_accountability(), p.feature_name))
+        .collect();
+    assert_eq!(
+        live,
+        vec![(true, "Bore D".to_string()), (false, "Bore X".to_string())],
+        "two ACTIVE plans, distinct names — the round-4 uniqueness check has nothing to catch"
+    );
+    let frozen: Vec<String> = aberp_qa::list_report_lines(&conn, T, &qcr_a)
+        .unwrap()
+        .into_iter()
+        .map(|l| l.characteristic_name)
+        .collect();
+    assert_eq!(
+        frozen,
+        vec!["Bore D".to_string()],
+        "the rename does not reach the frozen line: it snapshots the measurement's name"
+    );
+
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason, qcr_id: id, ..
+        } => {
+            assert_eq!(reason, QcReportBlockReason::PlanDrift);
+            assert_eq!(id.as_deref(), Some(qcr_a.as_str()));
+        }
+        other => panic!(
+            "plan {plan_b} is required and was never measured; only the demoted, RENAMED plan \
+             {plan_a} was — yet report {qcr_a} released the shipment: {other:?}"
+        ),
+    }
+
+    // Positive control — and it also proves the identity check does not
+    // demand a measurement for the OPTIONAL plan A, which is still live.
+    measure(&mut conn, &plan_b, &units[0].part_uid, 25.0);
+    let (_, disp_b) = issue_report_for_at(&mut conn, &units, now() + time::Duration::hours(1));
+    assert_eq!(disp_b, Disposition::Accept);
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "measuring the newly required characteristic releases the shipment"
+    );
 }

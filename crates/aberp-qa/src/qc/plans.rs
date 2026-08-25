@@ -160,15 +160,26 @@ fn validate(input: &NewInspectionPlan) -> Result<(), QcError> {
 /// not `" Bore D "`), passed the check, and was then written under the
 /// same STORED name as the first — two active plans, one stored key.
 ///
-/// That is not a cosmetic duplicate. `(product, feature_name)` is the join
-/// the shipment gate uses to decide whether an issued QC report still
-/// covers the inspection plan (`resolve_qc_report_gate_with_capability`):
+/// That is not a cosmetic duplicate. `(product, feature_name)` is one of the
+/// two joins the shipment gate uses to decide whether an issued QC report
+/// still covers the inspection plan (`resolve_qc_report_gate_with_capability`):
 /// it builds `required_now` as a SET of trimmed plan names and asks whether
 /// every one of them is covered by the report's frozen lines. Two active
 /// plans sharing a stored name collapse to ONE element of that set, so the
 /// first plan's measurement covers the second plan's name — and a required
 /// characteristic that was never measured at all rides out on it. Refusing
 /// the duplicate at source is what keeps the name-keyed join honest.
+///
+/// **This is NOT a uniqueness key on the table** — it is uniqueness among
+/// the rows that are active RIGHT NOW. The `archived_at IS NULL` predicate
+/// below is load-bearing and deliberate (an archived plan must not block
+/// re-creating the characteristic it documented), but it means a stored name
+/// is freed by archiving, and by renaming, and a frozen `qc_report_lines`
+/// row outlives both. So this check cannot be the gate's only defence:
+/// the gate also keys coverage on `plan_id`, through
+/// `qc_report_lines.qci_id` → `qc_inspections.inspection_plan_id` (round 5,
+/// B-1). Reasoning about the name join as though it were backed by a real
+/// unique constraint is exactly what left that gap open for four rounds.
 ///
 /// The comparison is trim-only, deliberately: it is the exact
 /// normalisation the writes apply, so the check and the storage cannot

@@ -1290,11 +1290,120 @@ normalise differently, or do not re-read at all.
 - **`UnitDrift` compares the rendered range string, not the serial SET.**
   `serial_range_of` prints first … last (n units), so a mark set with the
   same first serial, last serial and count but a different middle compares
-  equal. That is unreachable through `record_part_marks` (which writes the
-  set once) and would require an out-of-band write that preserves all three
-  terms; comparing the full set would mean re-deriving the enumeration from
+  equal. The residual is one term wider than that: `serial_range_of` reads
+  only `part_serial`, so a mark set whose SERIALS are all preserved but whose
+  `part_uid`s were rewritten also compares equal — and `part_uid` is the term
+  the per-serial measurement join (`latest_measurement`) and the NCR belt
+  both key on, so the identity that matters most to coverage is the one the
+  comparison cannot see. Both shapes are unreachable through
+  `record_part_marks` (which writes the set once and refuses a second write)
+  and would require an out-of-band write that preserves every printed term;
+  comparing the full set would mean re-deriving the enumeration from
   `qc_report_lines`, which is itself empty of per-unit rows when every
   characteristic is lot-level.
+
+### Round-5 behaviours pinned by mutation testing
+
+The round-4 adversarial confirmed both round-4 fixes (12/12 mutations killed,
+every round-3 item still closed) and found that **B-1 was only half closed**.
+Round 4 shut the case where two *simultaneously active* plans collapse onto
+one stored name. It did not shut the case where they are never active at the
+same time — which needs no normalisation trick at all.
+
+- **(B-1, deeper) the coverage join keyed on a BORROWABLE label.**
+  `qc_report_lines` has no `plan_id` column, and `line_from` copies
+  `characteristic_name` from the MEASUREMENT's snapshot (`m.feature_name`),
+  not from the live plan. `ensure_unique` enforces its key only among
+  NON-archived rows — deliberately, so an archived plan cannot block
+  re-creating the characteristic it documented — but a frozen
+  `qc_report_lines` row outlives archival, and a stored name is freed by
+  archiving *and* by renaming. Three ordinary sequences therefore let one
+  plan's measurement stand in for a DIFFERENT plan's required
+  characteristic:
+
+  1. plan A "Bore D" required + measured, report frozen + issued `accept`
+     → archive A → create plan B "Bore D", required, tighter band, never
+     measured (`ensure_unique` cannot see the archived A);
+  2. the same, but B already exists as an OPTIONAL characteristic under
+     another name and is RENAMED onto the freed "Bore D" and promoted;
+  3. **no archival at all** — rename A to "Bore X" and demote it to
+     optional (two ordinary `PUT /api/inspection-plans/:id` edits), which
+     frees "Bore D" among active rows, then create B under it.
+
+  In all three `required_now` is `{"Bore D"}` (plan B, never measured) and
+  `covered` is `{"Bore D"}` (plan A's frozen line, measured against the OLD
+  band), so the gate passed and a required, never-measured characteristic
+  shipped on a document that describes a different characteristic.
+
+- **Coverage is now keyed on plan IDENTITY as well, from data already
+  persisted.** `qc_report_lines.qci_id` → `qc_inspections.inspection_plan_id`
+  — the very key `latest_measurement` joined on when the line was built —
+  read back through the already-public `list_inspections_for_wo`. A required
+  plan is covered only if some `Measured` line resolves to ITS `plan_id`.
+  `plan_id` is minted once and `update_plan` edits in place, so an ordinary
+  name or tolerance edit keeps its identity and cannot false-block, while a
+  different plan row is a different id whatever it is called. **No schema
+  change, no migration, no new `EventKind`** — the block reuses `PlanDrift`
+  and `ALL_KINDS_COUNT` stays **195**. The `product_id` variant of round 4's
+  collapse falls out for free: a plan filed under a padded product id is
+  still a distinct `plan_id`, so it must be measured on its own account.
+
+- **Both joins are kept, and the mutation proves neither subsumes the
+  other.** Dropping the identity term turns exactly the three new probes red
+  and leaves the other 28 green; dropping the NAME term instead turns
+  `a_characteristic_measured_on_only_some_units_is_not_covered_for_the_rest`
+  red on its own — identity is per PLAN, while the `NotMeasured` subtraction
+  is per plan AND per line, so a characteristic measured on unit 1 and left
+  blank on unit 2 has its `plan_id` in the measured set either way. The name
+  check also still blocks a bare rename of the measured plan, which identity
+  passes. Pinned by
+  `an_archived_plans_measurement_cannot_cover_its_recreated_namesake`,
+  `a_plan_renamed_onto_an_archived_name_is_not_covered_by_its_measurement`
+  and `demoting_the_measured_plan_frees_its_name_but_not_its_coverage`, each
+  asserting the pre-attack `Pass` first and each carrying a positive control
+  (measure the plan that is required TODAY, re-issue → `Pass`), so
+  "block everything" cannot satisfy them.
+
+- **Two comments that made this gap easy to reason past are corrected.**
+  `ensure_unique`'s doc and the gate's join comment both called
+  `(product, feature_name)` "the plan table's own uniqueness key". It is not
+  a key on the table — it is uniqueness among the rows that are active right
+  now, and treating it as a real unique constraint is precisely what left
+  this open for four rounds. Both now say so, and both name the identity
+  join as the other half.
+
+### Round-5 residuals, stated
+
+- **The NCR belt matches on PART UIDs only, so a lot-level failure does not
+  block.** `open_ncr_ids_blocking_part_uids` intersects an open NCR's
+  `affected_part_uids` with the WO's marked units. A measurement recorded
+  with `linked_part_uid = None` — the first-article or lot-level check, the
+  same shape `build_report_lines` matches with `lot_level = true` — spawns an
+  auto-NCR whose `affected_part_uids` is EMPTY
+  (`req.part_uid.clone().into_iter().collect()` over a `None`), so the
+  intersection is empty and the NCR does not block the shipment even while it
+  is `Open`. The QC-report gate covers the case where such a failure is *in
+  the report* (a failing verdict makes the report `reject` and
+  `permits_shipment()` is false), so this is the belt, not the braces: it
+  bites when the failing measurement lands AFTER issuance, where the report is
+  frozen by design and the NCR is the only live signal.
+
+  **The missing data is not missing.** The same call site already writes
+  `affected_wo_ids: req.wo_id.clone().into_iter().collect()`, and
+  `resolve_open_ncr_gate` already holds `dispatch.wo_id` — it simply never
+  consults either. Closing this is a widening of the pure helper to match on
+  the WO as well as the units, not a data-model change; it is stated rather
+  than done here because it is the NCR gate's scope (ADR-0090 / S439), not
+  this ADR's, and because widening a shipment gate deserves its own
+  counter-direction tests. Note the second arm too: `resolve_open_ncr_gate`
+  returns `Pass` outright when the WO has no marked units, so a WO-scoped NCR
+  on an unmarked WO would still need that early exit revisited.
+- **A `Measured` line whose `qci_id` resolves to no inspection counts as NOT
+  covering its plan.** Through the application that cannot happen — the
+  report was frozen from this very list and `qc_inspections` has no delete
+  path — so it is the same posture as
+  `refuse_unparseable_report_timestamps`: a refusal only an out-of-band write
+  reaches, kept because stopping beats guessing.
 
 ---
 

@@ -17921,9 +17921,13 @@ pub fn resolve_qc_report_gate_with_capability(
         // an `accept` otherwise left the old report releasing forever, over
         // evidence that never covered the new one.
         //
-        // `(product, feature_name)` is the plan table's own uniqueness key
-        // and is exactly what `build_report_lines` writes into
-        // `characteristic_name`, so it is the join.
+        // `(product, feature_name)` is what `build_report_lines` writes into
+        // `characteristic_name`, so it is the join — but it is the plan
+        // table's uniqueness key only among CURRENTLY-ACTIVE rows
+        // (`ensure_unique` filters on `archived_at IS NULL`), and a frozen
+        // line outlives the plan it was taken from. That is why the name
+        // join is only half the check; the identity join below is the other
+        // half, and neither one covers the other's case.
         //
         // **A characteristic is COVERED only if EVERY line for it carries a
         // measurement** (round 3, B1-a). `freeze_report` writes a line for
@@ -17973,7 +17977,91 @@ pub fn resolve_qc_report_gate_with_capability(
             .map(|l| l.characteristic_name.as_str())
             .filter(|n| !unmeasured.contains(n))
             .collect();
-        if required_now.iter().all(|n| covered.contains(n)) {
+
+        // ── Round 5, B-1 — the SAME coverage question, asked of the plan's
+        // IDENTITY instead of its display name. ─────────────────────────
+        //
+        // The name-keyed join above closes the case where two ACTIVE plans
+        // collapse onto one stored name (round 4 shut that at source, in
+        // `ensure_unique`). It cannot close the case where the two plans are
+        // never active at the same time, because `ensure_unique` only ranges
+        // over NON-archived rows while frozen `qc_report_lines` outlive
+        // archival — and `line_from` takes `characteristic_name` from the
+        // MEASUREMENT's snapshot, not from the live plan. So a name is a
+        // borrowable label, and three ordinary sequences borrow it:
+        //
+        //   1. plan A "Bore D" required + measured, report frozen + issued
+        //      (`accept`) → archive A → create plan B "Bore D", required,
+        //      tighter band, never measured. `ensure_unique` cannot see the
+        //      archived A, so B is accepted.
+        //   2. the same, but B already exists as an OPTIONAL characteristic
+        //      under another name and is RENAMED onto the freed "Bore D".
+        //   3. no archival at all: RENAME A to "Bore X" and demote it to
+        //      optional, which frees "Bore D" among active rows, then create
+        //      B "Bore D" required and never measured.
+        //
+        // In all three `required_now` is {"Bore D"} (plan B, never measured)
+        // and `covered` is {"Bore D"} (plan A's frozen line, measured against
+        // the OLD band) — so the name join passes and a required,
+        // never-measured characteristic ships.
+        //
+        // `plan_id` is minted once and never reused: `update_plan` edits the
+        // row in place, so an ordinary name or tolerance edit keeps the same
+        // identity and cannot false-block, while a DIFFERENT plan row is a
+        // different id no matter what it is called. Keying coverage on it
+        // asks the question the name was standing in for — "was THIS
+        // characteristic measured?" — and the answer stops being borrowable.
+        //
+        // The link is already persisted; nothing new is stored. A `Measured`
+        // line carries the `qci_id` it froze, and `qc_inspections` carries
+        // the `inspection_plan_id` the measurement was taken against — which
+        // is the very key `latest_measurement` joined on when the line was
+        // built. Reading it back through `list_inspections_for_wo` is reading
+        // back the same join, one release later.
+        //
+        // **Both checks are kept, and they are not redundant.** Identity is
+        // PER PLAN; the name check is per plan AND per line. So identity
+        // alone re-opens round 3's B1-a: a characteristic measured on unit 1
+        // and left blank on unit 2 has its `plan_id` in `measured_plan_ids`
+        // either way, and only the `unmeasured` subtraction above sees the
+        // gap — dropping the name term turns
+        // `a_characteristic_measured_on_only_some_units_is_not_covered_for_the_rest`
+        // red on its own. The name check also still blocks a bare RENAME of
+        // the measured plan, which identity passes. Neither subsumes the
+        // other, so the gate demands both.
+        //
+        // The `product_id` variant of round 4's collapse falls out for free:
+        // a second plan filed under a padded product id is still a distinct
+        // `plan_id`, so it must be measured on its own account.
+        //
+        // A `Measured` line whose `qci_id` resolves to nothing is dropped and
+        // therefore counts as NOT covering its plan. Through the application
+        // that cannot happen — the report was frozen from this very list, and
+        // `qc_inspections` has no delete path — so this is the same posture as
+        // `refuse_unparseable_report_timestamps`: only an out-of-band write
+        // reaches it, and stopping beats guessing.
+        let inspections = aberp_qa::list_inspections_for_wo(conn, tenant, &wo.wo_id)
+            .map_err(|e| anyhow!("list QC inspections for {}: {e}", wo.wo_id))?;
+        let plan_of_qci: std::collections::HashMap<&str, &str> = inspections
+            .iter()
+            .map(|i| (i.qci_id.as_str(), i.inspection_plan_id.as_str()))
+            .collect();
+        let measured_plan_ids: std::collections::BTreeSet<&str> = report_lines
+            .iter()
+            .filter(|l| l.accountability == aberp_qa::Accountability::Measured)
+            .filter_map(|l| l.qci_id.as_deref())
+            .filter_map(|q| plan_of_qci.get(q).copied())
+            .collect();
+        let required_plan_ids: std::collections::BTreeSet<&str> = plans
+            .iter()
+            .filter(|p| p.enabled && p.counts_toward_accountability())
+            .map(|p| p.plan_id.as_str())
+            .collect();
+        let identity_covered = required_plan_ids
+            .iter()
+            .all(|id| measured_plan_ids.contains(id));
+
+        if identity_covered && required_now.iter().all(|n| covered.contains(n)) {
             return Ok(QcReportGate::Pass);
         }
         return Ok(QcReportGate::Blocked {
