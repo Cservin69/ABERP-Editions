@@ -248,12 +248,26 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
         "NAV credentials loaded; actor derived for this CLI invocation"
     );
 
-    // 3. Load the previously-issued invoice + its idempotency key.
-    let mut conn = Connection::open(&args.db)
-        .with_context(|| format!("open tenant DuckDB at {}", args.db.display()))?;
-    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
-    let (ready_invoice, idempotency_key) = load_issued_invoice(&mut conn, &args.invoice_id)?;
+    // 3. D-22 / ADR-0110 D3 — route EVERY DuckDB access through the ONE shared
+    //    `aberp_db::Handle`, exactly as `submit_invoice::run` and
+    //    `drain_pending_retries::run` already do. Pre-D-22 this command opened
+    //    a raw `Connection`, held it across the NAV wire send, and followed
+    //    each commit with an independent `Ledger::open` + `sync_mirror`: the
+    //    mirror was explicitly `fsync`ed and the DB was not — the durability
+    //    ordering INVERTED (ADR-0099 §R2.2) on a path that re-POSTs a real NAV
+    //    ÁFA submission. On the Handle each tx gets its own tight `db.write()`
+    //    window whose guard drop runs `fsync_data_paths` FIRST and only then
+    //    the lockstep mirror sync; `Handle::durable_ack` claims that flush's
+    //    outcome before the operator is told the retry succeeded. The writer
+    //    mutex is NOT held across the wire send — each window re-acquires it.
+    let db = aberp_db::Handle::open_default(&args.db, tenant.clone())
+        .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
+    let (ready_invoice, idempotency_key) = {
+        let mut conn = db
+            .read()
+            .context("shared read: retry-submission invoice lookup (ADR-0098 C2)")?;
+        load_issued_invoice(&mut conn, &args.invoice_id)?
+    };
     if ready_invoice.id.to_prefixed_string() != args.invoice_id {
         return Err(anyhow!(
             "loaded invoice id {} does not match requested {}",
@@ -279,7 +293,7 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
     // ledger's chain-link entry is canonical. Hard-coding `Create` (the
     // pre-fix shape) would re-POST a stuck STORNO as a fresh CREATE.
     let (stuck, operation) = resolve_stuck_or_loud_fail(
-        &args.db,
+        &db,
         tenant.clone(),
         binary_hash_bytes,
         &args.invoice_id,
@@ -361,15 +375,12 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
             &credentials,
             &tax_number_8,
             &nav_invoice_number,
-            &mut conn,
+            &db,
             &ledger_meta,
             actor.clone(),
             &ready_invoice,
             idempotency_key,
             endpoint_audit_label,
-            &args.db,
-            tenant.clone(),
-            binary_hash_bytes,
         )?;
         match decision {
             Layer2Decision::SkipRePost => {
@@ -378,12 +389,19 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
                 // local Response/Ack chain remains absent (F48-
                 // deferred chain reconstruction); operator-visible
                 // summary names the gap loud per CLAUDE.md rule 12.
-                drop(conn);
-                let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
-                    .context("open audit ledger after TX0 Exists for chain verification")?;
-                let verified = ledger
-                    .verify_chain()
-                    .context("audit-ledger chain verification failed AFTER Phase 0 Exists")?;
+                // D-22 — TX0's flush outcome was already CLAIMED inside
+                // `perform_layer_2_check`, at the boundary of the write it
+                // belongs to. Re-claiming here would take the `None` arm of
+                // `durable_ack` and pay a second, redundant F_FULLFSYNC.
+                let verified = {
+                    let conn = db
+                        .read()
+                        .context("shared read: retry Phase 0 Exists chain verify (ADR-0098 C2)")?;
+                    let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
+                    ledger
+                        .verify_chain()
+                        .context("audit-ledger chain verification failed AFTER Phase 0 Exists")?
+                };
                 tracing::info!(
                     entries_verified = verified,
                     nav_invoice_number = %nav_invoice_number,
@@ -418,12 +436,19 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
                 // InvoiceCheckPerformed audit entry with
                 // outcome=failure was written by
                 // perform_layer_2_check before this branch fired.
-                drop(conn);
-                let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
-                    .context("open audit ledger after TX0 Failure for chain verification")?;
-                let verified = ledger
-                    .verify_chain()
-                    .context("audit-ledger chain verification failed AFTER Phase 0 Failure")?;
+                // D-22 — TX0's flush outcome was already CLAIMED inside
+                // `perform_layer_2_check` (which runs BEFORE this arm is
+                // reached, on the same committed row), so it is not re-claimed
+                // here.
+                let verified = {
+                    let conn = db
+                        .read()
+                        .context("shared read: retry Phase 0 Failure chain verify (ADR-0098 C2)")?;
+                    let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
+                    ledger
+                        .verify_chain()
+                        .context("audit-ledger chain verification failed AFTER Phase 0 Failure")?
+                };
                 tracing::error!(
                     invoice_id = %ready_invoice.id.to_prefixed_string(),
                     entries_verified = verified,
@@ -479,25 +504,32 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
     //    ADR-0032 §1). Two audit entries in one tx so the
     //    operator-decision and the resulting Attempt are atomically
     //    paired.
-    write_retry_requested_and_attempt_audit(
-        &mut conn,
-        &ledger_meta,
-        actor.clone(),
-        &ready_invoice,
-        idempotency_key,
-        endpoint_audit_label,
-        reason,
-        &stuck,
-        prepared.request_xml.clone(),
-    )?;
     {
-        let ledger_tx1 = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
-            .context("open audit ledger after TX1 commit")?;
-        let mirror_path = audit_ledger::mirror_path_for(&args.db);
-        ledger_tx1
-            .sync_mirror(&mirror_path)
-            .context("sync audit-ledger mirror file after TX1 RetryRequested+Attempt commit")?;
+        let mut conn = db
+            .write()
+            .context("shared writer: retry TX1 RetryRequested+Attempt (ADR-0098 Gap 1a C2)")?;
+        write_retry_requested_and_attempt_audit(
+            &mut conn,
+            &ledger_meta,
+            actor.clone(),
+            &ready_invoice,
+            idempotency_key,
+            endpoint_audit_label,
+            reason,
+            &stuck,
+            prepared.request_xml.clone(),
+        )?;
+        // WriteGuard drop -> D3 fsync_data_paths, THEN lockstep sync_mirror.
+        // The writer mutex is released here: it is NOT held across the wire
+        // send below.
     }
+
+    // 7a. D-22 / ADR-0110 D3 — the Attempt-before-call row is the ONLY local
+    //     evidence that this re-POST is about to happen. It must be on stable
+    //     storage BEFORE the wire send, or a power loss mid-flight leaves NAV
+    //     with a submission ABERP has no record of attempting.
+    db.durable_ack()
+        .context("D3 durable ack for the retry TX1 RetryRequested+Attempt write (ADR-0110 R1)")?;
 
     // 8. Wire send — POST the pre-rendered envelope.
     let wire_result = runtime.block_on(manage_invoice::send_built_request(
@@ -514,26 +546,37 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
                 stage = ?stuck.stage,
                 "NAV manageInvoice (retry) OK"
             );
-            write_response_audit(
-                &mut conn,
-                &ledger_meta,
-                actor.clone(),
-                &ready_invoice,
-                idempotency_key,
-                &send_outcome.transaction_id,
-                send_outcome.response_xml,
-            )?;
-            drop(conn);
-            let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
-                .context("open audit ledger after TX2 Response commit")?;
-            let verified = ledger
-                .verify_chain()
-                .context("audit-ledger chain verification failed AFTER retry-submission")?;
+            {
+                let mut conn = db
+                    .write()
+                    .context("shared writer: retry TX2 Response audit (ADR-0098 Gap 1a C2)")?;
+                write_response_audit(
+                    &mut conn,
+                    &ledger_meta,
+                    actor.clone(),
+                    &ready_invoice,
+                    idempotency_key,
+                    &send_outcome.transaction_id,
+                    send_outcome.response_xml,
+                )?;
+                // WriteGuard drop -> D3 fsync_data_paths, THEN lockstep sync_mirror.
+            }
+            // D-22 / ADR-0110 D3 — NAV has ACCEPTED the re-POST at this point.
+            // Claim the flush outcome BEFORE printing "retry-submission OK":
+            // an ack on a write nothing could `fsync` is the "filed at NAV,
+            // absent locally" loss this whole item exists to close.
+            db.durable_ack()
+                .context("D3 durable ack for the retry TX2 Response write (ADR-0110 R1)")?;
+            let verified = {
+                let conn = db
+                    .read()
+                    .context("shared read: retry TX2 Response chain verify (ADR-0098 C2)")?;
+                let ledger = Ledger::from_connection(conn, tenant, binary_hash_bytes);
+                ledger
+                    .verify_chain()
+                    .context("audit-ledger chain verification failed AFTER retry-submission")?
+            };
             tracing::info!(entries_verified = verified, "audit chain verified");
-            let mirror_path = audit_ledger::mirror_path_for(&args.db);
-            ledger
-                .sync_mirror(&mirror_path)
-                .context("sync audit-ledger mirror file after TX2 Response commit")?;
             let submitted = ready_invoice.into_submitted(send_outcome.transaction_id.clone());
             let prior_txid_label = stuck
                 .prior_transaction_id
@@ -562,28 +605,38 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
             let (error_class, error_code) = submission_queue::classify_attempt_failure(&wire_err);
             let error_message = format!("{wire_err}");
             let response_xml: Option<Vec<u8>> = None;
-            write_attempt_failed_audit(
-                &mut conn,
-                &ledger_meta,
-                actor.clone(),
-                &ready_invoice,
-                idempotency_key,
-                endpoint_audit_label,
-                error_class,
-                error_code,
-                error_message.clone(),
-                response_xml,
-            )?;
-            drop(conn);
-            let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
-                .context("open audit ledger after TX2 AttemptFailed commit")?;
-            let verified = ledger
-                .verify_chain()
-                .context("audit-ledger chain verification failed AFTER AttemptFailed")?;
-            let mirror_path = audit_ledger::mirror_path_for(&args.db);
-            ledger
-                .sync_mirror(&mirror_path)
-                .context("sync audit-ledger mirror file after TX2 AttemptFailed commit")?;
+            {
+                let mut conn = db
+                    .write()
+                    .context("shared writer: retry TX2 AttemptFailed audit (ADR-0098 Gap 1a C2)")?;
+                write_attempt_failed_audit(
+                    &mut conn,
+                    &ledger_meta,
+                    actor.clone(),
+                    &ready_invoice,
+                    idempotency_key,
+                    endpoint_audit_label,
+                    error_class,
+                    error_code,
+                    error_message.clone(),
+                    response_xml,
+                )?;
+                // WriteGuard drop -> D3 fsync_data_paths, THEN lockstep sync_mirror.
+            }
+            // D-22 / ADR-0110 D3 — the AttemptFailed row is what keeps the
+            // invoice reachable by a later retry; losing it strands the
+            // invoice. Claim the flush outcome even on this failure arm.
+            db.durable_ack()
+                .context("D3 durable ack for the retry TX2 AttemptFailed write (ADR-0110 R1)")?;
+            let verified = {
+                let conn = db
+                    .read()
+                    .context("shared read: retry TX2 AttemptFailed chain verify (ADR-0098 C2)")?;
+                let ledger = Ledger::from_connection(conn, tenant, binary_hash_bytes);
+                ledger
+                    .verify_chain()
+                    .context("audit-ledger chain verification failed AFTER AttemptFailed")?
+            };
             tracing::error!(
                 invoice_id = %ready_invoice.id.to_prefixed_string(),
                 entries_verified = verified,
@@ -627,14 +680,18 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
 /// `prior_transaction_id` field on the `InvoiceRetryRequestedPayload`
 /// differs (`None` for state-2 because no prior Response exists).
 fn resolve_stuck_or_loud_fail(
-    db_path: &std::path::Path,
+    db: &aberp_db::HandleArc,
     tenant: TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     invoice_id: &str,
     issuance_idempotency_key: &IdempotencyKey,
 ) -> Result<(StuckPrecondition, InvoiceOperation)> {
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to resolve retry-submission precondition")?;
+    // D-22 — a coherent read clone of the ONE shared instance, never an
+    // independent `Ledger::open` of the live path.
+    let conn = db
+        .read()
+        .context("shared read: retry-submission stuck precondition (ADR-0098 C2)")?;
+    let ledger = Ledger::from_connection(conn, tenant, binary_hash);
     // S381/F1 — derive the NAV envelope operation from the SAME ledger
     // read (no second opener). The chain-link entries are the canonical
     // source; the re-POST must carry the invoice's true operation.
@@ -929,15 +986,12 @@ fn perform_layer_2_check(
     credentials: &NavCredentials,
     tax_number_8: &str,
     nav_invoice_number: &str,
-    conn: &mut Connection,
+    db: &aberp_db::HandleArc,
     ledger_meta: &LedgerMeta,
     actor: Actor,
     invoice: &ReadyInvoice,
     idempotency_key: IdempotencyKey,
     endpoint_audit_label: &'static str,
-    db_path: &std::path::Path,
-    tenant: TenantId,
-    binary_hash: aberp_audit_ledger::BinaryHash,
 ) -> Result<Layer2Decision> {
     // Build transport. (No tokenExchange — queryInvoiceCheck is a
     // NAV query operation per ADR-0009 §4 / ADR-0033 §3.)
@@ -1009,20 +1063,26 @@ fn perform_layer_2_check(
         }
     };
 
-    // TX0 — write the InvoiceCheckPerformed audit entry.
-    write_check_performed_audit(conn, ledger_meta, actor, idempotency_key, payload)?;
-
-    // Sync mirror after TX0 commit. Same pattern as every other
-    // post-tx mirror sync; the mirror is the secondary-evidence
-    // source per ADR-0030 §2.
+    // TX0 — write the InvoiceCheckPerformed audit entry in its own tight
+    // `db.write()` window. D-22: the guard's drop runs the D3
+    // `fsync_data_paths` and THEN the lockstep `sync_mirror`, so the explicit
+    // ADR-0030 §2 `Ledger::open` + `sync_mirror` tail (a SECOND live opener
+    // that made the mirror durable while the DB was not) is gone.
     {
-        let ledger_tx0 = Ledger::open(db_path, tenant, binary_hash)
-            .context("open audit ledger after TX0 InvoiceCheckPerformed commit")?;
-        let mirror_path = audit_ledger::mirror_path_for(db_path);
-        ledger_tx0
-            .sync_mirror(&mirror_path)
-            .context("sync audit-ledger mirror file after TX0 InvoiceCheckPerformed commit")?;
+        let mut conn = db
+            .write()
+            .context("shared writer: retry TX0 InvoiceCheckPerformed (ADR-0098 Gap 1a C2)")?;
+        write_check_performed_audit(&mut conn, ledger_meta, actor, idempotency_key, payload)?;
+        // WriteGuard drop -> D3 fsync_data_paths, THEN lockstep sync_mirror.
     }
+    // D-22 / ADR-0110 D3 — the `InvoiceCheckPerformed` row is what a later
+    // `mark-abandoned` consults for its F49 guard; losing it silently would
+    // let an invoice NAV already holds be abandoned locally. Claim the flush
+    // outcome before the decision is acted on — this is the ONE ack for TX0;
+    // the caller's Exists / Failure early-return arms deliberately do not
+    // re-claim it (a second claim would fall through to a redundant flush).
+    db.durable_ack()
+        .context("D3 durable ack for the retry TX0 InvoiceCheckPerformed write (ADR-0110 R1)")?;
 
     Ok(decision)
 }

@@ -44,8 +44,71 @@
 # to close the *window* on money paths (ack-time vs up-to-60s-later), not to
 # substitute for a checkpoint that does not exist.
 
+# ── D-22 (ADR-0114, 2026-08-26): the NAV money-submission CLI paths joined ────
+#
+# The census above was written when the ONLY `durable_ack` sites were the five
+# issuance / payment boundaries. That was never the whole money surface: every
+# NAV *submission* path — `submit-invoice`, `retry-submission`,
+# `drain-submission-queue`, `drain-pending-retries`, `poll-ack`,
+# `poll-annulment-ack`, `submit-annulment`, `observe-receiver-confirmation`,
+# `recover-from-nav`, `mark-abandoned`, `request-technical-annulment` — also
+# tells an operator a money-path write succeeded, and none of them claimed a
+# flush. Two distinct shapes were open (ADR-0114 §2):
+#
+#   * eight commands did `Ledger::open` -> `append` -> `sync_mirror` on their
+#     OWN `Connection`, so no flush ever ran: the audit MIRROR was explicitly
+#     `fsync`ed and the DB was left to whatever DuckDB does with its WAL. That
+#     is the ADR-0099 §R2.2 inversion — the 2026-08-08 loss shape — and it was
+#     live on real NAV ÁFA filings. They are now Handle-routed;
+#   * three (`submit_invoice`, `poll_ack`, `drain_pending_retries`) were
+#     already Handle-routed, so the `WriteGuard` drop DID flush — but nothing
+#     claimed the parked outcome, so a flush that FAILED printed
+#     "submitted invoice …" anyway and left only a `tracing::error!`. That is
+#     the rule-11 downgrade CHECK D3-C forbids, reached by omission instead of
+#     by a `warn!`.
+#
+# The ack sits at the boundary of the WRITE it belongs to, not once per
+# command: an Attempt-before-call row must be durable BEFORE the wire send (a
+# power loss mid-flight otherwise leaves NAV holding a submission ABERP has no
+# record of attempting), and the TX2 row must be durable BEFORE the operator is
+# told the filing landed. Hence several lines per file.
+#
+# NOT joined, deliberately (ADR-0114 §5): the two `aberp-snapshot::recover`
+# sites the D-22 backlog entry also names. They run at BOOT, before any Handle
+# exists, on a PRIVATE staging file, and the mirror top-up at
+# `build_and_validate` §5d is an INPUT to the ahead-snapshot self-certification
+# gate — its result decides Recover vs Refuse, so it structurally cannot move
+# after the install. Neither writes a money row. The install itself is durable
+# (`fsync_file` -> `rename` -> `fsync_dir`), so the DB catches up within the
+# same boot. Named as the residual rather than quietly dropped.
+
 apps/aberp/src/issue_invoice.rs	issue_from_parsed	"invoice created" (invoice + invoice_line rows)
 apps/aberp/src/issue_modification.rs	modification_from_inputs	"modification issued" (burns a NAV number)
 apps/aberp/src/issue_storno.rs	storno_from_inputs	"storno issued" (cancels a filed document)
 apps/aberp/src/mark_invoice_paid.rs	mark_paid	"marked paid" (AR payment record)
 apps/aberp/src/incoming_invoices.rs	change_status	"marked paid" (AP ap_invoice.status UPDATE)
+
+# ── D-22 — NAV submission: the manageInvoice / manageAnnulment filings ───────
+apps/aberp/src/submit_invoice.rs	submit_from_inputs	TX1 Attempt-before-call, durable BEFORE the wire send
+apps/aberp/src/submit_invoice.rs	submit_from_inputs	"submitted invoice … -> NAV transactionId" (TX2 Response)
+apps/aberp/src/submit_invoice.rs	submit_from_inputs	TX2 AttemptFailed — the row a later retry-submission needs
+apps/aberp/src/retry_submission.rs	run	TX1 RetryRequested+Attempt, durable BEFORE the re-POST
+apps/aberp/src/retry_submission.rs	run	"retry-submission OK … -> NAV transactionId" (TX2 Response)
+apps/aberp/src/retry_submission.rs	run	TX2 AttemptFailed — keeps the invoice reachable by a later retry
+apps/aberp/src/retry_submission.rs	perform_layer_2_check	TX0 InvoiceCheckPerformed — the row mark-abandoned's F49 guard reads
+apps/aberp/src/drain_submission_queue.rs	drive_one_invoice	TX1 Attempt-before-call, durable BEFORE the wire send
+apps/aberp/src/drain_submission_queue.rs	drive_one_invoice	"drain: invoice … -> NAV transactionId" (TX2 Response)
+apps/aberp/src/drain_submission_queue.rs	drive_one_invoice	TX2 AttemptFailed — keeps the invoice reachable by a later retry
+apps/aberp/src/drain_pending_retries.rs	drive_one_retry	TX1 RetryRequested+Attempt, durable BEFORE the re-POST
+apps/aberp/src/drain_pending_retries.rs	drive_one_retry	"drain-pending-retries: invoice … -> NAV transactionId" (TX2 Response)
+apps/aberp/src/drain_pending_retries.rs	drive_one_retry	TX2 AttemptFailed — keeps the invoice reachable by a later retry
+apps/aberp/src/drain_pending_retries.rs	perform_layer_2_check	TX0 InvoiceCheckPerformed — the row mark-abandoned's F49 guard reads
+apps/aberp/src/submit_annulment.rs	run	"submit-annulment OK … -> NAV annulment transactionId"
+
+# ── D-22 — NAV verdicts + chain-terminating operator decisions ───────────────
+apps/aberp/src/poll_ack.rs	poll_ack_from_inputs	terminal InvoiceAckStatus — NAV's verdict on a filed submission
+apps/aberp/src/poll_annulment_ack.rs	run	terminal InvoiceAnnulmentAckStatus — NAV's verdict on a filed annulment
+apps/aberp/src/observe_receiver_confirmation.rs	run	"observe-receiver-confirmation OK" (verbatim queryInvoiceData bytes)
+apps/aberp/src/recover_from_nav.rs	run	"chain reconstructed" — the LOCAL record of a submission NAV already holds
+apps/aberp/src/mark_abandoned.rs	run	"mark-abandoned OK" (terminal; the sequence is never reused)
+apps/aberp/src/request_technical_annulment.rs	run	"request-technical-annulment" — the decision to withdraw a filed submission

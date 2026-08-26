@@ -656,6 +656,40 @@ sanctioned set honest. Making that a type-level property is a different
 <a id="d-22"></a>
 ### D-22 — Audit durability: the 15 CLI sites that fsync the mirror and not the DB
 
+> ### ✅ CLOSED — 2026-08-26, [ADR-0114](../adr/0114-editions-money-cli-durability-d22.md)
+>
+> All thirteen `apps/aberp` sites are on the shared `aberp_db::Handle` and
+> every money-path ack boundary across the eleven NAV commands now calls
+> `db.durable_ack()?` before the operator is told the write landed. The
+> `cut_gate_durable_ack.sh` census grew 5 → 26 sites, and the eight migrated
+> files were **promoted** out of CHECK 10i's frozen residual ledger into CHECK
+> 10h's zero-openers-ENFORCED set — a re-added opener is now a red build rather
+> than a tolerated count. CHECK 10L-b's and CHECK 10N's frozen fork manifests
+> are both EMPTY.
+>
+> The gap this entry described in 2b below turned out to have a **second
+> shape** the entry did not name: `submit_invoice`, `poll_ack` and
+> `drain_pending_retries` were already Handle-routed, so the flush ran — but
+> nothing CLAIMED its outcome, so a failed flush printed
+> `submitted invoice … -> NAV transactionId …` anyway. `submit_invoice` is
+> described below as "the one benign case"; it was benign in its *ordering* and
+> not in its *reporting*. All three now ack.
+>
+> **The two `aberp-snapshot::recover` sites are deliberately NOT converted** —
+> see ADR-0114 §5. They are boot-time, pre-`Handle`, on a private staging file,
+> neither writes a money row, and `build_and_validate` §5d's mirror top-up is an
+> INPUT to the ahead-snapshot self-certification gate (its result decides
+> Recover vs Refuse), so it structurally cannot move after the install. So the
+> count closed is **13 of 15**, with the remaining two named rather than
+> dropped.
+>
+> Pinned by `apps/aberp/tests/d22_money_cli_power_loss_durability.rs`: a
+> power-loss spec on the real `mark-abandoned` path plus a fault-injection test
+> that breaks the filesystem reach and demands the ack refuse. Three mutations
+> were RUN and killed (ADR-0114 §6) — including the one that shows a
+> debounce-shadow design for this spec is **vacuous**, because the durable-set
+> copy takes whole files.
+
 **Why this exists.** ADR-0099 §R2 established that the seq-2508 incident was a
 **lost DB commit**, not a writer fork: pre-ADR-0110-D3, `WriteGuard::drop`
 `fsync`ed the audit MIRROR on every commit and never flushed the DB — the

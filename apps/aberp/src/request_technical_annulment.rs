@@ -63,12 +63,9 @@
 //! annulment decision regardless of whether the operator's
 //! workstation has a keychain.
 
-use std::path::Path;
-
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
-use aberp_billing::{self as billing, DuckDbBillingStore, IdempotencyKey};
+use aberp_billing::{self as billing, IdempotencyKey};
 use anyhow::{anyhow, bail, Context, Result};
-use duckdb::Connection;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use ulid::Ulid;
@@ -167,7 +164,17 @@ pub fn run(args: &RequestTechnicalAnnulmentArgs) -> Result<()> {
         .context("resolve seller.toml path for numbering template")?;
     let template = crate::numbering::read_numbering_template(&seller_toml_path)
         .context("read [seller.numbering] template from seller.toml")?;
-    let base_issue_year = load_base_invoice_issue_year(&args.db, &args.references)?;
+    // D-22 / ADR-0110 D3 — route EVERY DuckDB access through the ONE shared
+    // `aberp_db::Handle`, exactly as `submit_invoice::run` already does.
+    // Pre-D-22 this command opened a raw `Connection` for the audit write and
+    // followed the commit with an independent `Ledger::open` + `sync_mirror`:
+    // the mirror was explicitly `fsync`ed and the DB was not — the durability
+    // ordering INVERTED (ADR-0099 §R2.2). On the Handle the `WriteGuard`'s
+    // drop runs `fsync_data_paths` FIRST and only then the lockstep mirror
+    // sync, and `Handle::durable_ack` below claims that flush's outcome.
+    let db = aberp_db::Handle::open_default(&args.db, tenant.clone())
+        .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
+    let base_issue_year = load_base_invoice_issue_year(&db, &args.references)?;
     // S190 — also resolve the base invoice's on-disk NAV XML path during the
     // same ledger scope. The reference to NAV on the `<annulmentReference>`
     // element MUST match the byte-exact `<invoiceNumber>` NAV holds on file
@@ -179,8 +186,10 @@ pub fn run(args: &RequestTechnicalAnnulmentArgs) -> Result<()> {
     // and used purely as the defence-in-depth comparator that fires a WARN
     // below if the two disagree.
     let (precondition, base_nav_xml_path) = {
-        let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
-            .context("open audit ledger for annulment precondition check")?;
+        let conn = db
+            .read()
+            .context("shared read: annulment precondition check (ADR-0098 C2)")?;
+        let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
         let pre = check_base_is_annullable(&ledger, &args.references, &template, base_issue_year)?;
         let path = crate::issue_storno::find_base_nav_xml_path_for_chain(&ledger, &args.references)
             .context(
@@ -222,13 +231,12 @@ pub fn run(args: &RequestTechnicalAnnulmentArgs) -> Result<()> {
         annulment_code_wire,
         reason,
     );
-    let mut conn = Connection::open(&args.db)
-        .with_context(|| format!("open tenant DuckDB at {}", args.db.display()))?;
-    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
-    audit_ledger::ensure_schema(&conn)
-        .context("ensure audit-ledger schema for request-technical-annulment")?;
     {
+        let mut conn = db.write().context(
+            "shared writer: request-technical-annulment audit append (ADR-0098 Gap 1a C2)",
+        )?;
+        audit_ledger::ensure_schema(&conn)
+            .context("ensure audit-ledger schema for request-technical-annulment")?;
         let tx = conn
             .transaction()
             .context("begin DuckDB transaction (request-technical-annulment audit append)")?;
@@ -243,23 +251,32 @@ pub fn run(args: &RequestTechnicalAnnulmentArgs) -> Result<()> {
         .context("audit_ledger::append_in_tx InvoiceTechnicalAnnulmentRequested")?;
         tx.commit()
             .context("commit DuckDB transaction (request-technical-annulment audit append)")?;
+        // WriteGuard drop -> D3 fsync_data_paths (DB + WAL + dir), THEN the
+        // lockstep sync_mirror. The explicit ADR-0030 §2 `Ledger::open` +
+        // `sync_mirror` tail is GONE with D-22.
     }
-    drop(conn);
 
-    // 6. Verify the audit chain (success-criterion gate).
-    let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
-        .context("re-open audit ledger after request-technical-annulment commit")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER annulment audit append")?;
+    // 5a. D-22 / ADR-0110 D3 — claim the parked flush outcome BEFORE the
+    //     operator is told the annulment request was recorded. The entry this
+    //     write lands is the ONLY local evidence of the operator's decision to
+    //     withdraw a filed NAV submission; an ack on a write nothing could
+    //     `fsync` is exactly the 2026-08-08 loss.
+    db.durable_ack()
+        .context("D3 durable ack for the request-technical-annulment audit write (ADR-0110 R1)")?;
+
+    // 6. Verify the audit chain (success-criterion gate). Reuses a coherent
+    //    shared READ clone — never an independent `Ledger::open` of the live
+    //    path.
+    let verified = {
+        let conn = db
+            .read()
+            .context("shared read: request-technical-annulment post-commit verify (ADR-0098 C2)")?;
+        let ledger = Ledger::from_connection(conn, tenant, binary_hash_bytes);
+        ledger
+            .verify_chain()
+            .context("audit-ledger chain verification failed AFTER annulment audit append")?
+    };
     tracing::info!(entries_verified = verified, "audit chain verified");
-
-    // 6a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    //     post-commit.
-    let mirror_path = audit_ledger::mirror_path_for(&args.db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after request-technical-annulment commit")?;
 
     // 7. Render the annulment XML + minimal call-site sanity check
     //    per ADR-0025 §4. The full `validate_annulment_data` runtime
@@ -566,10 +583,12 @@ fn local_name(qualified: &[u8]) -> String {
 // year — the rest of the row is discarded.
 // ──────────────────────────────────────────────────────────────────────
 
-fn load_base_invoice_issue_year(db_path: &Path, invoice_id: &str) -> Result<i32> {
-    let store = DuckDbBillingStore::open(db_path)
-        .with_context(|| format!("open billing DuckDB at {}", db_path.display()))?;
-    let mut conn = store.into_connection();
+fn load_base_invoice_issue_year(db: &aberp_db::HandleArc, invoice_id: &str) -> Result<i32> {
+    // D-22 — a coherent read clone of the ONE shared instance, never an
+    // independent `DuckDbBillingStore::open` of the live path.
+    let mut conn = db
+        .read()
+        .context("shared read: request-technical-annulment base issue year (ADR-0098 C2)")?;
     let tx = conn
         .transaction()
         .context("begin read tx for base invoice issue-year lookup")?;

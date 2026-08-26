@@ -104,7 +104,7 @@ use std::path::Path;
 use aberp_audit_ledger::{
     self as audit_ledger, Actor, Entry, EventKind, Ledger, LedgerMeta, TenantId,
 };
-use aberp_billing::{self as billing, DuckDbBillingStore, IdempotencyKey, ReadyInvoice};
+use aberp_billing::{self as billing, IdempotencyKey, ReadyInvoice};
 use aberp_nav_transport::{
     operations::query_invoice_data::{self, QueryInvoiceDataOutcome},
     soap::InvoiceDirection,
@@ -195,9 +195,21 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
     // `issue_modification` (S184) and `request_technical_annulment`
     // (S190). See `load_base_nav_invoice_number` for the WARN
     // comparator + on-disk XML read.
+    // D-22 / ADR-0110 D3 — route EVERY DuckDB access through the ONE shared
+    // `aberp_db::Handle`, exactly as `submit_invoice::run` already does.
+    // Pre-D-22 this command opened a raw `Connection` for the audit write and
+    // followed the commit with an independent `Ledger::open` + `sync_mirror`:
+    // the mirror was explicitly `fsync`ed and the DB was not — the durability
+    // ordering INVERTED (ADR-0099 §R2.2). On the Handle the `WriteGuard`'s
+    // drop runs `fsync_data_paths` FIRST and only then the lockstep mirror
+    // sync, and `Handle::durable_ack` below claims that flush's outcome.
+    let db = aberp_db::Handle::open_default(&args.db, tenant.clone())
+        .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
     let (inputs, base_nav_xml_path) = {
-        let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
-            .context("open audit ledger for observe-receiver-confirmation lookup")?;
+        let conn = db
+            .read()
+            .context("shared read: observe-receiver-confirmation lookup (ADR-0098 C2)")?;
+        let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
         let inputs = lookup_receiver_confirmation_inputs(&ledger, &args.invoice_id)?;
         let path = crate::issue_storno::find_base_nav_xml_path_for_chain(&ledger, &args.invoice_id)
             .context(
@@ -235,7 +247,7 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
     let template = crate::numbering::read_numbering_template(&seller_toml_path)
         .context("read [seller.numbering] template from seller.toml")?;
     let (nav_invoice_number, base_sequence_number) =
-        load_base_nav_invoice_number(&args.db, &args.invoice_id, &template, &base_nav_xml_path)?;
+        load_base_nav_invoice_number(&db, &args.invoice_id, &template, &base_nav_xml_path)?;
     tracing::info!(
         nav_invoice_number = %nav_invoice_number,
         base_sequence_number,
@@ -246,14 +258,8 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
     //    per ADR-0028 §4 + §"Surfaced conflict 2" — NO bounded
     //    poll loop; receiver-confirmation is human-paced and
     //    the operator re-runs the command at their cadence.
-    //    Open a fresh Connection here (the lookup-ledger was
-    //    opened read-only and is already dropped; the audit-
-    //    write path needs a writable Connection).
-    let mut conn = Connection::open(&args.db)
-        .with_context(|| format!("open tenant DuckDB at {}", args.db.display()))?;
-    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
-
+    //    D-22: the audit write takes its own tight `db.write()` window on the
+    //    shared Handle below — no separate writable `Connection` is opened.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -276,34 +282,46 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
     //    response_xml is the load-bearing audit evidence per
     //    ADR-0028 §"Surfaced conflict 3" (no parsed field).
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
-    write_receiver_confirmation_audit_entry(
-        &mut conn,
-        &ledger_meta,
-        actor.clone(),
-        &args.invoice_id,
-        &nav_invoice_number,
-        &inputs.annulment_transaction_id,
-        inputs.annulment_idempotency_key,
-        &outcome,
+    {
+        let mut conn = db.write().context(
+            "shared writer: observe-receiver-confirmation audit append (ADR-0098 Gap 1a C2)",
+        )?;
+        write_receiver_confirmation_audit_entry(
+            &mut conn,
+            &ledger_meta,
+            actor.clone(),
+            &args.invoice_id,
+            &nav_invoice_number,
+            &inputs.annulment_transaction_id,
+            inputs.annulment_idempotency_key,
+            &outcome,
+        )?;
+        // WriteGuard drop -> D3 fsync_data_paths (DB + WAL + dir), THEN the
+        // lockstep sync_mirror. The explicit ADR-0030 §2 `Ledger::open` +
+        // `sync_mirror` tail is GONE with D-22.
+    }
+
+    // 6a. D-22 / ADR-0110 D3 — claim the parked flush outcome BEFORE the
+    //     operator is told the observation was recorded. The verbatim NAV
+    //     `queryInvoiceData` bytes are the ONLY local record that this
+    //     observation happened; losing them silently is what D3 prevents.
+    db.durable_ack().context(
+        "D3 durable ack for the observe-receiver-confirmation audit write (ADR-0110 R1)",
     )?;
 
-    // 7. Verify the audit chain after commit (success-
-    //    criterion gate). Drop the tx-Connection first; re-open
-    //    a fresh Ledger to read.
-    drop(conn);
-    let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
-        .context("re-open audit ledger after observe-receiver-confirmation commit")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER observe-receiver-confirmation")?;
+    // 7. Verify the audit chain after commit (success-criterion gate).
+    //    Reuses a coherent shared READ clone — never an independent
+    //    `Ledger::open` of the live path.
+    let verified = {
+        let conn = db.read().context(
+            "shared read: observe-receiver-confirmation post-commit verify (ADR-0098 C2)",
+        )?;
+        let ledger = Ledger::from_connection(conn, tenant, binary_hash_bytes);
+        ledger
+            .verify_chain()
+            .context("audit-ledger chain verification failed AFTER observe-receiver-confirmation")?
+    };
     tracing::info!(entries_verified = verified, "audit chain verified");
-
-    // 7a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    //     post-commit.
-    let mirror_path = audit_ledger::mirror_path_for(&args.db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after observe-receiver-confirmation commit")?;
 
     // 8. Operator-visible summary per ADR-0028 §5. The message
     //    NAMES THE VERBATIM-BYTES-AS-EVIDENCE POSTURE LOUD
@@ -360,14 +378,16 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
 /// disagreement. Loud-fail (CLAUDE.md rule 12) if the on-disk XML is
 /// missing or malformed — no silent fallback.
 fn load_base_nav_invoice_number(
-    db_path: &Path,
+    db: &aberp_db::HandleArc,
     invoice_id: &str,
     template: &crate::numbering::NumberingTemplate,
     base_nav_xml_path: &Path,
 ) -> Result<(String, u64)> {
-    let store = DuckDbBillingStore::open(db_path)
-        .with_context(|| format!("open billing DuckDB at {}", db_path.display()))?;
-    let mut conn = store.into_connection();
+    // D-22 — a coherent read clone of the ONE shared instance, never an
+    // independent `DuckDbBillingStore::open` of the live path.
+    let mut conn = db
+        .read()
+        .context("shared read: observe-receiver-confirmation base invoice (ADR-0098 C2)")?;
 
     let base_invoice: ReadyInvoice = {
         let tx = conn

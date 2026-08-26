@@ -13,15 +13,25 @@
 # NOTE: presence here is NOT "safe" — it is the deferred fork-capable surface,
 #   frozen so it cannot expand. The sanctioned post-commit sync_mirror is the
 #   Handle's own WriteGuard drop (crates/aberp-db) — never one of these.
-apps/aberp/src/drain_submission_queue.rs|drive_one_invoice
-apps/aberp/src/email_invoice.rs|record_email_audit_entry
-apps/aberp/src/mark_abandoned.rs|run
-apps/aberp/src/observe_receiver_confirmation.rs|run
-apps/aberp/src/poll_annulment_ack.rs|run
-apps/aberp/src/recover_from_nav.rs|run
-apps/aberp/src/request_technical_annulment.rs|run
-apps/aberp/src/restore_from_nav_outgoing.rs|process_digest
-apps/aberp/src/retry_submission.rs|perform_layer_2_check
-apps/aberp/src/retry_submission.rs|run
-apps/aberp/src/serve.rs|set_restored_partner_request
-apps/aberp/src/submit_annulment.rs|run
+#
+# ── D-22 (ADR-0114, 2026-08-26): the set is now EMPTY. ──────────────────────
+# Nine of the twelve frozen entries were the NAV money-submission CLI commands
+# (drain_submission_queue, retry_submission ×2, submit_annulment,
+# poll_annulment_ack, observe_receiver_confirmation, recover_from_nav,
+# mark_abandoned, request_technical_annulment). D-22 routed all of them onto
+# the shared Handle, so their `Ledger::open` + `sync_mirror` pairs are gone and
+# they moved into the CHECK 10h C2 set (zero openers, ENFORCED) — the same
+# promotion the seven original C2 files got.
+#
+# The remaining THREE (email_invoice::record_email_audit_entry,
+# restore_from_nav_outgoing::process_digest, serve::set_restored_partner_request)
+# had ALREADY migrated off before D-22 and were reported by this gate's own
+# "(info) migrated off since freeze" line at `main` bae151d — a stale allowance
+# for three sites the scanner no longer finds. Three phantom entries in a
+# may-only-shrink manifest are three sites that could have regrown a fork
+# unnoticed, so they are removed here rather than carried: the manifest's whole
+# job is to be the minimal true set.
+#
+# EMPTY means the strictest possible reading of 10L-b: ANY site the scanner
+# reports is new, and fails the build. A line added below must be a
+# `<file>|<fname>` pair with its justification written above it.

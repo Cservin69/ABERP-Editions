@@ -183,9 +183,22 @@ pub fn run(args: &SubmitAnnulmentArgs) -> Result<()> {
     //    step 6's audit-write entries (F8 contract per ADR-0026
     //    §"F8 contract").
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
+    // D-22 / ADR-0110 D3 — route EVERY DuckDB access through the ONE shared
+    // `aberp_db::Handle`, exactly as `submit_invoice::run` already does.
+    // Pre-D-22 this command opened a raw `Connection` for the audit write and
+    // followed the commit with an independent `Ledger::open` + `sync_mirror`:
+    // the mirror was explicitly `fsync`ed and the DB was not — the durability
+    // ordering INVERTED (ADR-0099 §R2.2) on a path that has already burned a
+    // NAV `manageAnnulment` call. On the Handle the `WriteGuard`'s drop runs
+    // `fsync_data_paths` FIRST and only then the lockstep mirror sync, and
+    // `Handle::durable_ack` below claims that flush's outcome.
+    let db = aberp_db::Handle::open_default(&args.db, tenant.clone())
+        .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
     let precondition = {
-        let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
-            .context("open audit ledger for submit-annulment precondition check")?;
+        let conn = db
+            .read()
+            .context("shared read: submit-annulment precondition (ADR-0098 C2)")?;
+        let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
         check_annulment_is_submittable(&ledger, &args.invoice_id)?
     };
     tracing::info!(
@@ -216,35 +229,46 @@ pub fn run(args: &SubmitAnnulmentArgs) -> Result<()> {
 
     // 6. Write both audit entries under one tx, then commit.
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
-    let mut conn = Connection::open(&args.db)
-        .with_context(|| format!("open tenant DuckDB at {}", args.db.display()))?;
-    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
-    write_annulment_submission_audit_entries(
-        &mut conn,
-        &ledger_meta,
-        actor.clone(),
-        &args.invoice_id,
-        precondition.annulment_idempotency_key,
-        endpoint_audit_label,
-        &nav_outcome,
-    )?;
+    {
+        let mut conn = db
+            .write()
+            .context("shared writer: submit-annulment audit append (ADR-0098 Gap 1a C2)")?;
+        write_annulment_submission_audit_entries(
+            &mut conn,
+            &ledger_meta,
+            actor.clone(),
+            &args.invoice_id,
+            precondition.annulment_idempotency_key,
+            endpoint_audit_label,
+            &nav_outcome,
+        )?;
+        // WriteGuard drop -> D3 fsync_data_paths (DB + WAL + dir), THEN the
+        // lockstep sync_mirror. The explicit ADR-0030 §2 `Ledger::open` +
+        // `sync_mirror` tail is GONE with D-22 (second live opener, and it
+        // made the mirror durable while the DB was not).
+    }
+
+    // 6a. D-22 / ADR-0110 D3 — claim the parked flush outcome BEFORE the
+    //     operator is told the annulment was recorded. NAV has already
+    //     accepted the `manageAnnulment` call at this point, so losing the
+    //     local record is exactly the "filed at NAV, absent locally"
+    //     divergence D3 exists to prevent.
+    db.durable_ack()
+        .context("D3 durable ack for the submit-annulment audit write (ADR-0110 R1)")?;
 
     // 7. Verify the audit chain after commit (success-criterion gate).
-    drop(conn);
-    let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
-        .context("re-open audit ledger after submit-annulment commit")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER annulment submission")?;
+    //    Reuses a coherent shared READ clone — never an independent
+    //    `Ledger::open` of the live path.
+    let verified = {
+        let conn = db
+            .read()
+            .context("shared read: submit-annulment post-commit verify (ADR-0098 C2)")?;
+        let ledger = Ledger::from_connection(conn, tenant, binary_hash_bytes);
+        ledger
+            .verify_chain()
+            .context("audit-ledger chain verification failed AFTER annulment submission")?
+    };
     tracing::info!(entries_verified = verified, "audit chain verified");
-
-    // 7a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    //     post-commit.
-    let mirror_path = audit_ledger::mirror_path_for(&args.db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after annulment submission commit")?;
 
     // 8. Operator-visible summary. Surfaced loud (CLAUDE.md rule 12)
     //    because the annulment wire submission is an operator-

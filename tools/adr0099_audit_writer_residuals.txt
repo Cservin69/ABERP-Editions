@@ -22,15 +22,6 @@
 # shared Handle to route through, and its writes cannot collide with the serve
 # writer's in-process seq assignment (cross-process racing is backstopped by
 # the hash chain, as it always has been — see AUDIT_APPEND_LOCK's docs).
-apps/aberp/src/drain_submission_queue.rs:drive_one_invoice
-apps/aberp/src/mark_abandoned.rs:run
-apps/aberp/src/observe_receiver_confirmation.rs:run
-apps/aberp/src/poll_annulment_ack.rs:run
-apps/aberp/src/recover_from_nav.rs:run
-apps/aberp/src/request_technical_annulment.rs:run
-apps/aberp/src/retry_submission.rs:run
-apps/aberp/src/retry_submission.rs:perform_layer_2_check
-apps/aberp/src/submit_annulment.rs:run
 apps/aberp/src/snapshot.rs:emit_reopen_cli
 apps/aberp/src/tenant_registry.rs:emit_tenant_reopen
 #

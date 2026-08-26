@@ -97,7 +97,6 @@ use aberp_nav_transport::{
     NavCredentials, NavEndpoint, NavTransport, NavTransportError,
 };
 use anyhow::{anyhow, Context, Result};
-use duckdb::Connection;
 use ulid::Ulid;
 
 use crate::audit_payloads;
@@ -203,9 +202,21 @@ pub fn run(args: &PollAnnulmentAckArgs) -> Result<()> {
     //    invoice and steers the operator to run
     //    `aberp submit-annulment` first (CLAUDE.md rule 12).
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
+    // D-22 / ADR-0110 D3 — route EVERY DuckDB access through the ONE shared
+    // `aberp_db::Handle`, exactly as its twin `poll_ack::run` already does.
+    // Pre-D-22 this command threaded a raw `Connection` through the poll loop
+    // and followed it with an independent `Ledger::open` + `sync_mirror`: the
+    // mirror was explicitly `fsync`ed and the DB was not — the durability
+    // ordering INVERTED (ADR-0099 §R2.2). On the Handle each per-poll write
+    // takes its own tight `db.write()` window whose guard drop runs
+    // `fsync_data_paths` FIRST and then the lockstep mirror sync.
+    let db = aberp_db::Handle::open_default(&args.db, tenant.clone())
+        .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
     let inputs = {
-        let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
-            .context("open audit ledger for poll-annulment-ack lookup")?;
+        let conn = db
+            .read()
+            .context("shared read: poll-annulment-ack lookup (ADR-0098 C2)")?;
+        let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
         lookup_annulment_poll_inputs(&ledger, &args.invoice_id)?
     };
     tracing::info!(
@@ -218,15 +229,11 @@ pub fn run(args: &PollAnnulmentAckArgs) -> Result<()> {
 
     // 4. tokio current-thread runtime for the poll loop. Built
     //    AFTER every prerequisite is validated so we don't pay
-    //    the startup cost on a malformed input. Open a fresh
-    //    Connection here (the lookup-ledger was opened read-
-    //    only and is already dropped; the per-poll audit-write
-    //    path needs a writable Connection).
-    let mut conn = Connection::open(&args.db)
-        .with_context(|| format!("open tenant DuckDB at {}", args.db.display()))?;
-    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
-
+    //    the startup cost on a malformed input. D-22: the loop takes the
+    //    shared Handle, not a threaded `Connection` — each per-poll audit
+    //    write opens its own tight `db.write()` window so the `!Send`
+    //    `WriteGuard` never crosses a NAV `await` and every commit gets its
+    //    own D3 flush.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -239,28 +246,32 @@ pub fn run(args: &PollAnnulmentAckArgs) -> Result<()> {
         &inputs.transaction_id,
         &args.invoice_id,
         &inputs.annulment_idempotency_key,
-        &mut conn,
+        &db,
         &ledger_meta,
         &actor,
     ))?;
 
-    // 5. Verify the audit chain after the loop (success-
-    //    criterion gate). Drop the tx-Connection first; re-open
-    //    a fresh Ledger to read.
-    drop(conn);
-    let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
-        .context("re-open audit ledger after poll-annulment-ack")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER poll-annulment-ack")?;
-    tracing::info!(entries_verified = verified, "audit chain verified");
+    // 4a. D-22 / ADR-0110 D3 — claim the parked flush outcome BEFORE the
+    //     operator is told the terminal annulment status was recorded. The
+    //     poll writes NAV's verdict on an annulment already filed at NAV;
+    //     losing it locally is the "filed at NAV, absent locally" divergence
+    //     D3 exists to prevent.
+    db.durable_ack()
+        .context("D3 durable ack for the poll-annulment-ack audit writes (ADR-0110 R1)")?;
 
-    // 5a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    //     post-commit.
-    let mirror_path = audit_ledger::mirror_path_for(&args.db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after poll-annulment-ack commit")?;
+    // 5. Verify the audit chain after the loop (success-criterion gate).
+    //    Reuses a coherent shared READ clone — never an independent
+    //    `Ledger::open` of the live path.
+    let verified = {
+        let conn = db
+            .read()
+            .context("shared read: poll-annulment-ack post-loop verify (ADR-0098 C2)")?;
+        let ledger = Ledger::from_connection(conn, tenant, binary_hash_bytes);
+        ledger
+            .verify_chain()
+            .context("audit-ledger chain verification failed AFTER poll-annulment-ack")?
+    };
+    tracing::info!(entries_verified = verified, "audit chain verified");
 
     // 6. Operator-visible summary per ADR-0027 §5. The terminal-
     //    SAVED message NAMES THE RECEIVER-CONFIRMATION GAP LOUD
@@ -429,17 +440,16 @@ async fn poll_loop(
     transaction_id: &str,
     invoice_id: &str,
     annulment_idempotency_key: &str,
-    conn: &mut Connection,
+    db: &aberp_db::HandleArc,
     ledger_meta: &LedgerMeta,
     actor: &Actor,
 ) -> Result<LoopTerminus> {
     let transport = NavTransport::new(endpoint).context("build NAV transport")?;
 
-    // Ensure the audit-ledger schema exists once up-front so the
-    // per-poll tx body can call `append_in_tx` directly. Same
-    // posture as `poll_ack::poll_loop`.
-    audit_ledger::ensure_schema(conn)
-        .context("ensure audit-ledger schema for poll-annulment-ack")?;
+    // D-22 — the loop holds no long-lived `conn`; the audit-ledger schema is
+    // ensured inside each per-attempt `write_annulment_ack_audit_entry`
+    // `db.write()` window (idempotent), so the prior up-front `ensure_schema`
+    // on a threaded `conn` is removed. Same posture as `poll_ack::poll_loop`.
 
     let mut last_error: Option<String> = None;
     let mut last_intermediate_status: Option<ProcessingStatus> = None;
@@ -466,7 +476,7 @@ async fn poll_loop(
                 // walks back from any ack-status entry to the
                 // operator-decision entry via shared key.
                 write_annulment_ack_audit_entry(
-                    conn,
+                    db,
                     ledger_meta,
                     actor,
                     invoice_id,
@@ -568,7 +578,7 @@ async fn run_one_attempt(
 /// — divergence from `poll_ack`'s `None` posture that closes the
 /// per-annulment audit lineage.
 fn write_annulment_ack_audit_entry(
-    conn: &mut Connection,
+    db: &aberp_db::HandleArc,
     ledger_meta: &LedgerMeta,
     actor: &Actor,
     invoice_id: &str,
@@ -576,6 +586,16 @@ fn write_annulment_ack_audit_entry(
     annulment_idempotency_key: &str,
     outcome: &QueryTransactionStatusOutcome,
 ) -> Result<()> {
+    // D-22 / ADR-0098 C2 — acquire the shared writer for this single per-poll
+    // audit tx, then drop it: the guard's drop runs the D3 `fsync_data_paths`
+    // and then the lockstep `sync_mirror`. Tight window — the call site runs
+    // this synchronously between NAV awaits, so the `!Send` `WriteGuard` never
+    // crosses one.
+    let mut conn = db.write().context(
+        "shared writer: poll-annulment-ack InvoiceAnnulmentAckStatus (ADR-0098 Gap 1a C2)",
+    )?;
+    audit_ledger::ensure_schema(&conn)
+        .context("ensure audit-ledger schema for poll-annulment-ack")?;
     let tx = conn
         .transaction()
         .context("begin per-poll DuckDB transaction (InvoiceAnnulmentAckStatus append)")?;

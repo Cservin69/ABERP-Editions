@@ -575,8 +575,20 @@ fn drive_one_retry(
             prepared.request_xml.clone(),
         )
         .map_err(|e| DrainRetryError::Application(format!("{e:#}")))?;
-        // WriteGuard drop -> lockstep sync_mirror.
+        // WriteGuard drop -> D3 fsync_data_paths, THEN lockstep sync_mirror.
     }
+    // D-22 / ADR-0110 D3 — the Attempt-before-call row must be on stable
+    // storage BEFORE the wire send, or a power loss mid-flight leaves NAV with
+    // a submission this drain has no record of attempting. The guard drop
+    // already ran the flush; this CLAIMS its outcome so a failure is an error
+    // rather than a log line.
+    db.durable_ack().map_err(|e| {
+        DrainRetryError::Application(format!(
+            "D3 durable ack for drain-pending-retries TX1 Attempt write on invoice {} \
+             (ADR-0110 R1): {e}",
+            retry.invoice_id
+        ))
+    })?;
     tracing::info!(
         invoice_id = %retry.invoice_id,
         "drain-pending-retries TX1 RetryRequested+Attempt audit committed; sending manageInvoice"
@@ -612,8 +624,17 @@ fn drive_one_retry(
                     send_outcome.response_xml,
                 )
                 .map_err(|e| DrainRetryError::Application(format!("{e:#}")))?;
-                // WriteGuard drop -> lockstep sync_mirror.
+                // WriteGuard drop -> D3 fsync_data_paths, THEN lockstep sync_mirror.
             }
+            // D-22 / ADR-0110 D3 — NAV has ACCEPTED this invoice. Claim the
+            // flush outcome BEFORE the per-invoice "OK" line.
+            db.durable_ack().map_err(|e| {
+                DrainRetryError::Application(format!(
+                    "D3 durable ack for drain-pending-retries TX2 Response write on invoice {} \
+                     (ADR-0110 R1): {e}",
+                    retry.invoice_id
+                ))
+            })?;
             let verified = verify_chain_reusing_read(db, tenant, binary_hash_bytes).map_err(|e| {
                 DrainRetryError::Application(format!(
                     "audit-ledger chain verification failed AFTER drain-pending-retries TX2 Response commit for invoice {}: {e:#}",
@@ -655,8 +676,18 @@ fn drive_one_retry(
                     response_xml,
                 )
                 .map_err(|e| DrainRetryError::Application(format!("{e:#}")))?;
-                // WriteGuard drop -> lockstep sync_mirror.
+                // WriteGuard drop -> D3 fsync_data_paths, THEN lockstep sync_mirror.
             }
+            // D-22 / ADR-0110 D3 — the AttemptFailed row is what keeps this
+            // invoice reachable by a later retry; losing it strands it. Claim
+            // the flush outcome even on this failure arm.
+            db.durable_ack().map_err(|e| {
+                DrainRetryError::Application(format!(
+                    "D3 durable ack for drain-pending-retries TX2 AttemptFailed write on \
+                     invoice {} (ADR-0110 R1): {e}",
+                    retry.invoice_id
+                ))
+            })?;
             let _ = verify_chain_reusing_read(db, tenant, binary_hash_bytes).map_err(|e| {
                 DrainRetryError::Application(format!(
                     "audit-ledger chain verification failed AFTER drain-pending-retries TX2 AttemptFailed commit for invoice {}: {e:#}",
@@ -790,8 +821,16 @@ fn perform_layer_2_check(
             "shared writer: drain-pending-retries TX0 InvoiceCheckPerformed audit (ADR-0098 C2)",
         )?;
         write_check_performed_audit(&mut conn, ledger_meta, actor, idempotency_key, payload)?;
-        // WriteGuard drop -> lockstep sync_mirror.
+        // WriteGuard drop -> D3 fsync_data_paths, THEN lockstep sync_mirror.
     }
+    // D-22 / ADR-0110 D3 — the `InvoiceCheckPerformed` row is what a later
+    // `mark-abandoned` consults for its F49 guard; losing it silently would
+    // let an invoice NAV already holds be abandoned locally. Claim the flush
+    // outcome before the decision is acted on.
+    db.durable_ack().context(
+        "D3 durable ack for the drain-pending-retries TX0 InvoiceCheckPerformed write \
+         (ADR-0110 R1)",
+    )?;
 
     Ok(decision)
 }

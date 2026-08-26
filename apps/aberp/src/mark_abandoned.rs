@@ -13,7 +13,7 @@
 //!   2. Open tenant DuckDB; load the previously-issued invoice +
 //!      idempotency_key from the billing store (scoped read tx; same
 //!      shape as `submit_invoice::run` / `retry_submission::run`).
-//!   3. Read the audit ledger via a fresh `Ledger::open` and resolve
+//!   3. Read the audit ledger through the shared Handle and resolve
 //!      the stuck precondition through [`crate::audit_query::stuck_precondition`].
 //!      Loud-fail on every `NotStuck` reason — `mark-abandoned` is
 //!      a no-op outside the `Stuck` posture.
@@ -145,17 +145,93 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
         "actor derived for mark-abandoned (no NAV credentials loaded)"
     );
 
-    // 2. Load the previously-issued invoice + idempotency key.
-    let mut conn = Connection::open(&args.db)
-        .with_context(|| format!("open tenant DuckDB at {}", args.db.display()))?;
-    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
-    let (ready_invoice, idempotency_key) = load_issued_invoice(&mut conn, &args.invoice_id)?;
-    if ready_invoice.id.to_prefixed_string() != args.invoice_id {
+    // 2. D-22 / ADR-0110 D3 — route EVERY DuckDB access through the ONE shared
+    //    `aberp_db::Handle`, exactly as `submit_invoice::run` and
+    //    `drain_pending_retries::run` already do. Pre-D-22 this command opened a
+    //    raw `Connection` and followed its commit with an independent
+    //    `Ledger::open` + `sync_mirror`: the mirror was explicitly `fsync`ed and
+    //    the DB was not, which is the durability ordering INVERTED (ADR-0099
+    //    §R2.2). On the Handle the `WriteGuard`'s drop runs `fsync_data_paths`
+    //    on the DB + WAL + tenant dir FIRST and only then the lockstep mirror
+    //    sync, and `Handle::durable_ack` below claims that flush's outcome so
+    //    the operator-visible "OK" cannot outrun the bytes.
+    let db = aberp_db::Handle::open_default(&args.db, tenant.clone())
+        .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
+
+    let MarkAbandonedOutcome {
+        invoice: ready_invoice,
+        stuck,
+        entries_verified: verified,
+    } = mark_abandoned_from_inputs(MarkAbandonedInputs {
+        db: &db,
+        tenant,
+        actor,
+        invoice_id: &args.invoice_id,
+        reason,
+        force_despite_nav_exists: args.force_despite_nav_exists,
+    })?;
+
+    print_operator_summary(&ready_invoice, &stuck, verified);
+    Ok(())
+}
+
+/// D-22 — the library core of `aberp mark-abandoned`, split out from [`run`] on
+/// the `submit_invoice::submit_from_inputs` / `poll_ack::poll_ack_from_inputs`
+/// precedent: the CLI-specific responsibilities (arg validation, deriving the
+/// `Actor` from `$USER`, opening the Handle, printing) stay in [`run`]; the
+/// read → guard → write → **durable ack** → verify pipeline lives here.
+///
+/// The split is what makes D-22's durability claim TESTABLE. A caller that owns
+/// the `Handle` can put it into the D2 debounce shadow first (see
+/// `apps/aberp/tests/d22_money_cli_power_loss_durability.rs`), so the measured
+/// write is one the debounced checkpoint does NOT fold — i.e. one that survives
+/// a power loss ONLY because `durable_ack` flushed it. Driven through [`run`]
+/// the write would always be write #1 on a fresh Handle, which the
+/// unconditional first-write checkpoint makes durable for free, and the spec
+/// would prove nothing.
+#[allow(missing_docs)]
+pub struct MarkAbandonedInputs<'a> {
+    /// ADR-0098 C2 (Gap 1a) — the shared process-wide DuckDB Handle. Every DB
+    /// access below routes through it (`db.read()` / `db.write()`).
+    pub db: &'a aberp_db::HandleArc,
+    pub tenant: TenantId,
+    pub actor: Actor,
+    pub invoice_id: &'a str,
+    pub reason: &'a str,
+    pub force_despite_nav_exists: bool,
+}
+
+/// What [`mark_abandoned_from_inputs`] hands back for the operator-visible
+/// summary. The invoice + precondition are returned rather than re-read so the
+/// printing half needs no second ledger walk.
+#[derive(Debug)]
+pub struct MarkAbandonedOutcome {
+    pub invoice: ReadyInvoice,
+    pub stuck: StuckPrecondition,
+    pub entries_verified: u64,
+}
+
+pub fn mark_abandoned_from_inputs(inputs: MarkAbandonedInputs<'_>) -> Result<MarkAbandonedOutcome> {
+    let MarkAbandonedInputs {
+        db,
+        tenant,
+        actor,
+        invoice_id,
+        reason,
+        force_despite_nav_exists,
+    } = inputs;
+    let args_invoice_id = invoice_id;
+    let (ready_invoice, idempotency_key) = {
+        let mut conn = db
+            .read()
+            .context("shared read: mark-abandoned invoice lookup (ADR-0098 C2)")?;
+        load_issued_invoice(&mut conn, args_invoice_id)?
+    };
+    if ready_invoice.id.to_prefixed_string() != args_invoice_id {
         return Err(anyhow!(
             "loaded invoice id {} does not match requested {}",
             ready_invoice.id.to_prefixed_string(),
-            args.invoice_id
+            args_invoice_id
         ));
     }
     tracing::info!(
@@ -167,10 +243,10 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
     // 3. Resolve the stuck precondition.
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
     let stuck = resolve_stuck_or_loud_fail(
-        &args.db,
+        db,
         tenant.clone(),
         binary_hash_bytes,
-        &args.invoice_id,
+        args_invoice_id,
         &idempotency_key,
     )?;
 
@@ -182,12 +258,16 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
     //     --force-despite-nav-exists when out-of-band justification
     //     applies; the override is loud in the audit reason field.
     let latest_check = {
-        let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
-            .context("open audit ledger to consult latest_check_performed_outcome (F49 guard)")?;
-        audit_query::latest_check_performed_outcome(&ledger, &args.invoice_id)?
+        // D-22 — a coherent read clone of the ONE instance, never an
+        // independent `Ledger::open` of the live path.
+        let conn = db
+            .read()
+            .context("shared read: latest_check_performed_outcome (F49 guard) (ADR-0098 C2)")?;
+        let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
+        audit_query::latest_check_performed_outcome(&ledger, args_invoice_id)?
     };
     let nav_side_exists = matches!(latest_check.as_deref(), Some("exists"));
-    if nav_side_exists && !args.force_despite_nav_exists {
+    if nav_side_exists && !force_despite_nav_exists {
         return Err(anyhow!(
             "F49 guard: mark-abandoned REFUSED for invoice {}: \
              the most-recent InvoiceCheckPerformed audit entry has outcome=\"exists\" — \
@@ -202,14 +282,14 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
              annulled separately and the operator wants to terminate the local chain now), \
              re-run with --force-despite-nav-exists — the resulting audit entry's reason \
              field will carry a [forced-despite-nav-side-exists] marker.",
-            args.invoice_id,
-            args.invoice_id,
+            args_invoice_id,
+            args_invoice_id,
         ));
     }
-    let forced_marker_active = nav_side_exists && args.force_despite_nav_exists;
+    let forced_marker_active = nav_side_exists && force_despite_nav_exists;
     if forced_marker_active {
         tracing::warn!(
-            invoice_id = %args.invoice_id,
+            invoice_id = %args_invoice_id,
             "F49 guard OVERRIDDEN: --force-despite-nav-exists is set; \
              writing InvoiceMarkedAbandoned despite NAV-side Exists evidence"
         );
@@ -221,31 +301,57 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
     //    — the override is loud in the bundle).
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
     let effective_reason = effective_reason_for_audit(reason, forced_marker_active);
-    write_marked_abandoned_audit_entry(
-        &mut conn,
-        &ledger_meta,
-        actor,
-        &ready_invoice,
-        idempotency_key,
-        &effective_reason,
-        &stuck,
-    )?;
+    {
+        let mut conn = db
+            .write()
+            .context("shared writer: mark-abandoned audit append (ADR-0098 Gap 1a C2)")?;
+        write_marked_abandoned_audit_entry(
+            &mut conn,
+            &ledger_meta,
+            actor,
+            &ready_invoice,
+            idempotency_key,
+            &effective_reason,
+            &stuck,
+        )?;
+        // WriteGuard drop -> D3 fsync_data_paths (DB + WAL + dir), THEN the
+        // lockstep sync_mirror. The explicit ADR-0030 §2 `Ledger::open` +
+        // `sync_mirror` tail is GONE with D-22: it was a SECOND live opener
+        // and it made the mirror durable while the DB was not.
+    }
 
-    // 5. Verify the audit chain (success-criterion gate).
-    drop(conn);
-    let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes).context("open audit ledger")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER mark-abandoned")?;
+    // 4a. D-22 / ADR-0110 D3 — claim the parked flush outcome BEFORE the
+    //     operator is told this terminal decision was recorded. `mark-abandoned`
+    //     burns an invoice sequence for good; an ack on a write that nothing
+    //     could `fsync` is precisely the 2026-08-08 loss.
+    db.durable_ack()
+        .context("D3 durable ack for the mark-abandoned audit write (ADR-0110 R1)")?;
+
+    // 5. Verify the audit chain (success-criterion gate). Reuses a coherent
+    //    shared READ clone — never an independent `Ledger::open` of the live
+    //    path (the duckdb#23046 replay locus).
+    let verified = {
+        let conn = db
+            .read()
+            .context("shared read: mark-abandoned post-commit verify (ADR-0098 C2)")?;
+        let ledger = Ledger::from_connection(conn, tenant, binary_hash_bytes);
+        ledger
+            .verify_chain()
+            .context("audit-ledger chain verification failed AFTER mark-abandoned")?
+    };
     tracing::info!(entries_verified = verified, "audit chain verified");
 
-    // 5a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    //     post-commit.
-    let mirror_path = audit_ledger::mirror_path_for(&args.db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after mark-abandoned commit")?;
+    Ok(MarkAbandonedOutcome {
+        invoice: ready_invoice,
+        stuck,
+        entries_verified: verified,
+    })
+}
 
+/// The operator-visible half, split out of [`run`] alongside
+/// [`mark_abandoned_from_inputs`]. Pure printing + typestate display; it makes
+/// no DB access, so the durability spec can drive the core without a terminal.
+fn print_operator_summary(ready_invoice: &ReadyInvoice, stuck: &StuckPrecondition, verified: u64) {
     // 6. Typestate advance + operator-visible summary. PR-19 /
     //    ADR-0032 §4: state-2 Pending has no prior_transaction_id;
     //    the typestate-display path is taken only for state-3
@@ -265,7 +371,7 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
         Some(txid) => {
             // State-3 path — the existing pre-PR-19 typestate
             // advance is retained for the operator-visible message.
-            let submitted = ready_invoice.into_submitted(txid);
+            let submitted = ready_invoice.clone().into_submitted(txid);
             let stuck_typestate = submitted.into_submission_stuck();
             let abandoned = stuck_typestate.into_abandoned();
             tracing::error!(
@@ -314,8 +420,6 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
             );
         }
     }
-
-    Ok(())
 }
 
 /// Open the audit ledger, resolve the stuck precondition. Same
@@ -323,14 +427,18 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
 /// `retry_submission::resolve_stuck_or_loud_fail` — duplicated for
 /// the operator-facing-twin reason the parser helpers are duplicated.
 fn resolve_stuck_or_loud_fail(
-    db_path: &std::path::Path,
+    db: &aberp_db::HandleArc,
     tenant: TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     invoice_id: &str,
     issuance_idempotency_key: &IdempotencyKey,
 ) -> Result<StuckPrecondition> {
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to resolve mark-abandoned precondition")?;
+    // D-22 — a coherent read clone of the ONE shared instance, never an
+    // independent `Ledger::open` of the live path.
+    let conn = db
+        .read()
+        .context("shared read: mark-abandoned stuck precondition (ADR-0098 C2)")?;
+    let ledger = Ledger::from_connection(conn, tenant, binary_hash);
     match audit_query::stuck_precondition(&ledger, invoice_id)? {
         StuckOutcome::Stuck(p) => {
             if p.idempotency_key != *issuance_idempotency_key {

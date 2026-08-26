@@ -413,6 +413,16 @@ pub async fn poll_ack_from_inputs(
     )
     .await?;
 
+    // 5a. D-22 / ADR-0110 D3 — claim the parked flush outcome BEFORE the
+    //     caller is handed a terminal ack. Each per-attempt `WriteGuard` drop
+    //     inside `poll_loop` already ran `fsync_data_paths`; until D-22 that
+    //     result was DISCARDED, so a flush that failed surfaced only as a
+    //     `tracing::error!` while this function still returned a clean
+    //     `Finalized`. The terminal `InvoiceAckStatus` row is NAV's verdict on
+    //     a filed ÁFA submission — the operator's ack must not outrun it.
+    db.durable_ack()
+        .context("D3 durable ack for the poll-ack InvoiceAckStatus writes (ADR-0110 R1)")?;
+
     // 6. Verify the audit chain (success-criterion gate). ADR-0098 C2 — via a
     //    shared READ clone (Ledger::from_connection); the mirror was already
     //    synced on each per-attempt WriteGuard drop in poll_loop. No independent

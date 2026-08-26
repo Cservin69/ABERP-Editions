@@ -594,9 +594,16 @@ pub async fn submit_from_inputs(
             prepared.request_xml.clone(),
         )
         .map_err(SubmitFromInputsError::Other)?;
-        // WriteGuard drop -> lockstep sync_mirror (replaces the S388 explicit sync).
+        // WriteGuard drop -> D3 fsync_data_paths, THEN the lockstep sync_mirror
+        // (which replaced the S388 explicit sync).
     }
-    tracing::info!("TX1 Attempt audit committed; mirror synced; sending manageInvoice");
+    // D-22 / ADR-0110 D3 — the Attempt-before-call row must be on stable
+    // storage BEFORE the wire send, or a power loss mid-flight leaves NAV with
+    // a submission ABERP has no record of attempting.
+    db.durable_ack()
+        .context("D3 durable ack for the submit TX1 Attempt write (ADR-0110 R1)")
+        .map_err(SubmitFromInputsError::Other)?;
+    tracing::info!("TX1 Attempt audit committed; durable; mirror synced; sending manageInvoice");
 
     // 8. Wire send.
     let wire_result =
@@ -624,8 +631,17 @@ pub async fn submit_from_inputs(
                     send_outcome.response_xml,
                 )
                 .map_err(SubmitFromInputsError::Other)?;
-                // WriteGuard drop -> lockstep sync_mirror.
+                // WriteGuard drop -> D3 fsync_data_paths, THEN lockstep sync_mirror.
             }
+            // D-22 / ADR-0110 D3 — NAV has ACCEPTED the submission. The guard
+            // drop above already ran `fsync_data_paths`; this CLAIMS its
+            // parked outcome so a flush that FAILED becomes an error the
+            // operator sees instead of a `tracing::error!` nobody reads. Until
+            // D-22 this ack boundary printed "submitted invoice …" on the
+            // strength of a flush whose result was discarded.
+            db.durable_ack()
+                .context("D3 durable ack for the submit TX2 Response write (ADR-0110 R1)")
+                .map_err(SubmitFromInputsError::Other)?;
             // ADR-0098 C2 — verify via a shared READ clone; the hook already
             // synced the mirror, so the reused helper's sync_mirror is an
             // idempotent no-op re-run. No independent live re-open.
@@ -673,8 +689,15 @@ pub async fn submit_from_inputs(
                     response_xml,
                 )
                 .map_err(SubmitFromInputsError::Other)?;
-                // WriteGuard drop -> lockstep sync_mirror.
+                // WriteGuard drop -> D3 fsync_data_paths, THEN lockstep sync_mirror.
             }
+            // D-22 / ADR-0110 D3 — the AttemptFailed row is what keeps this
+            // invoice reachable by `aberp retry-submission`; losing it strands
+            // it. Claim the flush outcome even on this failure arm, BEFORE the
+            // typed WireFailed error the caller renders.
+            db.durable_ack()
+                .context("D3 durable ack for the submit TX2 AttemptFailed write (ADR-0110 R1)")
+                .map_err(SubmitFromInputsError::Other)?;
             // ADR-0098 C2 — same read-clone verify as the success arm.
             let read_conn = db
                 .read()

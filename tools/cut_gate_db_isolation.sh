@@ -657,6 +657,22 @@ c2_files=(
   apps/aberp/src/issue_modification.rs
   apps/aberp/src/submit_invoice.rs
   apps/aberp/src/mark_invoice_paid.rs
+  # ── D-22 (ADR-0114) — the NAV money-submission CLI one-shots. They were
+  #    FROZEN residuals (10i/10j/10k) rather than migrated seams, which is
+  #    exactly how they kept the pre-D3 durability inversion alive: an
+  #    independent `Connection::open` per tx, then `Ledger::open` +
+  #    `sync_mirror`, so the audit MIRROR was explicitly `fsync`ed and the DB
+  #    was not. Now Handle-routed like their already-migrated twins, so they
+  #    are promoted from "frozen, may not grow" to "zero, ENFORCED here" —
+  #    a re-added opener is a red build, not a silently tolerated count.
+  apps/aberp/src/drain_submission_queue.rs
+  apps/aberp/src/retry_submission.rs
+  apps/aberp/src/submit_annulment.rs
+  apps/aberp/src/poll_annulment_ack.rs
+  apps/aberp/src/observe_receiver_confirmation.rs
+  apps/aberp/src/recover_from_nav.rs
+  apps/aberp/src/mark_abandoned.rs
+  apps/aberp/src/request_technical_annulment.rs
 )
 for f in "${c2_files[@]}"; do
   if [[ ! -f "$f" ]]; then flag10 "✗ C2 migrated file missing: $f"; continue; fi
@@ -698,7 +714,7 @@ enforce10L="${ENFORCE_MIRROR_FORK:-1}"
 flag10L() { note "$1"; if [[ "$enforce10L" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
 mff_scan="tools/adr0098_r7_mirror_fork_scan.awk"
 mff_manifest="tools/adr0098_r7_mirror_fork_sites.txt"
-r7_c2_set=" apps/aberp/src/ap_sync.rs apps/aberp/src/poll_ack.rs apps/aberp/src/issue_invoice.rs apps/aberp/src/issue_storno.rs apps/aberp/src/issue_modification.rs apps/aberp/src/submit_invoice.rs apps/aberp/src/mark_invoice_paid.rs "
+r7_c2_set=" apps/aberp/src/ap_sync.rs apps/aberp/src/poll_ack.rs apps/aberp/src/issue_invoice.rs apps/aberp/src/issue_storno.rs apps/aberp/src/issue_modification.rs apps/aberp/src/submit_invoice.rs apps/aberp/src/mark_invoice_paid.rs apps/aberp/src/drain_submission_queue.rs apps/aberp/src/retry_submission.rs apps/aberp/src/submit_annulment.rs apps/aberp/src/poll_annulment_ack.rs apps/aberp/src/observe_receiver_confirmation.rs apps/aberp/src/recover_from_nav.rs apps/aberp/src/mark_abandoned.rs apps/aberp/src/request_technical_annulment.rs "
 if [[ ! -f "$mff_scan" || ! -f "$mff_manifest" ]]; then
   flag10L "✗ R7 mirror-fork scanner or frozen manifest missing: $mff_scan / $mff_manifest"
 else
@@ -710,7 +726,12 @@ else
     case "$f" in crates/aberp-db/*|crates/aberp-snapshot/*) continue;; esac
     awk -f "$mff_scan" "$f" 2>/dev/null
   done < <(find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/' | sort) | sort > "$r7_cur"
-  grep -vE '^#' "$mff_manifest" | sort > "$r7_froz"
+  # `|| true`: an EMPTY manifest is a legitimate state (D-22 emptied this one)
+  # and `grep -v` exits 1 when it matches nothing. Without the guard,
+  # `set -euo pipefail` KILLS the whole gate right here — 10i, 10j, 10k, 10M,
+  # 10P and 10N never run, and the exit-1 looks like an ordinary failure. Same
+  # guard 10M and 10N already carry on their own (already-empty) manifests.
+  grep -vE '^#' "$mff_manifest" | sort > "$r7_froz" || true
   r7_grew="$(comm -13 "$r7_froz" "$r7_cur")"
   if [[ -n "$r7_grew" ]]; then
     flag10L "✗ a NEW/REGROWN independent-opener + sync_mirror (write-fork) site appeared — route it through the shared Handle (ADR-0098 R7 regression):"
@@ -721,7 +742,7 @@ else
     note "  (info) mirror-fork sites migrated off since freeze — refresh $mff_manifest to lock the smaller set:"
     printf '%s\n' "$r7_shrunk" | sed 's/^/      /'
   fi
-  if [[ -z "$r7_grew" ]]; then note "✓ mirror-fork set has not grown ($(grep -vcE '^#' "$mff_manifest") frozen fork-capable sites; v0.2.6 target — may only shrink)"; fi
+  if [[ -z "$r7_grew" ]]; then note "✓ mirror-fork set has not grown ($(grep -vcE '^#' "$mff_manifest" || true) frozen fork-capable sites; D-22 emptied it — ANY site the scanner reports now is new)"; fi
   rm -f "$r7_cur" "$r7_froz"
 
   # 10L-a — the two seams migrated THIS session (ADR-0098 R7) must stay opener-free +
@@ -792,7 +813,7 @@ if [[ ! -f "$manifest" ]]; then
 elif [[ ! -f "$scan" ]]; then
   : # already flagged
 else
-  c2_set=" apps/aberp/src/ap_sync.rs apps/aberp/src/poll_ack.rs apps/aberp/src/issue_invoice.rs apps/aberp/src/issue_storno.rs apps/aberp/src/issue_modification.rs apps/aberp/src/submit_invoice.rs apps/aberp/src/mark_invoice_paid.rs "
+  c2_set=" apps/aberp/src/ap_sync.rs apps/aberp/src/poll_ack.rs apps/aberp/src/issue_invoice.rs apps/aberp/src/issue_storno.rs apps/aberp/src/issue_modification.rs apps/aberp/src/submit_invoice.rs apps/aberp/src/mark_invoice_paid.rs apps/aberp/src/drain_submission_queue.rs apps/aberp/src/retry_submission.rs apps/aberp/src/submit_annulment.rs apps/aberp/src/poll_annulment_ack.rs apps/aberp/src/observe_receiver_confirmation.rs apps/aberp/src/recover_from_nav.rs apps/aberp/src/mark_abandoned.rs apps/aberp/src/request_technical_annulment.rs "
   resid_fail=0
   while IFS= read -r f; do
     case " $c2_set " in *" $f "*) continue;; esac
@@ -1267,7 +1288,7 @@ else
     fi
     if [[ -z "$tf_grew" ]]; then
       tf_n="$(grep -vcE '^#' "$tf_manifest" || true)"
-      note "✓ frozen wrapper-fork residual holds (${tf_n:-0} site(s); the only entry is the separate-process CLI one-shot — every IN-PROCESS wrapper-hidden audit fork is on the shared Handle)"
+      note "✓ frozen wrapper-fork residual holds (${tf_n:-0} site(s); D-22 emptied it — every wrapper-hidden audit fork, in-process AND separate-process CLI, is on the shared Handle)"
     fi
   fi
   rm -f "$tf_files" "$tf_raw" "$tf_cur" "$tf_froz"

@@ -173,12 +173,23 @@ pub fn run(args: &RecoverFromNavArgs) -> Result<()> {
         "NAV credentials loaded; actor derived for recover-from-nav"
     );
 
-    // 3. Load the previously-issued invoice + its idempotency key.
-    let mut conn = Connection::open(&args.db)
-        .with_context(|| format!("open tenant DuckDB at {}", args.db.display()))?;
-    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
-    let (ready_invoice, idempotency_key) = load_issued_invoice(&mut conn, &args.invoice_id)?;
+    // 3. D-22 / ADR-0110 D3 — route EVERY DuckDB access through the ONE shared
+    //    `aberp_db::Handle`, exactly as `submit_invoice::run` already does.
+    //    Pre-D-22 this command opened a raw `Connection` for the audit write
+    //    and followed the commit with an independent `Ledger::open` +
+    //    `sync_mirror`: the mirror was explicitly `fsync`ed and the DB was not
+    //    — the durability ordering INVERTED (ADR-0099 §R2.2). On the Handle
+    //    the `WriteGuard`'s drop runs `fsync_data_paths` FIRST and only then
+    //    the lockstep mirror sync, and `Handle::durable_ack` below claims that
+    //    flush's outcome.
+    let db = aberp_db::Handle::open_default(&args.db, tenant.clone())
+        .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
+    let (ready_invoice, idempotency_key) = {
+        let mut conn = db
+            .read()
+            .context("shared read: recover-from-nav invoice lookup (ADR-0098 C2)")?;
+        load_issued_invoice(&mut conn, &args.invoice_id)?
+    };
     if ready_invoice.id.to_prefixed_string() != args.invoice_id {
         return Err(anyhow!(
             "loaded invoice id {} does not match requested {}",
@@ -202,7 +213,7 @@ pub fn run(args: &RecoverFromNavArgs) -> Result<()> {
     //    proven to match per the cross-check).
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
     let (nav_invoice_number_from_check, base_nav_xml_path) = resolve_recovery_precondition(
-        &args.db,
+        &db,
         tenant.clone(),
         binary_hash_bytes,
         &args.invoice_id,
@@ -294,33 +305,45 @@ pub fn run(args: &RecoverFromNavArgs) -> Result<()> {
     //    under one tx. Reuses the existing payload shape per
     //    ADR-0034 §4 (no schema change; F12 ritual does NOT fire).
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
-    write_recovered_response_audit_entry(
-        &mut conn,
-        &ledger_meta,
-        actor.clone(),
-        &ready_invoice,
-        idempotency_key,
-        &recovered_transaction_id,
-        outcome.response_xml.clone(),
-    )?;
+    {
+        let mut conn = db
+            .write()
+            .context("shared writer: recover-from-nav audit append (ADR-0098 Gap 1a C2)")?;
+        write_recovered_response_audit_entry(
+            &mut conn,
+            &ledger_meta,
+            actor.clone(),
+            &ready_invoice,
+            idempotency_key,
+            &recovered_transaction_id,
+            outcome.response_xml.clone(),
+        )?;
+        // WriteGuard drop -> D3 fsync_data_paths (DB + WAL + dir), THEN the
+        // lockstep sync_mirror. The explicit ADR-0030 §2 `Ledger::open` +
+        // `sync_mirror` tail is GONE with D-22.
+    }
 
-    // 9. Verify the audit chain after commit (success-criterion
-    //    gate). Drop the tx-Connection first; re-open a fresh
-    //    Ledger to read.
-    drop(conn);
-    let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
-        .context("re-open audit ledger after recover-from-nav commit")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER recover-from-nav")?;
+    // 8a. D-22 / ADR-0110 D3 — claim the parked flush outcome BEFORE the
+    //     operator is told the chain was reconstructed. This entry is the
+    //     LOCAL record of a submission NAV has already accepted; losing it is
+    //     precisely the "filed at NAV, absent locally" divergence that made
+    //     this command necessary in the first place.
+    db.durable_ack()
+        .context("D3 durable ack for the recover-from-nav audit write (ADR-0110 R1)")?;
+
+    // 9. Verify the audit chain after commit (success-criterion gate).
+    //    Reuses a coherent shared READ clone — never an independent
+    //    `Ledger::open` of the live path.
+    let verified = {
+        let conn = db
+            .read()
+            .context("shared read: recover-from-nav post-commit verify (ADR-0098 C2)")?;
+        let ledger = Ledger::from_connection(conn, tenant, binary_hash_bytes);
+        ledger
+            .verify_chain()
+            .context("audit-ledger chain verification failed AFTER recover-from-nav")?
+    };
     tracing::info!(entries_verified = verified, "audit chain verified");
-
-    // 9a. ADR-0030 §2 — sync the audit-ledger mirror file
-    //     post-commit.
-    let mirror_path = audit_ledger::mirror_path_for(&args.db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after recover-from-nav commit")?;
 
     // 10. Operator-visible summary per ADR-0034 §2 step 10. Names
     //     the recovered txid + steers the operator at poll-ack
@@ -370,14 +393,18 @@ pub fn run(args: &RecoverFromNavArgs) -> Result<()> {
 /// CLAUDE.md rule 2 (minimum code, no speculative
 /// abstractions).
 fn resolve_recovery_precondition(
-    db_path: &Path,
+    db: &aberp_db::HandleArc,
     tenant: TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     invoice_id: &str,
     issuance_idempotency_key: &IdempotencyKey,
 ) -> Result<(String, std::path::PathBuf)> {
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to resolve recover-from-nav precondition")?;
+    // D-22 — a coherent read clone of the ONE shared instance, never an
+    // independent `Ledger::open` of the live path.
+    let conn = db
+        .read()
+        .context("shared read: recover-from-nav precondition (ADR-0098 C2)")?;
+    let ledger = Ledger::from_connection(conn, tenant, binary_hash);
     // S184/S190 — resolve the invoice's on-disk NAV XML path from the
     // SAME ledger read (no second opener). The NAV-facing invoice number
     // consumed by `queryInvoiceData` must be read off that XML's

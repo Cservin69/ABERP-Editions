@@ -83,7 +83,6 @@
 //!     — NAV v3.0 protocol assigns per-request tokens.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
 use aberp_billing::IdempotencyKey;
@@ -145,11 +144,28 @@ pub fn run(args: &DrainSubmissionQueueArgs) -> Result<()> {
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
+    // 3a. D-22 / ADR-0110 D3 — route EVERY DuckDB access through the ONE
+    //     shared `aberp_db::Handle`, exactly as its twin
+    //     `drain_pending_retries::run` already does. Pre-D-22 the drain opened
+    //     a raw `Connection` per tx and followed each commit with an
+    //     independent `Ledger::open` + `sync_mirror`: the mirror was
+    //     explicitly `fsync`ed and the DB was not — the durability ordering
+    //     INVERTED (ADR-0099 §R2.2) on a loop that files real NAV ÁFA
+    //     submissions. On the Handle each tx gets its own tight `db.write()`
+    //     window whose guard drop runs `fsync_data_paths` FIRST and only then
+    //     the lockstep mirror sync, and `Handle::durable_ack` claims that
+    //     flush's outcome per invoice.
+    let db = aberp_db::Handle::open_default(&args.db, tenant.clone())
+        .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
+
     // 4. Resolve pending invoices via the audit-ledger walker. FIFO
-    //    by issue date.
+    //    by issue date. Read through a coherent `try_clone` of the ONE
+    //    instance (ADR-0098 C2), never an independent `Ledger::open`.
     let pending = {
-        let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
-            .context("open audit ledger for pending-submissions walk")?;
+        let conn = db
+            .read()
+            .context("shared read: pending-submissions walk (ADR-0098 C2)")?;
+        let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
         submission_queue::pending_from_ledger(&ledger)?
     };
     let pending_count = pending.len();
@@ -228,7 +244,7 @@ pub fn run(args: &DrainSubmissionQueueArgs) -> Result<()> {
         let outcome = drive_one_invoice(
             invoice,
             &override_map,
-            &args.db,
+            &db,
             nav_endpoint,
             endpoint_audit_label,
             &credentials,
@@ -332,7 +348,7 @@ enum DrainPerInvoiceError {
 fn drive_one_invoice(
     invoice: &PendingInvoice,
     override_map: &HashMap<String, String>,
-    db_path: &Path,
+    db: &aberp_db::HandleArc,
     nav_endpoint: NavEndpoint,
     endpoint_audit_label: &'static str,
     credentials: &NavCredentials,
@@ -388,46 +404,36 @@ fn drive_one_invoice(
         ))
         .map_err(classify_nav_error)?;
 
-    // e. TX1 — Attempt-before-call.
-    let mut conn = Connection::open(db_path).map_err(|e| {
+    // e. TX1 — Attempt-before-call, in its own tight `db.write()` window. The
+    //    writer mutex is NOT held across the wire send below.
+    {
+        let mut conn = db.write().map_err(|e| {
+            DrainPerInvoiceError::Application(format!(
+                "shared writer for drain TX1 audit-write (ADR-0098 Gap 1a C2): {e}"
+            ))
+        })?;
+        write_attempt_audit(
+            &mut conn,
+            ledger_meta,
+            actor.clone(),
+            &invoice.invoice_id,
+            invoice.idempotency_key,
+            endpoint_audit_label,
+            prepared.request_xml.clone(),
+        )
+        .map_err(|e| DrainPerInvoiceError::Application(format!("{e:#}")))?;
+        // WriteGuard drop -> D3 fsync_data_paths, THEN lockstep sync_mirror.
+        // The explicit `Ledger::open` + `sync_mirror` tail is GONE with D-22.
+    }
+    // D-22 / ADR-0110 D3 — the Attempt-before-call row must be on stable
+    // storage BEFORE the wire send, or a power loss mid-flight leaves NAV with
+    // a submission this drain has no record of attempting.
+    db.durable_ack().map_err(|e| {
         DrainPerInvoiceError::Application(format!(
-            "open tenant DuckDB at {} for drain TX1 audit-write: {e}",
-            db_path.display()
+            "D3 durable ack for drain TX1 Attempt write on invoice {} (ADR-0110 R1): {e}",
+            invoice.invoice_id
         ))
     })?;
-    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .map_err(|e| {
-            DrainPerInvoiceError::Application(format!(
-                "PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}"
-            ))
-        })?;
-    write_attempt_audit(
-        &mut conn,
-        ledger_meta,
-        actor.clone(),
-        &invoice.invoice_id,
-        invoice.idempotency_key,
-        endpoint_audit_label,
-        prepared.request_xml.clone(),
-    )
-    .map_err(|e| DrainPerInvoiceError::Application(format!("{e:#}")))?;
-    drop(conn);
-    // Sync mirror for TX1.
-    {
-        let ledger_tx1 = Ledger::open(db_path, tenant.clone(), binary_hash_bytes).map_err(|e| {
-            DrainPerInvoiceError::Application(format!(
-                "re-open audit ledger after drain TX1 commit for invoice {}: {e}",
-                invoice.invoice_id
-            ))
-        })?;
-        let mirror_path = audit_ledger::mirror_path_for(db_path);
-        ledger_tx1.sync_mirror(&mirror_path).map_err(|e| {
-            DrainPerInvoiceError::Application(format!(
-                "sync audit-ledger mirror after drain TX1 commit for invoice {}: {e}",
-                invoice.invoice_id
-            ))
-        })?;
-    }
     tracing::info!(
         invoice_id = %invoice.invoice_id,
         "drain TX1 Attempt audit committed; sending manageInvoice"
@@ -439,51 +445,55 @@ fn drive_one_invoice(
         &prepared.request_xml,
     ));
 
-    // g. TX2 — Response on success, AttemptFailed on failure.
-    let mut conn = Connection::open(db_path).map_err(|e| {
-        DrainPerInvoiceError::Application(format!(
-            "open tenant DuckDB at {} for drain TX2 audit-write: {e}",
-            db_path.display()
-        ))
-    })?;
-    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .map_err(|e| {
-            DrainPerInvoiceError::Application(format!(
-                "PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}"
-            ))
-        })?;
+    // g. TX2 — Response on success, AttemptFailed on failure. Own tight
+    //    `db.write()` window per arm.
     match wire_result {
         Ok(send_outcome) => {
-            write_response_audit(
-                &mut conn,
-                ledger_meta,
-                actor,
-                &invoice.invoice_id,
-                invoice.idempotency_key,
-                &send_outcome.transaction_id,
-                send_outcome.response_xml,
-            )
-            .map_err(|e| DrainPerInvoiceError::Application(format!("{e:#}")))?;
-            drop(conn);
-            let ledger = Ledger::open(db_path, tenant, binary_hash_bytes).map_err(|e| {
+            {
+                let mut conn = db.write().map_err(|e| {
+                    DrainPerInvoiceError::Application(format!(
+                        "shared writer for drain TX2 Response audit-write \
+                         (ADR-0098 Gap 1a C2): {e}"
+                    ))
+                })?;
+                write_response_audit(
+                    &mut conn,
+                    ledger_meta,
+                    actor,
+                    &invoice.invoice_id,
+                    invoice.idempotency_key,
+                    &send_outcome.transaction_id,
+                    send_outcome.response_xml,
+                )
+                .map_err(|e| DrainPerInvoiceError::Application(format!("{e:#}")))?;
+                // WriteGuard drop -> D3 fsync_data_paths, THEN lockstep sync_mirror.
+            }
+            // D-22 / ADR-0110 D3 — NAV has ACCEPTED this invoice. Claim the
+            // flush outcome BEFORE the per-invoice "OK" line: an ack on a
+            // write nothing could `fsync` is the "filed at NAV, absent
+            // locally" loss this item exists to close.
+            db.durable_ack().map_err(|e| {
                 DrainPerInvoiceError::Application(format!(
-                    "re-open audit ledger after drain TX2 Response commit for invoice {}: {e}",
+                    "D3 durable ack for drain TX2 Response write on invoice {} \
+                     (ADR-0110 R1): {e}",
                     invoice.invoice_id
                 ))
             })?;
-            let verified = ledger.verify_chain().map_err(|e| {
-                DrainPerInvoiceError::Application(format!(
-                    "audit-ledger chain verification failed AFTER drain TX2 Response commit for invoice {}: {e:#}",
-                    invoice.invoice_id
-                ))
-            })?;
-            let mirror_path = audit_ledger::mirror_path_for(db_path);
-            ledger.sync_mirror(&mirror_path).map_err(|e| {
-                DrainPerInvoiceError::Application(format!(
-                    "sync audit-ledger mirror after drain TX2 Response commit for invoice {}: {e}",
-                    invoice.invoice_id
-                ))
-            })?;
+            let verified = {
+                let conn = db.read().map_err(|e| {
+                    DrainPerInvoiceError::Application(format!(
+                        "shared read for drain TX2 Response chain verify on invoice {}: {e}",
+                        invoice.invoice_id
+                    ))
+                })?;
+                let ledger = Ledger::from_connection(conn, tenant, binary_hash_bytes);
+                ledger.verify_chain().map_err(|e| {
+                    DrainPerInvoiceError::Application(format!(
+                        "audit-ledger chain verification failed AFTER drain TX2 Response commit for invoice {}: {e:#}",
+                        invoice.invoice_id
+                    ))
+                })?
+            };
             tracing::info!(
                 invoice_id = %invoice.invoice_id,
                 transaction_id = %send_outcome.transaction_id,
@@ -499,39 +509,53 @@ fn drive_one_invoice(
             let (error_class, error_code) = submission_queue::classify_attempt_failure(&wire_err);
             let error_message = format!("{wire_err}");
             let response_xml: Option<Vec<u8>> = None;
-            write_attempt_failed_audit(
-                &mut conn,
-                ledger_meta,
-                actor,
-                &invoice.invoice_id,
-                invoice.idempotency_key,
-                endpoint_audit_label,
-                error_class,
-                error_code,
-                error_message.clone(),
-                response_xml,
-            )
-            .map_err(|e| DrainPerInvoiceError::Application(format!("{e:#}")))?;
-            drop(conn);
-            let ledger = Ledger::open(db_path, tenant, binary_hash_bytes).map_err(|e| {
+            {
+                let mut conn = db.write().map_err(|e| {
+                    DrainPerInvoiceError::Application(format!(
+                        "shared writer for drain TX2 AttemptFailed audit-write \
+                         (ADR-0098 Gap 1a C2): {e}"
+                    ))
+                })?;
+                write_attempt_failed_audit(
+                    &mut conn,
+                    ledger_meta,
+                    actor,
+                    &invoice.invoice_id,
+                    invoice.idempotency_key,
+                    endpoint_audit_label,
+                    error_class,
+                    error_code,
+                    error_message.clone(),
+                    response_xml,
+                )
+                .map_err(|e| DrainPerInvoiceError::Application(format!("{e:#}")))?;
+                // WriteGuard drop -> D3 fsync_data_paths, THEN lockstep sync_mirror.
+            }
+            // D-22 / ADR-0110 D3 — the AttemptFailed row is what keeps this
+            // invoice reachable by a later retry; losing it strands it. Claim
+            // the flush outcome even on this failure arm.
+            db.durable_ack().map_err(|e| {
                 DrainPerInvoiceError::Application(format!(
-                    "re-open audit ledger after drain TX2 AttemptFailed commit for invoice {}: {e}",
+                    "D3 durable ack for drain TX2 AttemptFailed write on invoice {} \
+                     (ADR-0110 R1): {e}",
                     invoice.invoice_id
                 ))
             })?;
-            let _ = ledger.verify_chain().map_err(|e| {
-                DrainPerInvoiceError::Application(format!(
-                    "audit-ledger chain verification failed AFTER drain TX2 AttemptFailed commit for invoice {}: {e:#}",
-                    invoice.invoice_id
-                ))
-            })?;
-            let mirror_path = audit_ledger::mirror_path_for(db_path);
-            ledger.sync_mirror(&mirror_path).map_err(|e| {
-                DrainPerInvoiceError::Application(format!(
-                    "sync audit-ledger mirror after drain TX2 AttemptFailed commit for invoice {}: {e}",
-                    invoice.invoice_id
-                ))
-            })?;
+            {
+                let conn = db.read().map_err(|e| {
+                    DrainPerInvoiceError::Application(format!(
+                        "shared read for drain TX2 AttemptFailed chain verify on invoice {}: {e}",
+                        invoice.invoice_id
+                    ))
+                })?;
+                let ledger = Ledger::from_connection(conn, tenant, binary_hash_bytes);
+                let _ = ledger.verify_chain().map_err(|e| {
+                    DrainPerInvoiceError::Application(format!(
+                        "audit-ledger chain verification failed AFTER drain TX2 AttemptFailed commit for invoice {}: {e:#}",
+                        invoice.invoice_id
+                    ))
+                })?;
+            }
             // Now classify the wire error into the drain's loop fork
             // (transport → break, application → continue). The audit
             // entry has been written either way per ADR-0032 §1.
