@@ -1659,6 +1659,9 @@ was also — silently — deciding REFUSAL.
   report cannot move. That is the one shape of this defect class round 7
   leaves open, and closing it means a second belt keyed on stale-calibration
   measurements, not a change to `build_report_lines`.
+- **The waiver has no SPA affordance.** The route is live; the Quality
+  module's NCR detail panel has no control for it. An operator blocked by the
+  widened gate needs the route, or the NCR closed, until the panel gains one.
 - **A waiver does not check that its `work_order_id` exists** — it is matched
   exactly against the dispatch's WO at gate time, so a waiver naming a WO
   that never existed is simply inert. Cheap to add, no defect behind it.

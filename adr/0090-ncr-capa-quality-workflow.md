@@ -93,5 +93,11 @@ One new kind: `ncr.shipment_waiver_granted`, tenth member of the `ncr.*` family.
 
 - **This refuses more than it used to.** A shop that shipped while an NCR sat in `UnderInvestigation` now needs either the close or the signature. That is the point, and it is the conservative direction.
 - **Still no RBAC.** "Named manager" is the authenticated operator login, exactly as the CAPA approve/verify sign-off already is — there is no role system in PROD yet, so nothing here can enforce that the signer is *entitled* to sign. What it does enforce is that a **person** signed, that they said **why**, and that both are in the hash chain. Flagged, not closed.
+- **No SPA affordance yet.** The waiver is an API route only; the Quality
+  module's NCR detail panel has no "sign off for shipment" control. An
+  operator blocked by the widened gate therefore needs the route (or the NCR
+  closed) until the panel gains a button. Flagged deliberately rather than
+  bundled — a management sign-off is a UI surface that wants its own
+  confirmation copy, not a fourth transition button squeezed into this change.
 - **The escalation timer keeps its job** — it still raises the alarm and still fires `ncr.escalated`. It simply no longer decides anything about shipping.
 - **The `qcr` report annotation is deliberately NOT waived.** `open_ncr_against` still drives the `accept_with_ncr` disposition from the un-waived NCR set: a waiver releases a *shipment*, it does not make the nonconformity stop existing, and the certificate should keep saying so.

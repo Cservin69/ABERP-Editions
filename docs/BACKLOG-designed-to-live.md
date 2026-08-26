@@ -1157,12 +1157,18 @@ this list had recorded separately.
     measurements against the WO, not a change to `build_report_lines`.
     *Size:* medium; it is a new gate arm, and it needs a policy answer on
     what a stale probe should do to an already-issued document.
-20. **Nothing stops an operator signing off their own NCR.** The shipment
+20. **The shipment waiver has no SPA affordance.** `POST
+    /api/ncrs/:id/shipment-waiver` is live, but the Quality module's NCR
+    detail panel has no control for it, so an operator blocked by the widened
+    gate needs the route or a closed NCR. A management sign-off wants its own
+    confirmation copy, not a fourth transition button.
+    *Size:* small, but it is a UX writing job as much as a code one.
+21. **Nothing stops an operator signing off their own NCR.** The shipment
     waiver has no separation-of-duties check. Adding one would wedge a
     one-person shop, which the Defense pilot is. The ledger records who
     signed; who is *allowed* to sign is item 17's RBAC question.
     *Size:* falls out of item 17.
-21. **The per-serial report arm stays linkage-scoped.** Round 7's B-2 fix
+22. **The per-serial report arm stays linkage-scoped.** Round 7's B-2 fix
     makes the LOT line's negative direction linkage-blind: any newer failing
     or `CalibrationStale` measurement of the characteristic condemns it. The
     per-serial lines are deliberately untouched — a newer failure linked to a
