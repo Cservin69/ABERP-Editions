@@ -412,7 +412,8 @@ fn recency_key(i: &QcInspection) -> (Option<OffsetDateTime>, &str) {
     (measured_at_instant(i), i.qci_id.as_str())
 }
 
-/// **The lot line's negative direction is linkage-blind** (round 7, B-2).
+/// **A line's negative direction is linkage-blind** (round 7, B-2; widened
+/// off the lot branch onto the per-serial branch in round 8, B-1).
 ///
 /// [`Evidence::LotOnly`] is the right rule for SATISFACTION — a per-unit
 /// measurement is not a fact about the lot, so it must not account for the
@@ -433,42 +434,72 @@ fn recency_key(i: &QcInspection) -> (Option<OffsetDateTime>, &str) {
 /// So: keep `LotOnly` for what ACCOUNTS for the line, and let ANY
 /// measurement of the characteristic — unit-linked or not — CONDEMN it.
 ///
+/// **`admits` scopes what may CONDEMN, separately from what may satisfy**
+/// (round 8, B-1). The two branches of [`build_report_lines`] need
+/// different answers, and round 7 only ever gave one:
+///
+/// - The lot line passes `|_| true`. Linkage is irrelevant to a fact about
+///   the whole lot, so any measurement of the characteristic condemns it.
+/// - A per-serial line passes `|l| l.is_none() || l == Some(uid)`. A
+///   LOT-recorded measurement (`linked_part_uid = None`) IS a fact about
+///   every unit, this one included, so it has to be able to condemn; a
+///   measurement linked to a NEIGHBOUR is not, so it must not — the
+///   no-cross-unit-leak rule survives intact.
+///
+/// The serial branch previously used a bare `Evidence::Unit(uid)` for both
+/// jobs, which admitted only measurements carrying that exact uid. A
+/// lot-recorded `CalibrationStale` check on a per-serial characteristic was
+/// therefore invisible to the report — and `CalibrationStale` raises no
+/// NCR, so the NCR belt never saw it either. An uncalibrated probe's
+/// reading passed a per-serial part end to end.
+///
 /// **Recency-scoped, and that is load-bearing.** The legitimate shop-floor
 /// sequence is measure → fail → NCR → rework → re-measure → pass, and a
-/// linkage-blind check that ignored time would refuse every lot line that
-/// ever had a failure behind it, forever. Only a measurement at or after
-/// the lot fact's own position in [`recency_key`] condemns.
+/// linkage-blind check that ignored time would refuse every line that ever
+/// had a failure behind it, forever. Only a measurement at or after the
+/// accounting fact's own [`measured_at_instant`] condemns.
 ///
-/// Ties (identical instant AND the adverse row sorting at-or-above the lot
-/// fact) resolve toward blocking: with a formatted timestamp shared to the
-/// sub-second, "which came last" is not knowable, and this is a shipment
-/// gate. Rework inside one recorded instant is not a real sequence; a
-/// same-instant contradiction is.
+/// **Ties break on the INSTANT ALONE, toward blocking** (round 8, B-3).
+/// [`recency_key`] carries `qci_id` as a second term so `latest_measurement`
+/// has a total order; comparing the WHOLE key here would hand a genuine
+/// instant tie to the ULID's random suffix, condemning or not on a coin
+/// flip. So the comparison against the accounting fact is on
+/// [`measured_at_instant`] only, and `>=` resolves the tie toward refusing:
+/// with a formatted timestamp shared to the sub-second, "which came last"
+/// is not knowable, and this is a shipment gate. Rework inside one recorded
+/// instant is not a real sequence; a same-instant contradiction is.
 ///
-/// When there is NO lot fact the line is `NotMeasured` either way, so this
-/// can only move it from "unaccounted" to "failed" — strictly the more
+/// (`recency_key` still picks WHICH adverse row is reported when several
+/// tie — that choice is a total order for determinism, and it cannot flip
+/// the direction: every row it chooses between is already adverse.)
+///
+/// When there is NO accounting fact the line is `NotMeasured` either way, so
+/// this can only move it from "unaccounted" to "failed" — strictly the more
 /// refusing direction, never the other.
 ///
 /// An UNPARSEABLE `measured_at_utc` sorts below every parsed instant
 /// (`Option`'s own ordering), so an adverse row carrying one does not
-/// override a lot fact that parses. That arm never decides anything in
+/// override an accounting fact that parses. That arm never decides anything in
 /// practice: [`freeze_report`] refuses the whole freeze when any supplied
 /// measurement carries a timestamp it cannot read, rather than silently
 /// demoting it — the same posture [`latest_measurement`] documents.
 fn adverse_override<'a>(
     inspections: &'a [QcInspection],
     plan_id: &str,
-    lot_fact: Option<&QcInspection>,
+    accounted: Option<&QcInspection>,
+    admits: impl Fn(Option<&str>) -> bool,
 ) -> Option<&'a QcInspection> {
     let worst = inspections
         .iter()
         .filter(|i| i.inspection_plan_id == plan_id)
+        .filter(|i| admits(i.linked_part_uid.as_deref()))
         .filter(|i| i.verdict.is_failing() || i.verdict == Verdict::CalibrationStale)
         .max_by(|a, b| recency_key(a).cmp(&recency_key(b)))?;
-    match lot_fact {
-        // `>=`, not `>`: see the tie note above. When the lot fact IS the
-        // adverse row this returns it unchanged — the override is idempotent.
-        Some(lot) => (recency_key(worst) >= recency_key(lot)).then_some(worst),
+    match accounted {
+        // The INSTANT only, and `>=` not `>`: see the tie note above. When
+        // the accounting fact IS the adverse row this returns it unchanged
+        // — the override is idempotent.
+        Some(fact) => (measured_at_instant(worst) >= measured_at_instant(fact)).then_some(worst),
         None => Some(worst),
     }
 }
@@ -593,11 +624,17 @@ pub fn build_report_lines(
     for unit in units {
         for plan in &serial_plans {
             line_no += 1;
-            let m = latest_measurement(
-                inspections,
-                &plan.plan_id,
-                Evidence::Unit(unit.part_uid.as_str()),
-            );
+            let uid = unit.part_uid.as_str();
+            let m = latest_measurement(inspections, &plan.plan_id, Evidence::Unit(uid));
+            // …and the negative direction is WIDER than the positive one: a
+            // LOT-recorded check is a fact about this unit too, so it may
+            // condemn this line even though it cannot satisfy it. Still
+            // unit-scoped, so a neighbour's failure does not bleed across
+            // (round 8, B-1 — see [`adverse_override`]).
+            let m = adverse_override(inspections, &plan.plan_id, m, |l: Option<&str>| {
+                l.is_none() || l == Some(uid)
+            })
+            .or(m);
             lines.push(line_from(line_no, plan, Some(unit), m));
         }
     }
@@ -610,7 +647,7 @@ pub fn build_report_lines(
         // …but only for SATISFACTION. A newer failing or calibration-stale
         // measurement condemns the line whatever it is linked to (round 7,
         // B-2 — see [`adverse_override`]).
-        let m = adverse_override(inspections, &plan.plan_id, m).or(m);
+        let m = adverse_override(inspections, &plan.plan_id, m, |_: Option<&str>| true).or(m);
         lines.push(line_from(line_no, plan, None, m));
     }
     lines
@@ -2373,6 +2410,188 @@ mod tests {
             compute_disposition(summarise(&lines), false),
             Disposition::Reject
         );
+    }
+
+    // ── Round 8, B-1 — the same hole on the PER-SERIAL branch ────────
+
+    /// **THE round-8 blocker (B-1): a stale-calibration reading passed a
+    /// per-serial part.**
+    ///
+    /// Round 7 widened the negative direction on the LOT branch only; the
+    /// serial branch kept a bare `Evidence::Unit(uid)` for both jobs, which
+    /// admits only measurements carrying that exact uid. So a check recorded
+    /// with no serial selected (`linked_part_uid = None`) — the shape the
+    /// manual route produces when the operator leaves the unit picker empty
+    /// — was invisible to every per-serial line. `CalibrationStale` raises
+    /// no NCR by design, so the NCR belt could not catch it either, and an
+    /// uncalibrated probe's reading shipped.
+    ///
+    /// A lot-recorded fact is a fact about EVERY unit, so it condemns every
+    /// per-serial line of that characteristic.
+    #[test]
+    fn a_lot_recorded_stale_calibration_check_condemns_every_per_serial_line() {
+        let plans = vec![plan("p1", "Bore D", Some("1"), Some(true))];
+        let units = vec![unit("SN-001", "uid1"), unit("SN-002", "uid2")];
+        let mut inspections = vec![
+            measurement(
+                "q1",
+                "p1",
+                Some("uid1"),
+                25.0,
+                Verdict::Pass,
+                "2026-08-02T10:00:00Z",
+            ),
+            measurement(
+                "q2",
+                "p1",
+                Some("uid2"),
+                25.0,
+                Verdict::Pass,
+                "2026-08-02T10:00:00Z",
+            ),
+        ];
+
+        // Both units measured in tolerance on a calibrated probe: accepted.
+        // The positive control — the block below must come from the stale
+        // check, not from the fix refusing everything.
+        let lines = build_report_lines(&plans, &inspections, &units);
+        assert_eq!(
+            compute_disposition(summarise(&lines), false),
+            Disposition::Accept
+        );
+
+        // …then a LATER check on the same characteristic with no serial
+        // selected, on a probe calibrated a year ago.
+        inspections.push(measurement(
+            "q3",
+            "p1",
+            None,
+            25.0,
+            Verdict::CalibrationStale,
+            "2026-08-02T10:05:00Z",
+        ));
+        let lines = build_report_lines(&plans, &inspections, &units);
+        assert_eq!(lines.len(), 2, "still ONE line per unit");
+        assert_eq!(lines[0].verdict, Some(Verdict::CalibrationStale));
+        assert_eq!(lines[1].verdict, Some(Verdict::CalibrationStale));
+        let counts = summarise(&lines);
+        assert_eq!(counts.calibration_stale, 2);
+        let d = compute_disposition(counts, false);
+        assert_eq!(d, Disposition::Incomplete);
+        assert!(
+            !d.permits_shipment(),
+            "an uncalibrated probe's reading is not evidence of conformity — \
+             on a per-serial characteristic either"
+        );
+    }
+
+    /// The widened admission is still UNIT-SCOPED. `|l| l.is_none() || l ==
+    /// Some(uid)` lets a lot-recorded fact through and nothing else, so a
+    /// NEIGHBOUR's `Critical` cannot condemn this unit's line — the
+    /// no-cross-unit-leak rule is intact in the negative direction too.
+    /// Without this the fix would trade one wrong document for another:
+    /// every part in a batch condemned by one bad sibling.
+    #[test]
+    fn a_neighbours_failure_does_not_condemn_this_units_line() {
+        let plans = vec![plan("p1", "Bore D", Some("1"), Some(true))];
+        let units = vec![unit("SN-001", "uid1"), unit("SN-002", "uid2")];
+        let inspections = vec![
+            measurement(
+                "q1",
+                "p1",
+                Some("uid1"),
+                25.0,
+                Verdict::Pass,
+                "2026-08-02T10:00:00Z",
+            ),
+            measurement(
+                "q2",
+                "p1",
+                Some("uid2"),
+                99.0,
+                Verdict::Critical,
+                "2026-08-02T10:05:00Z",
+            ),
+        ];
+        let lines = build_report_lines(&plans, &inspections, &units);
+        assert_eq!(
+            lines[0].verdict,
+            Some(Verdict::Pass),
+            "SN-001 measured clean; SN-002's later failure is not its fact"
+        );
+        assert_eq!(lines[1].verdict, Some(Verdict::Critical));
+    }
+
+    /// Recency is load-bearing on the serial branch in the OTHER direction
+    /// too: an OLDER lot-recorded failure superseded by a NEWER per-unit
+    /// pass (measure → fail → NCR → rework → re-measure) must accept, or
+    /// one bad first-article check would condemn the characteristic forever.
+    #[test]
+    fn an_older_lot_recorded_failure_superseded_by_a_newer_unit_pass_still_accepts() {
+        let plans = vec![plan("p1", "Bore D", Some("1"), Some(true))];
+        let units = vec![unit("SN-001", "uid1")];
+        let inspections = vec![
+            measurement(
+                "q1",
+                "p1",
+                None,
+                99.0,
+                Verdict::Critical,
+                "2026-08-02T10:00:00Z",
+            ),
+            measurement(
+                "q2",
+                "p1",
+                Some("uid1"),
+                25.0,
+                Verdict::Pass,
+                "2026-08-02T10:05:00Z",
+            ),
+        ];
+        let lines = build_report_lines(&plans, &inspections, &units);
+        assert_eq!(lines[0].verdict, Some(Verdict::Pass));
+        assert_eq!(
+            compute_disposition(summarise(&lines), false),
+            Disposition::Accept
+        );
+    }
+
+    /// **Round 8, B-3 — a genuine instant tie must not be decided by a ULID
+    /// random suffix.**
+    ///
+    /// [`adverse_override`] compared the whole [`recency_key`] — `(instant,
+    /// qci_id)` — against the accounting fact, so when the two measurements
+    /// carry the SAME `measured_at_utc` the outcome fell out of the ULID's
+    /// random tail: `>=` held or did not depending on which id happened to
+    /// sort higher. Swap the two ids and nothing else, and the verdict has
+    /// to stay `Reject` both ways.
+    ///
+    /// Not reachable through today's manual route (nanosecond stamps), but
+    /// it arms the moment an ingestion source stamps a coarser clock.
+    #[test]
+    fn a_same_instant_contradiction_blocks_whichever_way_the_ids_fall() {
+        const TIE: &str = "2026-08-02T10:00:00Z";
+        let plans = vec![lot_plan("p1", "Heat treat")];
+        let units = vec![unit("SN-001", "uid1")];
+
+        for (pass_id, fail_id) in [("a", "b"), ("b", "a")] {
+            let inspections = vec![
+                measurement(pass_id, "p1", None, 25.0, Verdict::Pass, TIE),
+                measurement(fail_id, "p1", Some("uid1"), 99.0, Verdict::Critical, TIE),
+            ];
+            let lines = build_report_lines(&plans, &inspections, &units);
+            assert_eq!(
+                lines[0].verdict,
+                Some(Verdict::Critical),
+                "pass={pass_id} fail={fail_id}: a same-instant contradiction \
+                 resolves toward blocking, not toward whichever ULID sorts higher"
+            );
+            assert_eq!(
+                compute_disposition(summarise(&lines), false),
+                Disposition::Reject,
+                "pass={pass_id} fail={fail_id}"
+            );
+        }
     }
 
     /// **THE round-6 blocker, at the layer it lives on.**

@@ -1414,6 +1414,11 @@ pub fn validate_waiver_reason(s: &str) -> std::result::Result<(), &'static str> 
 ///   manufacture the appearance of a deliberated release.
 /// - **Append-only.** There is no revoke: an over-broad waiver is corrected by
 ///   the NCR it names, not by editing history.
+/// - **Ledger BEFORE row** (round 8, B-2), the reverse of every sibling writer
+///   in this module. This is the only function here that RELEASES something,
+///   and the design's claim is that the ledger entry IS the accountability. A
+///   failed append must therefore leave zero waiver rows and a still-blocking
+///   gate — not a release nobody can see.
 #[allow(clippy::too_many_arguments)]
 pub fn grant_ncr_shipment_waiver(
     db_path: &std::path::Path,
@@ -1466,6 +1471,41 @@ pub fn grant_ncr_shipment_waiver(
             approved_at_utc: now_rfc3339(),
             ncr_state_at_waiver: ncr.state.as_db_str().to_string(),
         };
+        // LEDGER FIRST — deliberately the opposite order to the seven
+        // sibling writers in this module (round 8, B-2, which called them nine;
+        // `create_ncr`, `transition_ncr`, `escalate_overdue_ncrs`,
+        // `create_capa`, `approve_capa`, `review_capa_effectiveness`,
+        // `close_capa`). Those record something that already
+        // happened, so a row that lands without its entry is a reporting gap.
+        // THIS one is the only RELEASE writer in the module: the waiver row
+        // is what stops `open_ncr_ids_blocking_wo` counting the NCR, and the
+        // design's own claim is that "the ledger entry IS the
+        // accountability". Row-first made that claim false — the two writes
+        // are separate transactions on separate connections, so an append
+        // that failed left the release standing with zero ledger entries and
+        // only a 500 for the caller to notice it by.
+        //
+        // Appending first inverts the residue: a failed INSERT leaves an
+        // entry recording a sign-off that released nothing, and the gate goes
+        // on blocking. An over-recorded intention is auditable; an
+        // unaudited release is not.
+        append_event(
+            db,
+            tenant.clone(),
+            binary_hash,
+            operator,
+            EventKind::NcrShipmentWaiverGranted,
+            serde_json::json!({
+                "waiver_id": waiver.waiver_id,
+                "ncr_id": waiver.ncr_id,
+                "work_order_id": waiver.work_order_id,
+                "ncr_state_at_waiver": waiver.ncr_state_at_waiver,
+                "reason": waiver.reason,
+                "approved_by_operator": waiver.approved_by_operator,
+                "approved_at_utc": waiver.approved_at_utc,
+                "operator_user_id": operator,
+            }),
+        )?;
         conn.execute(
             "INSERT INTO ncr_shipment_waivers (waiver_id, tenant_id, ncr_id, work_order_id, \
              approved_by_operator, reason, approved_at_utc, ncr_state_at_waiver) \
@@ -1485,23 +1525,6 @@ pub fn grant_ncr_shipment_waiver(
         waiver
     };
 
-    append_event(
-        db,
-        tenant,
-        binary_hash,
-        operator,
-        EventKind::NcrShipmentWaiverGranted,
-        serde_json::json!({
-            "waiver_id": waiver.waiver_id,
-            "ncr_id": waiver.ncr_id,
-            "work_order_id": waiver.work_order_id,
-            "ncr_state_at_waiver": waiver.ncr_state_at_waiver,
-            "reason": waiver.reason,
-            "approved_by_operator": waiver.approved_by_operator,
-            "approved_at_utc": waiver.approved_at_utc,
-            "operator_user_id": operator,
-        }),
-    )?;
     Ok(waiver)
 }
 
@@ -2425,6 +2448,75 @@ mod tests {
             .unwrap_err();
             assert!(matches!(err, QualityError::Invalid(_)), "wo={wo:?}");
         }
+        assert_eq!(count_kind(&handle, "ncr.shipment_waiver_granted"), 0);
+    }
+
+    /// **Round 8, B-2 — a waiver that cannot be audited releases nothing.**
+    ///
+    /// The waiver row and its ledger entry are two transactions on two
+    /// connections, so one of them can land alone. Row-first, an append that
+    /// failed left the release STANDING — the gate stopped listing the NCR,
+    /// the chain held zero entries naming who signed, and the caller's only
+    /// signal was a 500. That falsifies the kind's own contract ("this entry
+    /// IS the accountability").
+    ///
+    /// Inject an append failure by breaking the chain head so `read_head`
+    /// cannot decode it (no test-only seam needed — any append failure has
+    /// the same shape), and assert the residue is the safe one.
+    #[test]
+    fn a_waiver_whose_ledger_append_fails_releases_nothing() {
+        let (db, handle, tenant, hash) = temp_db();
+        let ncr = create_ncr(
+            &db,
+            &handle,
+            tenant.clone(),
+            hash,
+            "op",
+            sample_new_ncr(NcrSeverity::Critical, &["dp-A"]),
+        )
+        .unwrap();
+
+        // The injection: the head row's id stops being a prefixed ULID, so
+        // `row_to_entry` fails and every subsequent append fails with it.
+        {
+            let guard = handle.write().unwrap();
+            guard
+                .execute(
+                    "UPDATE audit_ledger SET id = 'not-an-entry-id'                      WHERE seq = (SELECT MAX(seq) FROM audit_ledger)",
+                    params![],
+                )
+                .unwrap();
+        }
+
+        let err = grant_ncr_shipment_waiver(
+            &db,
+            &handle,
+            tenant.clone(),
+            hash,
+            "erzsi.quality.manager",
+            &ncr.ncr_id,
+            "wo-1",
+            "MRB 2026-08-26: customer accepted the deviation in writing",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, QualityError::Other(_)),
+            "the append failure must surface, got {err:?}"
+        );
+
+        let conn = Connection::open(&db).unwrap();
+        let waivers = list_ncr_shipment_waivers(&conn, tenant.as_str()).unwrap();
+        assert!(
+            waivers.is_empty(),
+            "a waiver nobody can audit must not exist"
+        );
+        let ncrs = list_ncrs(&conn, tenant.as_str(), &NcrFilter::default()).unwrap();
+        assert_eq!(
+            open_ncr_ids_blocking_wo(&ncrs, &waivers, "wo-1", &["dp-A".to_string()]),
+            vec![ncr.ncr_id],
+            "the shipment stays blocked — an unaudited release is the one \
+             outcome this ordering exists to make impossible"
+        );
         assert_eq!(count_kind(&handle, "ncr.shipment_waiver_granted"), 0);
     }
 }

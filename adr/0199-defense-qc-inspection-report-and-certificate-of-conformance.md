@@ -30,9 +30,11 @@
 >   `export_invoice_bundle.rs`. Do not trust either branch's number.
 >   **Round 7 then adds a seventh kind deliberately**
 >   (`ncr.shipment_waiver_granted`, ADR-0090's audited management sign-off),
->   so the current pin is **196** at all three sites. The "stays 195" notes
->   in the round-4/5/6 sections below are statements about *those* rounds,
->   not the current number.
+>   so the current pin is **196** at all three sites. **Round 8 adds no kind**
+>   — it reuses `ncr.shipment_waiver_granted` and only reorders when it is
+>   written — so 196 still holds. The "stays 195" notes in the round-4/5/6
+>   sections below are statements about *those* rounds, not the current
+>   number.
 > - **`serve.rs` does not actually collide.** The pricing-queue hunks are in
 >   the quote-pricing handler region (~line 23 900); this branch touches
 >   `build_router`'s tail, the shipment-gate block (~17 500) and a new
@@ -1628,12 +1630,13 @@ was also — silently — deciding REFUSAL.
 
 ### Round-7 residuals, stated
 
-- **The per-serial arm is deliberately untouched.** `Evidence::Unit` is
-  linkage-scoped on purpose: a newer failure linked to a DIFFERENT unit must
-  not condemn this unit's line. A newer LOT-level failure against a
-  per-serial characteristic likewise does not reach the unit lines; that is
-  a different join (one lot fact fanning out to N units) and was not the
-  reported defect. Filed, not closed.
+- ~~**The per-serial arm is deliberately untouched.**~~ **CLOSED by round 8
+  (B-1).** The half of this residual that was right — a failure linked to a
+  DIFFERENT unit must not condemn this unit's line — still holds. The half
+  that was wrong shipped a part: a LOT-recorded fact (`linked_part_uid =
+  None`) IS a fact about every unit, and leaving it out of the per-serial
+  arm's negative direction made a stale-calibration check invisible on both
+  belts. See "Round-8 behaviours pinned by mutation testing" below.
 - **"Named manager" is the authenticated login, not a role.** There is no
   RBAC in PROD, so nothing enforces that the signer is entitled to sign —
   the same limitation the CAPA approve/verify sign-off has always had. What
@@ -1665,6 +1668,98 @@ was also — silently — deciding REFUSAL.
 - **A waiver does not check that its `work_order_id` exists** — it is matched
   exactly against the dispatch's WO at gate time, so a waiver naming a WO
   that never existed is simply inert. Cheap to add, no defect behind it.
+
+### Round-8 behaviours pinned by mutation testing
+
+The round-7 adversarial returned **MERGE-AFTER-FIXES** on three findings. All
+three are closed; each mutation below was run and turns its own test red.
+
+- **(B-1) The certificate was wrong at creation: a stale-calibration reading
+  passed a per-serial part.** Round 7 gave the negative direction
+  (`adverse_override`) to the LOT arm of `build_report_lines` only. The
+  serial arm kept a bare `Evidence::Unit(uid)` for BOTH jobs, and that rule
+  admits only measurements carrying that exact uid. So a check recorded with
+  no serial selected — `linked_part_uid = None`, the shape the manual route
+  produces whenever the operator leaves the unit picker empty — was invisible
+  to every per-serial line. And `CalibrationStale` raises no NCR by design,
+  so the belt round 6 built never saw it either. Both belts blind; the CoC
+  said the parts conformed.
+
+  Closed by giving `adverse_override` an `admits: impl Fn(Option<&str>) ->
+  bool` and letting each arm answer for itself. The lot arm passes `|_|
+  true` (linkage is irrelevant to a fact about the lot — round 7 unchanged).
+  The serial arm passes `|l| l.is_none() || l == Some(uid)`: **linkage-blind
+  for lot facts, still unit-scoped for unit facts**, so the widened refusal
+  does not become a new defect where one bad sibling condemns a whole batch.
+
+  Pinned at both layers and both directions. Unit: a lot-recorded
+  `CalibrationStale` condemns EVERY per-serial line (`Incomplete`); a
+  neighbour's `Critical` condemns nothing; an older lot-recorded failure
+  superseded by a newer per-unit pass still `Accept`s. End-to-end
+  (`qc_report_gate`): two marked units, one required `Dimensional` plan, both
+  measured in tolerance on a calibrated probe → the gate PASSES; then one
+  later check with no serial selected on a probe calibrated a year ago →
+  `Incomplete` / `Blocked`. Narrowing `admits` back to `l == Some(uid)` reds
+  the first; widening it to `|_| true` reds the second; dropping the recency
+  term reds the third.
+
+- **(B-2) The waiver released before it was accountable.**
+  `grant_ncr_shipment_waiver` committed the `ncr_shipment_waivers` row on its
+  residual connection and THEN appended `ncr.shipment_waiver_granted` on the
+  shared Handle — two transactions, two connections, so one can land alone.
+  Inject an append failure and the row stood, the gate stopped listing the
+  NCR, the chain held zero entries naming who signed, and the caller's only
+  signal was a 500. That falsifies the kind's own contract: *this entry IS
+  the accountability*.
+
+  Closed by moving the append ABOVE the `INSERT`, inside the same block —
+  deliberately the reverse of the seven sibling writers in `quality.rs`. Those
+  record
+  something that already happened, so row-first is right for them and a
+  missing entry is a reporting gap. This is the module's only RELEASE
+  writer, so the residue has to be inverted: a failed append now leaves
+  `waiver rows = 0` and the gate still `blocking=[ncr_…]`. An
+  over-recorded intention is auditable; an unaudited release is not.
+
+  Pinned by injecting an append failure (the chain head's id stops being a
+  prefixed ULID, so `read_head` cannot decode it — no test-only seam needed)
+  and asserting all three: no waiver row, no ledger entry, NCR still
+  blocking. Swapping the two writes back reds it.
+
+- **(B-3) A genuine instant tie was decided by a ULID random suffix.**
+  `adverse_override` compared the whole `recency_key` — `(instant, qci_id)` —
+  against the accounting fact, so with equal `measured_at_utc` the `>=` held
+  or did not depending on which ULID sorted higher. Round 7's own mutation
+  M7 SURVIVED on exactly this. Not reachable through today's manual route
+  (nanosecond stamps), but it arms the moment an ingestion source stamps a
+  coarser clock. Closed by comparing `measured_at_instant` alone, resolving
+  the tie toward blocking — the same reach for a monotonic term that
+  `report_recency_key` makes for `report_number`. `recency_key` still picks
+  WHICH adverse row is reported; that choice cannot flip the direction,
+  because every row it chooses between is already adverse. Pinned by swapping
+  the two ids on a genuine tie: `Reject` either way.
+
+Also corrected: `NcrShipmentWaiverGranted`'s payload doc listed a `severity`
+field the writer has never emitted.
+
+### Round-8 residuals, stated
+
+- **Self-approval (SoD) stays open**, unchanged from round 7 and
+  architecturally unavailable until RBAC exists. The ledger records who
+  signed; who is ENTITLED to sign is the RBAC question. What round 7 did
+  close is the one automatic release: no timer can reach this function.
+- **Post-issuance `CalibrationStale` stays open**, post-freeze by design. An
+  issued report is immutable; B-1 is a pre-freeze fix and cannot move one.
+  `aberp_qa::list_recent_stale_calibration` already returns the rows a second
+  belt would key on, so the work is wiring, not discovery — it is a belt, not
+  a `build_report_lines` change, and it is filed as such.
+- **The degraded no-marked-units arm is untouched.** With zero marks every
+  characteristic collapses to one `AnyOfCharacteristic` line, where the
+  latest measurement of any linkage already wins; the same-instant tie B-3
+  describes exists there too but is decided by `latest_measurement`'s total
+  order, not by `adverse_override`. Scope-limited deliberately: the gate's
+  `UnitDrift` arm already refuses a shipment whose marks are not the marks
+  the report froze over.
 
 ---
 

@@ -2939,10 +2939,21 @@ pub enum EventKind {
     /// NCR releases no other NCR, and a waiver for one WO releases no other
     /// WO's shipment.
     ///
+    /// **Appended BEFORE the waiver row is inserted** (round 8, B-2). The two
+    /// writes are separate transactions on separate connections, so one of
+    /// them has to be able to land alone. Row-first meant a failed append left
+    /// the release standing with nothing in the chain — an unaudited release,
+    /// which is exactly what this kind exists to make impossible. Ledger-first
+    /// inverts the residue to an entry recording a sign-off that released
+    /// nothing, with the gate still blocking.
+    ///
     /// Payload (`serde_json::Value`): `waiver_id`, `ncr_id`, `work_order_id`,
-    /// `ncr_state_at_waiver`, `severity`, `reason`, `approved_by_operator`,
-    /// `approved_at_utc`, `operator_user_id`. `ncr.*` family — app-layer JSON,
-    /// never NAV XML bytes.
+    /// `ncr_state_at_waiver`, `reason`, `approved_by_operator`,
+    /// `approved_at_utc`, `operator_user_id`. (No `severity` — the round-7
+    /// doc listed one, but the writer has never emitted it; the NCR's
+    /// severity is on the NCR, and `ncr_state_at_waiver` is what the waiver
+    /// itself needs to pin.) `ncr.*` family — app-layer JSON, never NAV XML
+    /// bytes.
     NcrShipmentWaiverGranted,
 
     /// S439 (ADR-0090) — a Corrective And Preventive Action was created for a

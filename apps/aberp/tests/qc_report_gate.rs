@@ -335,6 +335,51 @@ fn measure_lot_level(conn: &mut Connection, plan_id: &str, actual: f64) {
     tx.commit().unwrap();
 }
 
+/// A measurement on a NAMED probe with an explicit calibration date, at an
+/// explicit instant, optionally attributed to a unit.
+///
+/// `part_uid = None` is the shape the manual route produces when the
+/// operator records a check without selecting a serial — a fact about the
+/// lot, and therefore about every unit in it. That is the round-8 B-1
+/// fixture: it must be able to CONDEMN a per-serial line even though it
+/// cannot satisfy one.
+fn measure_on_probe(
+    conn: &mut Connection,
+    plan_id: &str,
+    part_uid: Option<&str>,
+    actual: f64,
+    last_calibration_at: OffsetDateTime,
+    at: OffsetDateTime,
+) {
+    let m = meta();
+    let plan = aberp_qa::get_inspection_plan(conn, T, plan_id)
+        .unwrap()
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    record_inspection(
+        &tx,
+        &ctx(&m),
+        RecordInspectionInputs {
+            plan: &plan,
+            source: QcSource::Probe,
+            source_event_id: None,
+            actual_value: actual,
+            units: "mm".into(),
+            probe_serial: Some("RMP600-007".into()),
+            last_calibration_at: Some(last_calibration_at),
+            measured_at: at,
+            current_time: at,
+            stale_window_seconds: 86_400,
+            linked_part_uid: part_uid.map(str::to_string),
+            linked_heat_lot: Some("HL-9911".into()),
+            linked_wo_id: Some("wo-def".into()),
+            recorded_by: "ervin".into(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
 /// Freeze + issue a report for `wo-def`, returning `(qcr_id, disposition)`.
 fn issue_report_for(conn: &mut Connection, units: &[ReportUnit]) -> (String, Disposition) {
     issue_report_for_at(conn, units, now())
@@ -646,6 +691,88 @@ fn a_stale_calibration_measurement_blocks_the_shipment() {
             ..
         }
     ));
+}
+
+/// **THE round-8 blocker (B-1), end to end: a stale-calibration reading
+/// passed a PER-SERIAL part.**
+///
+/// Round 7 taught the LOT branch of `build_report_lines` that any
+/// measurement of a characteristic can condemn its line, whatever it is
+/// linked to. The per-serial branch kept a bare `Evidence::Unit(uid)`, which
+/// admits only measurements carrying that exact uid — so a check recorded
+/// with NO serial selected was invisible to every per-serial line. And
+/// `CalibrationStale` raises no NCR by design, so the NCR belt never saw it
+/// either. Both belts blind, and the CoC said the parts conformed.
+///
+/// The sibling above pins the same refusal when the stale reading IS linked
+/// to the unit; this one pins it when the operator left the unit picker
+/// empty — the shape that used to walk straight through.
+#[test]
+fn a_lot_recorded_stale_calibration_check_blocks_the_per_serial_shipment() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "2");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 2);
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+
+    // Both units measured IN TOLERANCE on a probe calibrated an hour before.
+    let t0 = now() - time::Duration::minutes(10);
+    let fresh = t0 - time::Duration::hours(1);
+    measure_on_probe(&mut conn, &p1, Some(&units[0].part_uid), 25.0, fresh, t0);
+    measure_on_probe(&mut conn, &p1, Some(&units[1].part_uid), 25.0, fresh, t0);
+
+    // The positive control: this fixture ships. The block below must be
+    // caused by the stale check, not by the gate simply always refusing.
+    let (_, d0) = issue_report_for_at(&mut conn, &units, t0);
+    assert_eq!(d0, Disposition::Accept);
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: two clean readings on a calibrated probe release the shipment"
+    );
+
+    // …then ONE later check on the same characteristic, no serial selected,
+    // on a probe last calibrated a year ago. The VALUE is in tolerance — the
+    // refusal has to come from the calibration, not from a bad reading.
+    let t1 = now();
+    measure_on_probe(
+        &mut conn,
+        &p1,
+        None,
+        25.0,
+        t1 - time::Duration::days(365),
+        t1,
+    );
+
+    let (qcr_id, d1) = issue_report_for_at(&mut conn, &units, t1);
+    assert_eq!(
+        d1,
+        Disposition::Incomplete,
+        "an uncalibrated probe's reading is not evidence of conformity, and a \
+         check taken without a serial is a fact about every unit in the lot"
+    );
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason,
+            qcr_id: id,
+            disposition,
+            ..
+        } => {
+            assert_eq!(reason, QcReportBlockReason::Incomplete);
+            assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
+            assert_eq!(disposition.as_deref(), Some("incomplete"));
+        }
+        other => panic!("expected Blocked(Incomplete), got {other:?}"),
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════
