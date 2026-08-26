@@ -1133,6 +1133,44 @@ this list had recorded separately.
     makes the replacement measurable on its own identity — but there is no
     operator-facing prompt saying so; today it is a 400 with a message.
     *Size:* small; it is a UX nudge on the plan form.
+17. **A shipment waiver names an authenticated LOGIN, not a role.**
+    ADR-0090's round-7 amendment makes an audited management sign-off the
+    only release for a non-`Closed` NCR, and the sign-off records the
+    `require_ready` operator login as the approver. There is no RBAC in
+    PROD, so nothing enforces that the signer is *entitled* to sign — the
+    same limitation the CAPA approve/verify sign-off has always had. What is
+    enforced is that a person signed, that they stated why, and that both
+    are in the hash chain.
+    *Size:* large — it is the role system, not a patch to this route.
+18. **A shipment waiver cannot be revoked.** `ncr_shipment_waivers` is
+    append-only; an over-broad waiver is corrected through the NCR it names.
+    A revoke needs a second EventKind and a precedence rule between the two,
+    and neither was asked for.
+    *Size:* small, but it wants a decision before it wants code.
+19. **A post-issuance `CalibrationStale` measurement still surfaces
+    nowhere.** Round 7's B-2 fix keeps a stale-calibration measurement out of
+    a report being FROZEN, and the NCR belt catches a post-issuance FAILURE
+    — but `CalibrationStale` raises no NCR by design (an untrusted probe must
+    not manufacture a false defect), and an issued report is immutable. So a
+    probe found out of calibration after the certificate was issued reaches
+    neither gate. Closing it means a second belt keyed on stale-calibration
+    measurements against the WO, not a change to `build_report_lines`.
+    *Size:* medium; it is a new gate arm, and it needs a policy answer on
+    what a stale probe should do to an already-issued document.
+20. **Nothing stops an operator signing off their own NCR.** The shipment
+    waiver has no separation-of-duties check. Adding one would wedge a
+    one-person shop, which the Defense pilot is. The ledger records who
+    signed; who is *allowed* to sign is item 17's RBAC question.
+    *Size:* falls out of item 17.
+21. **The per-serial report arm stays linkage-scoped.** Round 7's B-2 fix
+    makes the LOT line's negative direction linkage-blind: any newer failing
+    or `CalibrationStale` measurement of the characteristic condemns it. The
+    per-serial lines are deliberately untouched — a newer failure linked to a
+    DIFFERENT unit must not condemn this unit's line. The one shape left
+    open is a newer LOT-level failure against a per-serial characteristic
+    (one lot fact fanning out to N unit lines), which is a different join and
+    was not the reported defect.
+    *Size:* medium; it needs the fan-out rule decided first.
 
 ---
 

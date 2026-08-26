@@ -4686,6 +4686,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/ncrs/:id", get(handle_get_ncr))
         .route("/api/ncrs/:id/transition", post(handle_transition_ncr))
         .route("/api/ncrs/:id/capas", post(handle_create_capa))
+        // ADR-0090 round 7 (B-1) — the audited management sign-off. The only
+        // release path for a shipment blocked by a still-open NCR; scoped to
+        // one `(ncr_id, work_order_id)` pair and hash-chained with the actor
+        // and their stated reason.
+        .route(
+            "/api/ncrs/:id/shipment-waiver",
+            post(handle_grant_ncr_shipment_waiver),
+        )
         .route("/api/capas/:id/approve", post(handle_approve_capa))
         .route("/api/capas/:id/review", post(handle_review_capa))
         .route("/api/capas/:id/close", post(handle_close_capa))
@@ -17507,8 +17515,9 @@ fn enforce_part_uid_gate_for_shipment(
 pub enum OpenNcrGate {
     /// Shipment may proceed: not defense/aero, no WO part, or no open NCR.
     Pass,
-    /// Shipment refused: a defense/aerospace dispatch whose WO has a unit
-    /// referenced by an `Open`/`Contained` NCR.
+    /// Shipment refused: a defense/aerospace dispatch whose WO (or one of
+    /// its marked units) is referenced by an NCR that is not `Closed` and
+    /// carries no signed waiver for this WO (round 7, B-1).
     Blocked {
         work_order_id: String,
         customer_type: String,
@@ -17517,8 +17526,9 @@ pub enum OpenNcrGate {
 }
 
 /// Pure resolver mirroring [`resolve_part_uid_gate`]: a dispatch's customer
-/// (`partner_id`) → `customer_type`, and if defense/aerospace, refuse when any
-/// of the WO's marked part UIDs is referenced by an `Open`/`Contained` NCR.
+/// (`partner_id`) → `customer_type`, and if defense/aerospace, refuse when the
+/// WO or any of its marked part UIDs is referenced by an NCR that has not
+/// reached `Closed` and has no management sign-off for this WO.
 /// Read-only; no audit, no I/O beyond the supplied conn — unit-testable.
 pub fn resolve_open_ncr_gate(
     conn: &Connection,
@@ -17541,6 +17551,9 @@ pub fn resolve_open_ncr_gate(
             .map(|m| m.part_uid)
             .collect();
     let ncrs = crate::quality::list_ncrs(conn, tenant, &crate::quality::NcrFilter::default())?;
+    // Round 7, B-1 — the signed management sign-offs. The ONLY thing that
+    // releases a non-`Closed` NCR; a timer cannot mint one.
+    let waivers = crate::quality::list_ncr_shipment_waivers(conn, tenant)?;
     // Round 6, B-2 — block on the WORK ORDER as well as on its marked units.
     //
     // The `part_uids.is_empty()` early `Pass` that used to stand here is gone
@@ -17554,7 +17567,8 @@ pub fn resolve_open_ncr_gate(
     // auto-NCR spawned by a failing measurement that carried no `part_uid`
     // has `affected_part_uids: []`, so the unit join matched nothing while a
     // real Open NCR stood against the order.
-    let blocking = crate::quality::open_ncr_ids_blocking_wo(&ncrs, &dispatch.wo_id, &part_uids);
+    let blocking =
+        crate::quality::open_ncr_ids_blocking_wo(&ncrs, &waivers, &dispatch.wo_id, &part_uids);
     if blocking.is_empty() {
         Ok(OpenNcrGate::Pass)
     } else {
@@ -26979,6 +26993,60 @@ async fn handle_transition_ncr(
         Ok(Err(e)) => quality_error_response(e),
         Err(j) => internal_error(
             "transition_ncr:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GrantNcrShipmentWaiverBody {
+    work_order_id: String,
+    reason: String,
+}
+
+/// ADR-0090 round 7 (B-1) — record a management waiver releasing ONE NCR for
+/// ONE Work Order's shipment. `require_ready` supplies the operator login, and
+/// that login is what the `ncr.shipment_waiver_granted` ledger entry names as
+/// the approver: there is no way to sign this off as somebody else, and no way
+/// for a background task to reach the route at all.
+async fn handle_grant_ncr_shipment_waiver(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<GrantNcrShipmentWaiverBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<crate::quality::NcrShipmentWaiver, crate::quality::QualityError> {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
+            crate::quality::grant_ncr_shipment_waiver(
+                state_for_task.db_path.as_path(),
+                &state_for_task.db,
+                state_for_task.tenant.clone(),
+                binary_hash,
+                &operator,
+                &id,
+                &body.work_order_id,
+                &body.reason,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(w)) => (StatusCode::CREATED, Json(w)).into_response(),
+        Ok(Err(e)) => quality_error_response(e),
+        Err(j) => internal_error(
+            "grant_ncr_shipment_waiver:join",
             anyhow!("blocking task panicked: {j}"),
         ),
     }

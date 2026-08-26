@@ -24,10 +24,15 @@
 > - **`fix/pricing-queue-head-of-line` adds TWO event kinds**
 >   (`quote.pricing_cycle_outcome`, `quote.pricing_job_retried`) and pins
 >   `ALL_KINDS_COUNT == 189`. This branch adds six and pins `193`. **Merged
->   together the correct pin is 195**, in all three places that carry it:
+>   together the correct pin was 195**, in all three places that carry it:
 >   `event_kind.rs`'s `all_kinds_count_is_pinned`, the `const _` in
 >   `aberp-verify::verify.rs`, and the `const _` in
 >   `export_invoice_bundle.rs`. Do not trust either branch's number.
+>   **Round 7 then adds a seventh kind deliberately**
+>   (`ncr.shipment_waiver_granted`, ADR-0090's audited management sign-off),
+>   so the current pin is **196** at all three sites. The "stays 195" notes
+>   in the round-4/5/6 sections below are statements about *those* rounds,
+>   not the current number.
 > - **`serve.rs` does not actually collide.** The pricing-queue hunks are in
 >   the quote-pricing handler region (~line 23 900); this branch touches
 >   `build_router`'s tail, the shipment-gate block (~17 500) and a new
@@ -1518,7 +1523,8 @@ residuals the previous round had recorded separately.
   Defense path still refuses an unmarked WO at `resolve_part_uid_gate`, so
   removing the exit costs nothing there. **No new `EventKind` and no new gate
   reason** — the block reuses `OpenNcrGate::Blocked` and its existing
-  `ncr.wo_blocked_by_open_ncr` audit row; `ALL_KINDS_COUNT` stays **195**.
+  `ncr.wo_blocked_by_open_ncr` audit row; `ALL_KINDS_COUNT` stayed **195**
+  through round 6. (Round 7 adds one deliberate kind — see below.)
 
 - **A footgun fixed in passing.** `record_part_marks` guards `AlreadyMarked`
   on the `wo_id` PARAMETER but inserted `m.wo_id` from each mark. The route
@@ -1543,6 +1549,119 @@ residuals the previous round had recorded separately.
   override.** An operator who mis-sets it must archive and re-create. That
   is one more step than an edit, and it is the step that makes the new
   characteristic measurable on its own identity.
+
+### Round-7 behaviours pinned by mutation testing
+
+The round-6 adversarial returned **BLOCKED** on two ship-a-bad-part paths
+round 6's tests had only covered in the safe direction. Both are the same
+shape as every blocker before them: a rule that is correct for SATISFACTION
+was also — silently — deciding REFUSAL.
+
+- **(B-1) The NCR belt disarmed itself, and a 24h timer was what disarmed
+  it.** `NcrState::blocks_shipment()` was `Open | Contained`, so
+  `UnderInvestigation`, `CorrectionApplied` and `Escalated` all RELEASED the
+  shipment. `Escalated` is the live path: `escalate_overdue_ncrs`
+  (`serve.rs`, the boot scan) auto-moves a `Critical` NCR to `Escalated`
+  `CRITICAL_ESCALATION_HOURS` after discovery **with no human in the loop**.
+  A known, unresolved, Critical nonconformity therefore un-blocked its own
+  shipment by ageing — the alarm mechanism was also the silencer. Round 6's
+  belt (`open_ncr_ids_blocking_wo`) sat downstream of this predicate, so
+  widening the JOIN had bought nothing against it.
+
+  Closed to **Ervin's policy ruling**: `blocks_shipment` is now
+  `!matches!(self, NcrState::Closed)`, and the ONLY release for a still-open
+  NCR is an explicit audited management sign-off — a waiver / deviation / MRB
+  disposition naming an actor and a reason, written to the hash chain. There
+  was no existing management-disposition concept to reuse (the `deviation`
+  identifiers in this crate are measurement deviations), so ADR-0090 gains a
+  minimal one: the append-only `ncr_shipment_waivers` table,
+  `grant_ncr_shipment_waiver`, `POST /api/ncrs/:id/shipment-waiver`, and one
+  new EventKind **`ncr.shipment_waiver_granted`** — a deliberate
+  `ALL_KINDS_COUNT` **195 → 196**, reconciled at all three pins
+  (`event_kind.rs`'s `ALL_KINDS` + the independent round-trip hand-list,
+  `aberp-verify::verify.rs`, `export_invoice_bundle.rs`). See ADR-0090's
+  2026-08-26 amendment for the full rule.
+
+  Pinned, all mutation-verified: the timer's `Escalated` still blocks (and
+  mints no sign-off); a signed waiver releases AND lands in the ledger with
+  the approving actor and the stated reason; a waiver for `ncr_a` does not
+  release `ncr_b`, and a waiver naming `wo-1` does not release `wo-2`'s
+  shipment. Narrowing `blocks_shipment` back, dropping the waiver term, and
+  blinding either half of the `(ncr_id, wo_id)` match each turn tests red.
+
+- **(B-2) `Evidence::LotOnly` inverted recency: an older lot `Pass` outranked
+  a newer unit `Critical`.** Round 6's B-1 fix was right — a per-unit
+  measurement is not a fact about the lot, so it must not ACCOUNT for a
+  lot-level line. But `latest_measurement` applies the evidence filter
+  BEFORE `max_by`, so the same rule also hid every unit-linked measurement
+  from the lot line's **verdict**. Record a lot `Pass` at 10:00, then measure
+  SN-001 `Critical` on that characteristic at 10:05, and the line still read
+  `Measured / Pass`, `counts.failed == 0`, disposition `Accept` — frozen and
+  hash-pinned onto the CoC/FAIR. `CalibrationStale` is the quieter half:
+  it raises no NCR by design (an untrusted probe must not manufacture a false
+  defect), so the belt never sees it either — the report line was the only
+  place it could have surfaced.
+
+  Closed by splitting the two directions in `build_report_lines`' lot arm.
+  `Evidence::LotOnly` still decides what SATISFIES the line; the new
+  `adverse_override` decides what CONDEMNS it, and that half is
+  **linkage-blind and recency-scoped**: any measurement of the same
+  `plan_id` that is failing or `CalibrationStale` and sits at-or-after the
+  lot fact in `recency_key` (parsed instant, `qci_id` tiebreak — the same
+  order `latest_measurement` ranks by) becomes the line's measurement, so
+  the report reads `Reject` / `Incomplete` instead of clean `Measured/Pass`.
+
+  **The recency scope is load-bearing in both directions** and is pinned
+  both ways: without it, measure → fail → NCR → rework → re-measure-pass
+  would be refused forever, which is not conservatism but a report nobody
+  can complete. Dropping the recency term turns
+  `an_older_unit_failure_superseded_by_a_newer_lot_pass_still_accepts` red;
+  disabling the override turns the three condemnation tests red;
+  `a_process_characteristic_is_lot_level_and_needs_lot_evidence` (round 6's
+  own pin) stays green throughout.
+
+  Ties resolve toward blocking (`>=`, not `>`): with a formatted timestamp
+  shared to the sub-second, "which came last" is not knowable, and this is a
+  shipment gate. When the lot fact is absent entirely the line was
+  `NotMeasured` either way, so the override can only move it from
+  "unaccounted" to "failed" — strictly the more refusing direction.
+
+### Round-7 residuals, stated
+
+- **The per-serial arm is deliberately untouched.** `Evidence::Unit` is
+  linkage-scoped on purpose: a newer failure linked to a DIFFERENT unit must
+  not condemn this unit's line. A newer LOT-level failure against a
+  per-serial characteristic likewise does not reach the unit lines; that is
+  a different join (one lot fact fanning out to N units) and was not the
+  reported defect. Filed, not closed.
+- **"Named manager" is the authenticated login, not a role.** There is no
+  RBAC in PROD, so nothing enforces that the signer is entitled to sign —
+  the same limitation the CAPA approve/verify sign-off has always had. What
+  IS enforced is that a person signed, that they stated why, and that both
+  are hash-chained.
+- **A waiver cannot be revoked.** The table is append-only; an over-broad
+  waiver is corrected through the NCR it names. Adding a revoke would need a
+  second kind and a precedence rule, and neither was asked for.
+- **`open_ncr_against` still ignores waivers** — deliberately. It decides how
+  a report is LABELLED (`accept_with_ncr`), not whether a shipment leaves. A
+  waiver releases a shipment; it does not make the nonconformity stop
+  existing, and the certificate should keep saying so.
+- **Nothing stops the same operator signing off their own NCR.** There is no
+  separation-of-duties check, and adding one would wedge a one-person shop —
+  which the Defense pilot is. The ledger records who signed; who is allowed
+  to sign is the same open question as the RBAC residual above. Flagged, not
+  closed.
+- **B-2's fix is a PRE-FREEZE fix.** It stops a bad reading being frozen onto
+  a report; it cannot change one already issued, because an issued report is
+  immutable by design. For a FAILING measurement recorded after issuance the
+  NCR belt catches it (round 6, B-2). For `CalibrationStale` recorded after
+  issuance there is still nothing: it raises no NCR by design, and the frozen
+  report cannot move. That is the one shape of this defect class round 7
+  leaves open, and closing it means a second belt keyed on stale-calibration
+  measurements, not a change to `build_report_lines`.
+- **A waiver does not check that its `work_order_id` exists** — it is matched
+  exactly against the dispatch's WO at gate time, so a waiver naming a WO
+  that never existed is simply inert. Cheap to add, no defect behind it.
 
 ---
 

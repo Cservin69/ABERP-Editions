@@ -48,6 +48,17 @@
 #   central Ledger::open already carried it). The aberp-mes opener is now GONE
 #   (ADR-0104, on the shared Handle); full Handle migration of the remaining bin
 #   openers stays a v0.2.6 target.
+#
+# ── ADR-0090 round 7 (2026-08-26): quality.rs 10 -> 11, DELIBERATE. The new
+#   opener is `grant_ncr_shipment_waiver`'s business-row `Connection::open`,
+#   structurally identical to its nine siblings in this module
+#   (create_ncr/transition_ncr/create_capa/...): a business INSERT on its own
+#   pragma-fenced connection, with the AUDIT append routed through
+#   `quality::append_event` on the shared Handle. CHECK 10j confirms the
+#   pragma fence; 10M/10N/10P are unchanged (no write-fork, no new audit
+#   writer) — verified by diffing this gate's whole output before and after.
+#   It is an operator-paced ERP write and stays a v0.2.6 migration target with
+#   the rest of the module.
 6 apps/aberp/src/drain_submission_queue.rs
 1 apps/aberp/src/export_invoice_bundle.rs
 4 apps/aberp/src/incoming_invoices.rs
@@ -56,7 +67,7 @@
 3 apps/aberp/src/poll_annulment_ack.rs
 3 apps/aberp/src/print_invoice.rs
 6 apps/aberp/src/purchasing.rs
-10 apps/aberp/src/quality.rs
+11 apps/aberp/src/quality.rs
 1 apps/aberp/src/quote_calibration.rs
 1 apps/aberp/src/quoting_machines.rs
 3 apps/aberp/src/recover_from_nav.rs

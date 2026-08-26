@@ -34,7 +34,7 @@ Three invariants live in code:
 
 1. **State transitions** — `allowed_transition(from, to)` is the only legal-edge gate (`Open → Contained → UnderInvestigation → CorrectionApplied → Closed`, with `Escalated` reachable from any non-terminal state and recoverable). A `→ Closed` additionally requires a linked CAPA that is **approved AND effectiveness-Verified** (`Capa::permits_ncr_close`). The SPA mirrors the graph for instant feedback; the POST route re-validates and is the source of truth (a bad close returns 409).
 2. **Escalation timer** — a `Critical` NCR not closed within `CRITICAL_ESCALATION_HOURS` (24h) auto-escalates on the boot scan (`escalate_overdue_ncrs`), firing `ncr.escalated`; the operator dashboard surfaces a red banner. Non-fatal at boot ([[hulye-biztos]]) — mirrors the S431 AVL overdue scan.
-3. **Refuse-Shipment gate** — `resolve_open_ncr_gate(conn, tenant, dispatch)` (in `serve.rs`, mirroring `resolve_part_uid_gate`) returns `Blocked` when the dispatch is defense/aerospace AND any of the WO's marked part UIDs is referenced by an `Open`/`Contained` NCR. Enforced at `mark_dispatch_shipped_request` right after the S438 part-UID gate; fires `ncr.wo_blocked_by_open_ncr` + 409. The commercial path is unaffected.
+3. **Refuse-Shipment gate** — `resolve_open_ncr_gate(conn, tenant, dispatch)` (in `serve.rs`, mirroring `resolve_part_uid_gate`) returns `Blocked` when the dispatch is defense/aerospace AND the WO — or any of its marked part UIDs — is referenced by an NCR that has **not reached `Closed`** and carries **no signed management waiver for that WO**. Enforced at `mark_dispatch_shipped_request` right after the S438 part-UID gate; fires `ncr.wo_blocked_by_open_ncr` + 409. The commercial path is unaffected. *(Amended — round 7; it originally read `Open`/`Contained`, which let the escalation timer release the shipment. See the amendment at the end of this ADR.)*
 
 ### EventKinds (count 150 → 159)
 
@@ -49,3 +49,49 @@ Stored under `~/.aberp/<tenant>/ncr-photos/<ncr_id>/` (mirrors the S197 `ap-arti
 - **Positive:** the defense quality loop is closed end-to-end (part marked → NCR → CAPA → resolved → shipped); a part with a known unresolved issue cannot ship; the escalation timer + transition rules are enforced in code, not operator memory; every quality state change is hash-chained in the audit ledger.
 - **Negative / deferred:** events fire UNSIGNED (the DÁP / QES signature thread remains deferred, as with S438). "Approved operator" is modelled as a CAPA sign-off (approve + verify) rather than a per-operator RBAC role — there is no role system in PROD yet. Photos are operator-attested, not content-validated.
 - **Neutral:** the NCR detail is an in-page panel, not a deep route — the SPA router is single-level by design (no path params).
+
+## Amendment — 2026-08-26 (round 7, B-1): only `Closed` or a signed waiver releases
+
+### What was wrong
+
+`NcrState::blocks_shipment()` returned true for `Open | Contained` only. The other three non-terminal states — `UnderInvestigation`, `CorrectionApplied`, `Escalated` — all **released** the shipment.
+
+`Escalated` is the one that turns this from a modelling quibble into a release path. Invariant 2 above, the escalation timer, moves a `Critical` NCR to `Escalated` on the boot scan `CRITICAL_ESCALATION_HOURS` (24h) after discovery, with **no human in the loop**. So the worst class of defect, left unresolved for a day, un-blocked its own shipment *by ageing*. Invariants 2 and 3 were in direct contradiction and invariant 2 won: the mechanism whose whole purpose was to raise the alarm was also the mechanism that silenced the gate.
+
+`UnderInvestigation` and `CorrectionApplied` released for a duller reason: "we are looking into it" and "we think we fixed it" are not "it is fixed". Only `Closed` is gated on an approved, effectiveness-Verified CAPA (`Capa::permits_ncr_close`).
+
+### Ervin's ruling
+
+**An open nonconformity blocks the shipment, full stop.** There are exactly two releases:
+
+1. the NCR reaches `Closed` — which already demands the verified CAPA; or
+2. a **named manager signs an explicit, reasoned waiver** (waiver / deviation / MRB disposition) for that exact `(ncr_id, work_order_id)` pair.
+
+**A timer must never be able to sign anything off. A person must.**
+
+### What changed
+
+- `NcrState::blocks_shipment()` is now `!matches!(self, NcrState::Closed)`.
+- New append-only table `ncr_shipment_waivers` (`waiver_id` = `wvr_<ULID>`, `ncr_id`, `work_order_id`, `approved_by_operator`, `reason`, `approved_at_utc`, `ncr_state_at_waiver`) — the fourth quality table, same additive / no-CHECK / no-index shape as the other three.
+- `quality::grant_ncr_shipment_waiver(...)` writes the row and appends one **`ncr.shipment_waiver_granted`** ledger entry carrying the actor, the NCR, the WO, the NCR's state at signing, and the stated reason. **The ledger entry is the accountability** — not the table row, and not the state name. A state machine can be advanced by a background job; a hash-chained entry naming a person cannot.
+- `POST /api/ncrs/:id/shipment-waiver` (`{work_order_id, reason}`) is the only way in. `require_ready` supplies the operator login, so the approver cannot be spoofed in the request body, and no background task can reach the route at all.
+- `open_ncr_ids_blocking_wo` now takes the waiver set and drops an NCR only when a waiver matches **both** its `ncr_id` **and** this `wo_id`.
+
+### Deliberately narrow
+
+- **No wildcard.** `work_order_id` is required and matched exactly — the manager signs for a shipment they can see, not for every future one.
+- **A `Closed` NCR is refused a waiver.** It blocks nothing, so the signature would release nothing; recording one would only manufacture the appearance of a deliberated release.
+- **A reason must be a reason.** Blank, `ok`, `approved` are rejected (`validate_waiver_reason`, ≥ 12 characters).
+- **Append-only, no revoke.** An over-broad waiver is corrected through the NCR it names, not by editing history.
+- **A waiver is not a transition.** The NCR stays exactly where it was; the ledger records that a shipment was released while it was there.
+
+### EventKinds (count 195 → 196)
+
+One new kind: `ncr.shipment_waiver_granted`, tenth member of the `ncr.*` family. Full F12 ritual — `as_str`, `from_storage_str`, `ALL_KINDS`, the independent `round_trip_for_every_variant` hand-list, both NAV-leakage arms (app-only, never NAV XML), and both `const _` count pins bumped `195 → 196`.
+
+### Consequences
+
+- **This refuses more than it used to.** A shop that shipped while an NCR sat in `UnderInvestigation` now needs either the close or the signature. That is the point, and it is the conservative direction.
+- **Still no RBAC.** "Named manager" is the authenticated operator login, exactly as the CAPA approve/verify sign-off already is — there is no role system in PROD yet, so nothing here can enforce that the signer is *entitled* to sign. What it does enforce is that a **person** signed, that they said **why**, and that both are in the hash chain. Flagged, not closed.
+- **The escalation timer keeps its job** — it still raises the alarm and still fires `ncr.escalated`. It simply no longer decides anything about shipping.
+- **The `qcr` report annotation is deliberately NOT waived.** `open_ncr_against` still drives the `accept_with_ncr` disposition from the un-waived NCR set: a waiver releases a *shipment*, it does not make the nonconformity stop existing, and the certificate should keep saying so.

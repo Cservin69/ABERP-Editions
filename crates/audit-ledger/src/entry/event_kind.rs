@@ -2923,6 +2923,28 @@ pub enum EventKind {
     /// `blocked_at`. `ncr.*` family — app-layer JSON, never NAV XML bytes.
     WoBlockedByOpenNcr,
 
+    /// ADR-0090 round 7 (B-1) — a named manager RELEASED one NCR for one Work
+    /// Order's shipment: the audited waiver / deviation / MRB sign-off, and the
+    /// ONLY thing that lets a still-open NCR ship.
+    ///
+    /// The gate this lifts blocks on every non-`Closed` NCR state. Before round
+    /// 7 it blocked only on `Open` / `Contained`, so the boot escalation timer
+    /// — `escalate_overdue_ncrs`, 24h, no human in the loop — moved a `Critical`
+    /// NCR to `Escalated` and thereby RELEASED the shipment it was supposed to
+    /// stop. A timer must never be able to sign anything off; a person must.
+    /// This entry IS the accountability: it names the actor and records their
+    /// stated reason in the hash chain.
+    ///
+    /// Scoped to exactly one `(ncr_id, work_order_id)` pair. A waiver for one
+    /// NCR releases no other NCR, and a waiver for one WO releases no other
+    /// WO's shipment.
+    ///
+    /// Payload (`serde_json::Value`): `waiver_id`, `ncr_id`, `work_order_id`,
+    /// `ncr_state_at_waiver`, `severity`, `reason`, `approved_by_operator`,
+    /// `approved_at_utc`, `operator_user_id`. `ncr.*` family — app-layer JSON,
+    /// never NAV XML bytes.
+    NcrShipmentWaiverGranted,
+
     /// S439 (ADR-0090) — a Corrective And Preventive Action was created for a
     /// parent NCR. FIRST member of the new `capa.*` prefix family. Records the
     /// corrective + preventive plan, the responsible operator, and the target
@@ -3418,6 +3440,7 @@ impl EventKind {
             EventKind::NcrEscalated => "ncr.escalated",
             EventKind::NcrClosed => "ncr.closed",
             EventKind::WoBlockedByOpenNcr => "ncr.wo_blocked_by_open_ncr",
+            EventKind::NcrShipmentWaiverGranted => "ncr.shipment_waiver_granted",
             EventKind::CapaCreated => "capa.created",
             EventKind::CapaApproved => "capa.approved",
             EventKind::CapaEffectivenessReviewed => "capa.effectiveness_reviewed",
@@ -3645,6 +3668,7 @@ impl EventKind {
             "ncr.escalated" => Ok(EventKind::NcrEscalated),
             "ncr.closed" => Ok(EventKind::NcrClosed),
             "ncr.wo_blocked_by_open_ncr" => Ok(EventKind::WoBlockedByOpenNcr),
+            "ncr.shipment_waiver_granted" => Ok(EventKind::NcrShipmentWaiverGranted),
             "capa.created" => Ok(EventKind::CapaCreated),
             "capa.approved" => Ok(EventKind::CapaApproved),
             "capa.effectiveness_reviewed" => Ok(EventKind::CapaEffectivenessReviewed),
@@ -3860,6 +3884,7 @@ impl EventKind {
         EventKind::NcrEscalated,
         EventKind::NcrClosed,
         EventKind::WoBlockedByOpenNcr,
+        EventKind::NcrShipmentWaiverGranted,
         EventKind::CapaCreated,
         EventKind::CapaApproved,
         EventKind::CapaEffectivenessReviewed,
@@ -4083,6 +4108,7 @@ mod tests {
             EventKind::NcrEscalated,
             EventKind::NcrClosed,
             EventKind::WoBlockedByOpenNcr,
+            EventKind::NcrShipmentWaiverGranted,
             EventKind::CapaCreated,
             EventKind::CapaApproved,
             EventKind::CapaEffectivenessReviewed,
@@ -4155,7 +4181,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            195,
+            196,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
@@ -6746,8 +6772,10 @@ mod tests {
         assert!(seen.insert(EventKind::PartUidMarked.as_str()));
     }
 
-    /// S439 (ADR-0090) — the nine NCR/CAPA quality kinds round-trip, carry the
-    /// `ncr.*` / `capa.*` prefixes, and are distinct from one another.
+    /// S439 (ADR-0090) — the ten NCR/CAPA quality kinds round-trip, carry the
+    /// `ncr.*` / `capa.*` prefixes, and are distinct from one another. The tenth
+    /// is round 7's `ncr.shipment_waiver_granted` — the audited management
+    /// sign-off that is now the ONLY release path for a non-`Closed` NCR.
     #[test]
     fn s439_quality_kinds_round_trip_and_use_ncr_capa_prefix() {
         let new = [
@@ -6758,6 +6786,11 @@ mod tests {
             (
                 EventKind::WoBlockedByOpenNcr,
                 "ncr.wo_blocked_by_open_ncr",
+                "ncr.",
+            ),
+            (
+                EventKind::NcrShipmentWaiverGranted,
+                "ncr.shipment_waiver_granted",
                 "ncr.",
             ),
             (EventKind::CapaCreated, "capa.created", "capa."),
@@ -6781,7 +6814,7 @@ mod tests {
             );
             assert!(seen.insert(s), "duplicate storage string {s}");
         }
-        assert_eq!(seen.len(), 9, "nine distinct quality kinds");
+        assert_eq!(seen.len(), 10, "ten distinct quality kinds");
     }
 
     /// S440 (ADR-0068) — the nine purchase-order kinds round-trip, carry the new

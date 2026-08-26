@@ -58,6 +58,7 @@ apps/aberp/src/quality.rs|create_capa:let conn = Connection::open(db_path).map_e
 apps/aberp/src/quality.rs|create_ncr:let conn = Connection::open(db_path)
 apps/aberp/src/quality.rs|escalate_overdue_ncrs:let conn = Connection::open(db_path)
 apps/aberp/src/quality.rs|escalate_overdue_ncrs:let conn = Connection::open(db_path)
+apps/aberp/src/quality.rs|grant_ncr_shipment_waiver:let conn = Connection::open(db_path)
 apps/aberp/src/quality.rs|reread_capa:let conn = Connection::open(db_path)
 apps/aberp/src/quality.rs|review_capa_effectiveness:let conn = Connection::open(db_path).map_err(|e| {
 apps/aberp/src/quality.rs|transition_ncr:let conn = Connection::open(db_path)

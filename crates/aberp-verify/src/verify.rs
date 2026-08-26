@@ -1285,6 +1285,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::NcrEscalated
         | EventKind::NcrClosed
         | EventKind::WoBlockedByOpenNcr
+        | EventKind::NcrShipmentWaiverGranted
         | EventKind::CapaCreated
         | EventKind::CapaApproved
         | EventKind::CapaEffectivenessReviewed
@@ -1364,7 +1365,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 195,
+        EventKind::ALL_KINDS_COUNT == 196,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1983,6 +1984,7 @@ mod tests {
             EventKind::NcrEscalated,
             EventKind::NcrClosed,
             EventKind::WoBlockedByOpenNcr,
+            EventKind::NcrShipmentWaiverGranted,
             EventKind::CapaCreated,
             EventKind::CapaApproved,
             EventKind::CapaEffectivenessReviewed,

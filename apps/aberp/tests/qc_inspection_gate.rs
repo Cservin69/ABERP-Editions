@@ -528,3 +528,171 @@ fn a_failing_lot_level_measurement_after_issuance_still_blocks_the_shipment() {
         ),
     }
 }
+
+/// **Round 7, B-1, end to end: the escalation TIMER must not open the gate,
+/// and only a signed management waiver may.**
+///
+/// The composition this closes needed no operator at all. A failing
+/// measurement auto-spawns a `Critical` NCR; 24 hours later the boot scan
+/// `escalate_overdue_ncrs` moves it to `Escalated` with nobody in the loop;
+/// and `Escalated` was outside the old `Open | Contained` blocking set, so
+/// the defense shipment released itself by ageing.
+///
+/// Walks it: blocked → timer fires → still blocked → manager signs for THIS
+/// WO → Pass. And the same signature does nothing for a second WO's
+/// dispatch, which is the scoping half.
+#[test]
+fn the_escalation_timer_cannot_release_a_shipment_but_a_signed_waiver_can() {
+    let fx = setup();
+    let conn = Connection::open(&fx.db_path).unwrap();
+    let buyer = create_partner(&conn, T, &partner_inputs("Def Co", CustomerType::Defense)).unwrap();
+    seed_wo(&conn, "wo-tick");
+    seed_dispatch(&conn, "dsp-tick", "wo-tick", &buyer.id);
+    let part_uid = mark_one_unit(&conn, "wo-tick");
+    // A second order for the same buyer — the waiver must not reach it.
+    seed_wo(&conn, "wo-other");
+    seed_dispatch(&conn, "dsp-other", "wo-other", &buyer.id);
+    drop(conn);
+
+    let plan_id = seed_plan(&fx);
+
+    // 10.500 against 10.0 ±0.010 → far beyond 2× half-width → Critical.
+    let bad = record_manual_inspection(
+        &fx.db_path,
+        &fx.handle,
+        fx.tenant.clone(),
+        fx.hash,
+        "ervin",
+        now(),
+        86400,
+        ManualInspectionRequest {
+            plan_id,
+            actual_value: 10.500,
+            source: QcSource::Manual,
+            units: None,
+            source_event_id: None,
+            probe_serial: None,
+            last_calibration_at: None,
+            wo_id: Some("wo-tick".into()),
+            part_uid: Some(part_uid),
+            heat_lot: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(bad.inspection.verdict, Verdict::Critical);
+    let ncr = bad.auto_ncr.expect("a Critical verdict auto-spawns an NCR");
+    assert_eq!(ncr.state, aberp::quality::NcrState::Open);
+
+    // Blocked, as it should be.
+    let conn = Connection::open(&fx.db_path).unwrap();
+    assert!(matches!(
+        resolve_open_ncr_gate(&conn, T, &dispatch(&conn, "dsp-tick")).unwrap(),
+        OpenNcrGate::Blocked { .. }
+    ));
+    drop(conn);
+
+    // The timer fires: 48h later the boot scan escalates it. No human.
+    let escalated = aberp::quality::escalate_overdue_ncrs(
+        &fx.db_path,
+        &fx.handle,
+        fx.tenant.clone(),
+        fx.hash,
+        "boot",
+        // `create_ncr` stamps `discovered_at_utc` from the WALL clock, not
+        // from this file's frozen `now()` — so the scan's clock has to be
+        // wall-relative or the window never looks breached.
+        OffsetDateTime::now_utc() + time::Duration::hours(48),
+    )
+    .unwrap();
+    assert_eq!(escalated, 1, "the Critical NCR auto-escalated");
+
+    let conn = Connection::open(&fx.db_path).unwrap();
+    assert_eq!(
+        aberp::quality::get_ncr(&conn, T, &ncr.ncr_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        aberp::quality::NcrState::Escalated
+    );
+    // THE defect: this used to be `OpenNcrGate::Pass`.
+    match resolve_open_ncr_gate(&conn, T, &dispatch(&conn, "dsp-tick")).unwrap() {
+        OpenNcrGate::Blocked {
+            blocking_ncr_ids, ..
+        } => assert_eq!(blocking_ncr_ids, vec![ncr.ncr_id.clone()]),
+        other => panic!("an auto-escalated Critical NCR must still block, got {other:?}"),
+    }
+    drop(conn);
+
+    // A named manager signs off — for wo-tick, and for this NCR.
+    aberp::quality::grant_ncr_shipment_waiver(
+        &fx.db_path,
+        &fx.handle,
+        fx.tenant.clone(),
+        fx.hash,
+        "erzsi.quality.manager",
+        &ncr.ncr_id,
+        "wo-tick",
+        "MRB: customer accepted the deviation in writing, ref DEF-2026-114",
+    )
+    .unwrap();
+
+    let conn = Connection::open(&fx.db_path).unwrap();
+    assert_eq!(
+        resolve_open_ncr_gate(&conn, T, &dispatch(&conn, "dsp-tick")).unwrap(),
+        OpenNcrGate::Pass,
+        "the signed waiver is the release"
+    );
+    // …and the NCR did not move: a waiver is not a transition.
+    assert_eq!(
+        aberp::quality::get_ncr(&conn, T, &ncr.ncr_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        aberp::quality::NcrState::Escalated
+    );
+    drop(conn);
+
+    // The scoping half: point the SAME NCR at the second order. The waiver
+    // named wo-tick, so wo-other's dispatch stays refused.
+    {
+        let conn = Connection::open(&fx.db_path).unwrap();
+        conn.execute(
+            "UPDATE ncrs SET affected_wo_ids = '[\"wo-other\"]', affected_part_uids = '[]' \
+             WHERE tenant_id = ?1 AND ncr_id = ?2",
+            params![T, ncr.ncr_id],
+        )
+        .unwrap();
+    }
+    let conn = Connection::open(&fx.db_path).unwrap();
+    match resolve_open_ncr_gate(&conn, T, &dispatch(&conn, "dsp-other")).unwrap() {
+        OpenNcrGate::Blocked {
+            work_order_id,
+            blocking_ncr_ids,
+            ..
+        } => {
+            assert_eq!(work_order_id, "wo-other");
+            assert_eq!(blocking_ncr_ids, vec![ncr.ncr_id.clone()]);
+        }
+        other => panic!("a waiver for wo-tick must not release wo-other, got {other:?}"),
+    }
+
+    // The accountability: exactly one sign-off entry, and the timer minted
+    // none of it.
+    let led = fx.handle.read().unwrap();
+    let signed: i64 = led
+        .query_row(
+            "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'ncr.shipment_waiver_granted'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(signed, 1);
+    let escalations: i64 = led
+        .query_row(
+            "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'ncr.escalated'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(escalations, 1, "the timer still raises its alarm");
+}

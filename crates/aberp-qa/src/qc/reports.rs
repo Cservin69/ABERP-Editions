@@ -404,6 +404,75 @@ fn latest_measurement<'a>(
         })
 }
 
+/// The total order `latest_measurement` ranks by: parsed instant first,
+/// `qci_id` as the tiebreak. Extracted so the lot-line adverse check
+/// (round 7, B-2) compares recency the SAME way the winner was chosen —
+/// two different orderings here would be a defect factory.
+fn recency_key(i: &QcInspection) -> (Option<OffsetDateTime>, &str) {
+    (measured_at_instant(i), i.qci_id.as_str())
+}
+
+/// **The lot line's negative direction is linkage-blind** (round 7, B-2).
+///
+/// [`Evidence::LotOnly`] is the right rule for SATISFACTION — a per-unit
+/// measurement is not a fact about the lot, so it must not account for the
+/// lot line (round 6, B-1). But `latest_measurement` applies the evidence
+/// filter BEFORE picking the latest, so the same rule also hid every
+/// per-unit measurement from the lot line's *verdict*. A lot `Pass` at
+/// 10:00 and a unit-linked `Critical` on the SAME characteristic at 10:05
+/// produced a line reading `Measured / Pass`, `counts.failed == 0`, a
+/// computed disposition of `Accept`, and a CoC/FAIR frozen and hash-pinned
+/// over that reading. The failing measurement was recorded, and the
+/// document said the part conformed.
+///
+/// `CalibrationStale` is the quieter half of the same hole: it raises no
+/// NCR by design (a probe that may be lying must not manufacture a false
+/// defect), so the NCR belt never sees it either — the report line was the
+/// only place it could have surfaced.
+///
+/// So: keep `LotOnly` for what ACCOUNTS for the line, and let ANY
+/// measurement of the characteristic — unit-linked or not — CONDEMN it.
+///
+/// **Recency-scoped, and that is load-bearing.** The legitimate shop-floor
+/// sequence is measure → fail → NCR → rework → re-measure → pass, and a
+/// linkage-blind check that ignored time would refuse every lot line that
+/// ever had a failure behind it, forever. Only a measurement at or after
+/// the lot fact's own position in [`recency_key`] condemns.
+///
+/// Ties (identical instant AND the adverse row sorting at-or-above the lot
+/// fact) resolve toward blocking: with a formatted timestamp shared to the
+/// sub-second, "which came last" is not knowable, and this is a shipment
+/// gate. Rework inside one recorded instant is not a real sequence; a
+/// same-instant contradiction is.
+///
+/// When there is NO lot fact the line is `NotMeasured` either way, so this
+/// can only move it from "unaccounted" to "failed" — strictly the more
+/// refusing direction, never the other.
+///
+/// An UNPARSEABLE `measured_at_utc` sorts below every parsed instant
+/// (`Option`'s own ordering), so an adverse row carrying one does not
+/// override a lot fact that parses. That arm never decides anything in
+/// practice: [`freeze_report`] refuses the whole freeze when any supplied
+/// measurement carries a timestamp it cannot read, rather than silently
+/// demoting it — the same posture [`latest_measurement`] documents.
+fn adverse_override<'a>(
+    inspections: &'a [QcInspection],
+    plan_id: &str,
+    lot_fact: Option<&QcInspection>,
+) -> Option<&'a QcInspection> {
+    let worst = inspections
+        .iter()
+        .filter(|i| i.inspection_plan_id == plan_id)
+        .filter(|i| i.verdict.is_failing() || i.verdict == Verdict::CalibrationStale)
+        .max_by(|a, b| recency_key(a).cmp(&recency_key(b)))?;
+    match lot_fact {
+        // `>=`, not `>`: see the tie note above. When the lot fact IS the
+        // adverse row this returns it unchanged — the override is idempotent.
+        Some(lot) => (recency_key(worst) >= recency_key(lot)).then_some(worst),
+        None => Some(worst),
+    }
+}
+
 fn line_from(
     line_no: u32,
     plan: &InspectionPlan,
@@ -538,6 +607,10 @@ pub fn build_report_lines(
         // serialised units, so the one line standing for all of them must be
         // backed by a fact about all of them (round 6, B-1 — see [`Evidence`]).
         let m = latest_measurement(inspections, &plan.plan_id, Evidence::LotOnly);
+        // …but only for SATISFACTION. A newer failing or calibration-stale
+        // measurement condemns the line whatever it is linked to (round 7,
+        // B-2 — see [`adverse_override`]).
+        let m = adverse_override(inspections, &plan.plan_id, m).or(m);
         lines.push(line_from(line_no, plan, None, m));
     }
     lines
@@ -2147,6 +2220,158 @@ mod tests {
         assert_eq!(
             compute_disposition(summarise(&lines), false),
             Disposition::Accept
+        );
+    }
+
+    /// **THE round-7 blocker (B-2): an older lot `Pass` outranked a newer
+    /// unit `Critical`, and the CoC said the part conformed.**
+    ///
+    /// `latest_measurement` applies the [`Evidence`] filter BEFORE `max_by`,
+    /// so round 6's (correct) `LotOnly` rule for lot-level lines also hid
+    /// every unit-linked measurement from the lot line's VERDICT. Record a
+    /// lot `Pass` at 10:00, then measure SN-001 `Critical` on the same
+    /// characteristic at 10:05, and the line still read `Measured / Pass`,
+    /// `failed == 0`, disposition `Accept` — frozen and hash-pinned.
+    #[test]
+    fn a_newer_unit_failure_condemns_the_lot_line_the_older_lot_pass_would_have_accepted() {
+        let plans = vec![lot_plan("p1", "Heat treat")];
+        let units = vec![unit("SN-001", "uid1"), unit("SN-002", "uid2")];
+
+        // The lot fact alone: accepted.
+        let lot_only = vec![measurement(
+            "q1",
+            "p1",
+            None,
+            25.0,
+            Verdict::Pass,
+            "2026-08-02T10:00:00Z",
+        )];
+        let lines = build_report_lines(&plans, &lot_only, &units);
+        assert_eq!(
+            compute_disposition(summarise(&lines), false),
+            Disposition::Accept,
+            "the legitimate lot pass must still accept — the fix is not a blanket refusal"
+        );
+
+        // …plus a NEWER unit-linked Critical on the same characteristic.
+        let mut with_fail = lot_only.clone();
+        with_fail.push(measurement(
+            "q2",
+            "p1",
+            Some("uid1"),
+            99.0,
+            Verdict::Critical,
+            "2026-08-02T10:05:00Z",
+        ));
+        let lines = build_report_lines(&plans, &with_fail, &units);
+        assert_eq!(lines.len(), 1, "still ONE lot-level line");
+        assert_eq!(
+            lines[0].verdict,
+            Some(Verdict::Critical),
+            "the line must report the failure, not the superseded pass"
+        );
+        let d = compute_disposition(summarise(&lines), false);
+        assert_eq!(d, Disposition::Reject);
+        assert!(
+            !d.permits_shipment(),
+            "a failing measurement of this characteristic must refuse the shipment"
+        );
+    }
+
+    /// `CalibrationStale` is the quiet half of the same hole. It raises NO
+    /// NCR by design (an untrusted probe must not manufacture a false
+    /// defect), so the NCR belt never sees it — the report line was the only
+    /// place it could surface, and the `LotOnly` pre-filter hid it there.
+    #[test]
+    fn a_newer_unit_calibration_stale_measurement_stops_the_lot_line_accepting() {
+        let plans = vec![process_plan("p1", "Coating")];
+        let units = vec![unit("SN-001", "uid1")];
+        let inspections = vec![
+            measurement(
+                "q1",
+                "p1",
+                None,
+                25.0,
+                Verdict::Pass,
+                "2026-08-02T10:00:00Z",
+            ),
+            measurement(
+                "q2",
+                "p1",
+                Some("uid1"),
+                25.0,
+                Verdict::CalibrationStale,
+                "2026-08-02T10:05:00Z",
+            ),
+        ];
+        let lines = build_report_lines(&plans, &inspections, &units);
+        assert_eq!(lines[0].verdict, Some(Verdict::CalibrationStale));
+        let counts = summarise(&lines);
+        assert_eq!(counts.calibration_stale, 1);
+        let d = compute_disposition(counts, false);
+        assert_eq!(d, Disposition::Incomplete);
+        assert!(!d.permits_shipment());
+    }
+
+    /// **The recency scope is load-bearing in the OTHER direction.**
+    ///
+    /// measure → fail → NCR → rework → re-measure → pass is the legitimate
+    /// shop-floor sequence. A linkage-blind check that ignored time would
+    /// refuse every lot line that ever had a failure behind it, forever —
+    /// which is not conservatism, it is a report nobody can ever complete.
+    /// An OLDER unit failure superseded by a NEWER lot pass must accept.
+    #[test]
+    fn an_older_unit_failure_superseded_by_a_newer_lot_pass_still_accepts() {
+        let plans = vec![lot_plan("p1", "Heat treat")];
+        let units = vec![unit("SN-001", "uid1")];
+        let inspections = vec![
+            measurement(
+                "q1",
+                "p1",
+                Some("uid1"),
+                99.0,
+                Verdict::Critical,
+                "2026-08-02T10:00:00Z",
+            ),
+            measurement(
+                "q2",
+                "p1",
+                None,
+                25.0,
+                Verdict::Pass,
+                "2026-08-02T10:05:00Z",
+            ),
+        ];
+        let lines = build_report_lines(&plans, &inspections, &units);
+        assert_eq!(lines[0].verdict, Some(Verdict::Pass));
+        assert_eq!(
+            compute_disposition(summarise(&lines), false),
+            Disposition::Accept,
+            "the reworked-and-re-measured lot must not be blocked by its own history"
+        );
+    }
+
+    /// With NO lot fact at all the line is `NotMeasured` either way, so the
+    /// override can only move it from "unaccounted" to "failed" — strictly
+    /// the more refusing direction. Pins that it does, rather than leaving a
+    /// non-required lot characteristic with a recorded failure silent.
+    #[test]
+    fn a_unit_failure_with_no_lot_fact_at_all_rejects_rather_than_merely_incomplete() {
+        let plans = vec![lot_plan("p1", "Heat treat")];
+        let units = vec![unit("SN-001", "uid1")];
+        let inspections = vec![measurement(
+            "q1",
+            "p1",
+            Some("uid1"),
+            99.0,
+            Verdict::Major,
+            "2026-08-02T10:00:00Z",
+        )];
+        let lines = build_report_lines(&plans, &inspections, &units);
+        assert_eq!(lines[0].verdict, Some(Verdict::Major));
+        assert_eq!(
+            compute_disposition(summarise(&lines), false),
+            Disposition::Reject
         );
     }
 
