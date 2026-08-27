@@ -16,7 +16,8 @@
 # P0  the unmutated tree                                           -> GREEN
 # P6  a doc-comment mention of `Handle::durable_ack` alone         -> RED (not a call)
 # P7  the call kept but its error SWALLOWED (rule-11 downgrade)    -> RED (D3-C)
-# P8  P7's mutation flags ONLY the mutated site                    -> 1 swallowed, 4 propagate
+# P8  P7's mutation flags ONLY the mutated site                    -> 1 swallowed, rest propagate
+# P11 an ack MOVED between two censused files (total unchanged)    -> RED via D3-A, D3-B green
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -103,20 +104,64 @@ probe "P10 bare ack + a neighbouring ?; (statement-anchor test) -> RED" 1 "$bare
 
 # P8 — precision, not just sensitivity. A check that flagged every site would
 # also go red here and would be useless; assert it names the ONE mutated site
-# and clears the other four.
+# and clears every other one.
+#
+# The expected propagate count is DERIVED, never written down. It was a literal
+# `4` from the five-site census, and D-22 grew the census to 26 — so the probe
+# went red on a gate whose PROPERTY (exactly one swallowed, all others
+# propagating) still held perfectly. Bumping the constant would just re-arm the
+# same rot at the next census growth. So: measure the unmutated tree's D3-C
+# verdict count first, and expect that minus the one site P7 downgrades.
+#
+# Match the per-site verdict line only — the CHECK D3-C header also contains
+# the word "PROPAGATES" and would otherwise be counted as an extra site.
+d="$(mktree)"
+base_out="$( cd "$d" && bash "$GATE" 2>&1 )"
+base_prop="$(printf '%s' "$base_out" | grep -c '— PROPAGATES')"
+rm -rf "$d"
+
+# A derived expectation can go vacuous the way a literal cannot: if the matcher
+# died and the baseline were 0 or 1, "expect base-1" would be satisfied by a
+# gate that reports nothing at all. Pin the floor.
+if [[ "$base_prop" -lt 2 ]]; then
+  bad "P8 baseline is degenerate — the unmutated tree reports only $base_prop propagating site(s);"
+  printf '      a derived expectation of %s cannot distinguish a precise gate from a dead one.\n' "$((base_prop - 1))"
+fi
+want_prop=$((base_prop - 1))
+
 d="$(mktree)"
 ( cd "$d" && eval "$swallow_mut" )
 out="$( cd "$d" && bash "$GATE" 2>&1 )"
 nswallow="$(printf '%s' "$out" | grep -c 'SWALLOWED durable-ack failure')"
-# Match the per-site verdict line only — the CHECK D3-C header also contains
-# the word "PROPAGATES" and would otherwise be counted as a sixth site.
 nprop="$(printf '%s' "$out" | grep -c '— PROPAGATES')"
-if [[ "$nswallow" == "1" && "$nprop" == "4" ]] \
+if [[ "$nswallow" == "1" && "$nprop" == "$want_prop" ]] \
    && printf '%s' "$out" | grep -q 'SWALLOWED durable-ack failure at apps/aberp/src/issue_invoice.rs'; then
-  pass "P8 D3-C flags ONLY the mutated site (1 swallowed, 4 propagate)"
+  pass "P8 D3-C flags ONLY the mutated site (1 swallowed, $nprop propagate; baseline $base_prop, derived)"
 else
-  bad "P8 D3-C imprecise — expected 1 swallowed / 4 propagates, got $nswallow / $nprop"
+  bad "P8 D3-C imprecise — expected 1 swallowed / $want_prop propagates (baseline $base_prop − 1), got $nswallow / $nprop"
   printf '%s\n' "$out" | sed 's/^/      /'
+fi
+rm -rf "$d"
+
+# P11 — teeth for D3-A's per-file exactness (D-22 adversarial M7). Move ONE ack
+# from a censused file that owns three boundaries to a censused file that owns
+# four: the whole-tree total is unchanged, so D3-B stays GREEN and every file
+# still has at least one call — the old `>= 1` D3-A was green on this. The
+# twelve NAV-gated sites have no test cover at all, so an ack silently relocated
+# off (say) the Attempt-before-call boundary is exactly the edit that must not
+# pass. Assert the gate goes red AND that it is D3-A, not D3-B, that catches it.
+move_mut="perl -0pi -e 's/    db\.durable_ack\(\)/    let _ack_moved_away = ();/' apps/aberp/src/submit_invoice.rs"
+move_mut="$move_mut && printf 'fn _relocated(db: &Handle) -> anyhow::Result<()> { db.durable_ack()?; Ok(()) }\n' >> apps/aberp/src/retry_submission.rs"
+d="$(mktree)"
+( cd "$d" && eval "$move_mut" )
+rc="$( cd "$d" && bash "$GATE" >"$d/out.txt" 2>&1; echo $? )"
+if [[ "$rc" == "1" ]] \
+   && grep -q 'census closed' "$d/out.txt" \
+   && grep -q 'but the census owes it' "$d/out.txt"; then
+  pass "P11 an ack MOVED between censused files is RED via D3-A while D3-B stays green"
+else
+  bad "P11 a relocated ack was not caught per-file — exit $rc (want 1, with D3-B still reporting 'census closed')"
+  sed 's/^/      /' "$d/out.txt"
 fi
 rm -rf "$d"
 

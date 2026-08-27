@@ -834,8 +834,16 @@ else
     fi
   done < <(find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/' | sort)
   if [[ "$resid_fail" == "0" ]]; then
-    ft="$(grep -vE '^#' "$manifest" | awk '{s+=$1} END{print s}')"
-    ff="$(grep -vcE '^#' "$manifest")"
+    # `|| true` (x2): an ALL-COMMENT manifest is a legitimate terminal state —
+    # it is what "every residual opener has been migrated onto the Handle"
+    # looks like. `grep -v`/`grep -vc` exit 1 on zero matches, and under
+    # `set -euo pipefail` a bare assignment from such a command substitution
+    # (pipefail carries the failure out of the awk pipe) KILLS the whole gate
+    # right here — a hard RED, mid-run, so CHECK 10j/10k/10M/10N/10P below
+    # never execute at all. Same bug as the 10L-b manifest (D-22, line ~729)
+    # and the 10k baseline read below; fixed in all three places together.
+    ft="$( { grep -vE '^#' "$manifest" || true; } | awk '{s+=$1} END{print s+0}')"
+    ff="$(grep -vcE '^#' "$manifest" || true)"
     note "✓ frozen residual ledger holds — no file exceeds its frozen count, no new unlisted opener ($ft frozen openers across $ff files; v0.2.6 migration target)"
   fi
 fi
@@ -941,7 +949,13 @@ else
     [[ -z "$sigs" ]] && continue
     while IFS= read -r sig; do printf '%s|%s\n' "$f" "$sig"; done <<< "$sigs"
   done < <(find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/' | sort) | sort > "$cur"
-  grep -vE '^#' "$fpfile" | sort > "$froz"
+  # `|| true`: an ALL-COMMENT fingerprint manifest is a legitimate terminal
+  # state (no residual openers left to fingerprint). `grep -v` exits 1 on zero
+  # matches and `pipefail` carries that out of the pipeline, so under `set -e`
+  # this line KILLED the gate mid-run and CHECK 10M/10N/10P never ran. An empty
+  # `$froz` is the correct baseline: the diff below then reports every current
+  # opener as an addition, which is exactly right.
+  { grep -vE '^#' "$fpfile" || true; } | sort > "$froz"
   if diff -q "$froz" "$cur" >/dev/null 2>&1; then
     note "✓ opener fingerprint set matches the frozen baseline ($(grep -vcE '^#' "$fpfile") openers; no add/remove/swap)"
   else

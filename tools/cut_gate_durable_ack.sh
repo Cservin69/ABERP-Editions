@@ -15,7 +15,15 @@
 # have them. This gate covers all five, statically, in seconds, with no
 # toolchain — the same posture as the ADR-0099 opener-census gate.
 #
-# CHECK D3-A — every censused money-path ack file still calls `durable_ack()`.
+# CHECK D3-A — every censused money-path ack file calls `durable_ack()` EXACTLY
+#              as many times as the census lists lines for it. `>= 1` was the
+#              first cut and the D-22 adversarial (M7) defeated it: with several
+#              acks per file (an Attempt-before-call row and a Response row are
+#              two distinct ack boundaries), a per-file `>= 1` lets an ack be
+#              MOVED between two censused files — one loses a boundary, the
+#              other gains one — while the whole-tree total D3-B checks stays
+#              put. The twelve NAV-gated sites have no other cover, so the
+#              per-file count is the only thing that sees that edit.
 # CHECK D3-B — the call-site count across apps/*/src EQUALS the census count,
 #              so a new unregistered ack site is as red as a deleted one.
 # CHECK D3-C — every call site PROPAGATES the failure (`?`), rather than
@@ -82,12 +90,31 @@ note "✓ matcher live"
 echo
 
 # ── CHECK D3-A — every censused ack site still calls durable_ack ─────────────
-echo "[CHECK D3-A] every censused money-path ack still calls durable_ack() (ENFORCED)"
+echo "[CHECK D3-A] every censused money-path ack file calls durable_ack() EXACTLY its censused number of times (ENFORCED)"
+
+# `census_files` keeps ONE entry per census LINE (D3-B's whole-tree total is a
+# line count). `census_uniq` is the same list deduped, in census order, so a
+# file carrying several ack boundaries is reported — and checked — once.
 census_files=()
+census_uniq=()
 while IFS= read -r line; do
   [[ -z "$line" || "$line" == \#* ]] && continue
   f="${line%%$'\t'*}"
   census_files+=("$f")
+  seen=0
+  for u in ${census_uniq[@]+"${census_uniq[@]}"}; do [[ "$u" == "$f" ]] && seen=1; done
+  [[ "$seen" -eq 1 ]] || census_uniq+=("$f")
+done < "$CENSUS"
+
+# How many census LINES name this file — i.e. how many ack boundaries it owes.
+census_lines_for() {
+  local target="$1" c=0 e
+  for e in ${census_files[@]+"${census_files[@]}"}; do [[ "$e" == "$target" ]] && c=$((c + 1)); done
+  printf '%s' "$c"
+}
+
+for f in ${census_uniq[@]+"${census_uniq[@]}"}; do
+  want="$(census_lines_for "$f")"
   if [[ ! -f "$f" ]]; then
     flag "✗ censused money-path file is GONE: $f — update $CENSUS if the ack moved"
     continue
@@ -97,10 +124,18 @@ while IFS= read -r line; do
     flag "✗ ADR-0110 R1 AT RISK: $f no longer calls durable_ack() — an operator-visible"
     note "    money-path ack there is back to promising a write that only lives in an"
     note "    un-fsync'd WAL. That is the 2026-08-08 loss, restored."
+  elif [[ "$n" -ne "$want" ]]; then
+    flag "✗ ADR-0110 R1 AT RISK: $f has $n durable_ack() call site(s) but the census owes it $want."
+    note "    Each census line is one ACK BOUNDARY (e.g. the Attempt-before-call row and"
+    note "    the Response row are two). A file that gained one has an unreviewed ack;"
+    note "    a file that lost one had an ack MOVED or deleted — and a move between two"
+    note "    censused files leaves D3-B's whole-tree total unchanged, so this per-file"
+    note "    count is the only check that sees it (D-22 adversarial M7)."
+    note "    Fix the code, or edit $CENSUS and say in the PR why the boundary moved."
   else
-    note "✓ $f — $n call site(s)"
+    note "✓ $f — $n call site(s) (census owes $want)"
   fi
-done < "$CENSUS"
+done
 echo
 
 # ── CHECK D3-B — the census is CLOSED (no unregistered call sites) ───────────
@@ -121,7 +156,7 @@ if [[ "$actual" -ne "$expected" ]]; then
   flag "✗ call-site count $actual != census count $expected"
   note "    A count that drifted either way is a real change to which acks are durable."
 else
-  note "✓ $actual call site(s) across $expected censused file(s) — census closed"
+  note "✓ $actual call site(s) == $expected censused ack boundaries across ${#census_uniq[@]} file(s) — census closed"
 fi
 
 echo
@@ -161,7 +196,9 @@ ack_statement() {
   ' "$1"
 }
 
-for f in "${census_files[@]}"; do
+# Deduped: `census_files` has one entry per census LINE, so iterating it re-scanned
+# a multi-boundary file once per line and emitted its verdicts N times over.
+for f in ${census_uniq[@]+"${census_uniq[@]}"}; do
   [[ -f "$f" ]] || continue
   while IFS= read -r rec; do
     [[ -z "$rec" ]] && continue

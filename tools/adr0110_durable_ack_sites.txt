@@ -7,6 +7,12 @@
 #
 #   * a site that loses its `durable_ack()` call goes red (the regression that
 #     actually matters — a refactor silently un-durables invoicing);
+#   * a file whose call count no longer EQUALS the number of lines it has here
+#     goes red (CHECK D3-A is a per-file equality, not `>= 1`). Several files
+#     below carry three or four lines — one per ack BOUNDARY — and without the
+#     equality an ack could be moved from one censused file to another with the
+#     whole-tree total D3-B checks left intact. Adding or removing a boundary
+#     means editing this file, deliberately, in the same PR;
 #   * a NEW `durable_ack()` call site that is not listed here goes red, so
 #     growth is a deliberate, reviewed edit of this file and not a drive-by;
 #   * a site that KEEPS the call but SWALLOWS its error goes red (CHECK D3-C).
