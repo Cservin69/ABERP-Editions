@@ -410,6 +410,71 @@ fn ac6_named_families_are_protected_everywhere_not_only_under_a_tenant_home() {
     }
 }
 
+/// **The allow-list inversion is scoped to IMMEDIATE children of a tenant
+/// directory — and the contents of evidence directories are still protected.**
+///
+/// Evidence is written as a *sibling of the live DB*; it is never written
+/// inside a live working directory. A first cut applied the inversion at any
+/// depth, which made every file inside `ap-artifacts/`, `ncr-photos/`,
+/// `email-relay-attachments/` and `issued/` "protected evidence" — those
+/// directories are allow-listed but their CONTENTS are per-invoice/per-NCR
+/// files no list can enumerate. It would have frozen, among others, the
+/// incoming-invoice ingest's rollback cleanup of an orphaned artifact file.
+/// **A guard that blocks legitimate cleanup is a guard that gets switched
+/// off**, which is the worst outcome available here.
+///
+/// Depth is therefore governed by the family predicate alone — which now also
+/// matches on ANCESTOR components, so an evidence directory's contents stay
+/// protected. Both halves are asserted, because either one alone is a defect:
+/// too broad breaks working code, too narrow loses evidence.
+#[test]
+fn the_inversion_is_scoped_to_siblings_of_the_live_db() {
+    let home = Path::new("/Users/someone/.aberp-defense/defense");
+
+    // ── still protected: an unknown name SIBLING of the live DB ──
+    assert!(
+        is_protected_evidence(&home.join("whatever-2027-forensics")),
+        "the inversion must still cover immediate children — that is where every real \
+         evidence artefact on disk lives"
+    );
+
+    // ── NOT protected: legitimate contents of live working directories ──
+    for p in [
+        "ap-artifacts/inv-2026-001.xml",
+        "ncr-photos/NCR-17/front.jpg",
+        "email-relay-attachments/quote.pdf",
+        "issued/INV-001/input.json",
+    ] {
+        assert!(
+            !is_protected_evidence(&home.join(p)),
+            "ADR-0116 D2 — {p} is ordinary working data inside an allow-listed live \
+             directory, not recovery evidence. Freezing it blocks legitimate cleanup (the \
+             incoming-invoice ingest's rollback of an orphaned artifact, for one) and a guard \
+             that does that gets switched off."
+        );
+    }
+
+    // ── still protected: the CONTENTS of an evidence directory ──
+    //
+    // These file names carry no family token of their own; they are protected
+    // by their PARENT. Without the ancestor walk the guard would refuse a
+    // `remove_dir_all` of the directory while permitting an equivalent
+    // file-by-file walk — a difference no attacker or careless helper should
+    // be able to exploit.
+    for p in [
+        "_evidence-20260627/notes.md",
+        "_recovery-20260629/aberp.duckdb",
+        "RECOVERY-EVIDENCE-20260705T184449Z/mirror.jsonl",
+    ] {
+        assert!(
+            is_protected_evidence(&home.join(p)),
+            "ADR-0116 D2 — {p} sits inside a recovery-evidence DIRECTORY and must be protected \
+             by its ancestor, or the guard refuses the directory removal while permitting the \
+             file-by-file equivalent"
+        );
+    }
+}
+
 /// **The `.backup-` allow-list entry must not become an evidence escape.**
 ///
 /// `seller_toml_backup::prune_old_backups` enumerates a tenant home and

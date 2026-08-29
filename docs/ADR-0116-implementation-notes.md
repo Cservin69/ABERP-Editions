@@ -168,24 +168,30 @@ Said here rather than papered over.
    allow-list entry is pinned from both sides (the seller backup must be removable;
    `CORRUPT-BACKUP` / `INDEXDESYNC-BACKUP` must not be). **The allow-list entries are
    the risky half of an allow-list design — audit each one for what it un-protects.**
-3. **`LIVE_TENANT_NAMES` is a maintained list.** A new legitimate live filename nobody
+3. **The inversion is scoped to IMMEDIATE children of a tenant directory**, and depth is
+   governed by the family predicate alone (which matches on ancestor components too, so an
+   evidence directory's contents stay protected). A first cut applied it at any depth, which
+   made every file inside `ap-artifacts/`, `ncr-photos/`, `email-relay-attachments/` and
+   `issued/` "evidence" — freezing, among others, the incoming-invoice ingest's rollback
+   cleanup of an orphaned artifact. Both halves are pinned; check the boundary.
+4. **`LIVE_TENANT_NAMES` is a maintained list.** A new legitimate live filename nobody
    adds becomes "protected evidence" — the safe direction, but it accumulates, and a
    cleanup helper that starts refusing is a guard people switch off.
-4. **`LIVE_TRANSIENT_INFIXES` is the un-protecting half** and deserves the harder look:
+5. **`LIVE_TRANSIENT_INFIXES` is the un-protecting half** and deserves the harder look:
    the family predicate runs first, so an evidence-shaped name cannot be un-protected by
    a transient infix — but verify that ordering has not been inverted by a later edit.
-5. **The pre-restore snapshot extends the mirror**, and the e2e now asserts only
+6. **The pre-restore snapshot extends the mirror**, and the e2e now asserts only
    append-only + not-moved. Is there a mirror mutation the restore could make that this
    would not catch?
-6. **Drift #2 (the anchor sanction)** is the most consequential deviation and is the one
+7. **Drift #2 (the anchor sanction)** is the most consequential deviation and is the one
    to argue with directly if you disagree.
-7. **The D1.2 skip and the ADR-0095 §3 live checkpoint share a loop but must not
+8. **The D1.2 skip and the ADR-0095 §3 live checkpoint share a loop but must not
    share a condition.** The first cut of the skip `continue`d past
    `live_checkpoint_logged`, silently un-wiring the live-file durable checkpoint on
    every skipped tick — and precisely in the configuration this ADR sets up, where a
    scheduled floor satisfies the staleness window most ticks. Fixed, and called out
    here because it is the kind of coupling that reads as correct.
-8. **`store_is_stale` uses the newest snapshot valid-or-not.** A DB that fails validation
+9. **`store_is_stale` uses the newest snapshot valid-or-not.** A DB that fails validation
    every cycle therefore suppresses retries for a full interval. Deliberate (avoids a
    snapshot storm on a broken DB), but it means a broken tenant produces one failed
    forensic snapshot per interval rather than a burst — check that is what you want.

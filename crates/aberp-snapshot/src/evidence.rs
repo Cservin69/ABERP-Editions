@@ -178,30 +178,49 @@ const RECOVERY_DIR_PREFIX: &str = "aberp-recovery-";
 /// become "gone" via a second pass.
 const ARCHIVE_DIR_PREFIX: &str = "aberp-evidence";
 
-/// `true` if `path` sits inside a live tenant home
-/// (`~/.aberp*/<tenant>/…` — prod's `.aberp` or an edition's
-/// `.aberp-defense` / `.aberp-portable`).
-///
-/// HOME-independent by construction: it matches on the path SHAPE (a
-/// component beginning `.aberp`, with at least a tenant segment and one more
-/// component after it), so it is pure, total, and testable without touching
-/// a real home directory.
-pub fn path_is_under_tenant_home(path: &Path) -> bool {
-    let comps: Vec<&std::ffi::OsStr> = path
-        .components()
+/// Normalised path components (`Normal` segments only), lowercased.
+fn lower_components(path: &Path) -> Vec<String> {
+    path.components()
         .filter_map(|c| match c {
-            Component::Normal(s) => Some(s),
+            Component::Normal(s) => s.to_str().map(|s| s.to_ascii_lowercase()),
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+/// `true` if `path` is an **IMMEDIATE CHILD** of a live tenant directory
+/// (`~/.aberp*/<tenant>/<name>` — prod's `.aberp` or an edition's
+/// `.aberp-defense` / `.aberp-portable`).
+///
+/// HOME-independent by construction: it matches on the path SHAPE, so it is
+/// pure, total, and testable without touching a real home directory.
+///
+/// # Why IMMEDIATE, and not "anywhere below"
+///
+/// The allow-list inversion — *anything not known-live is evidence* — is only
+/// sound where evidence actually lives, and evidence is written as a
+/// **sibling of the live DB**: `aberp.duckdb.CORRUPT-<tag>`,
+/// `aberp.duckdb.audit.log.corrupt-<nanos>.bak`, `_evidence-<date>/`. It is
+/// never written *inside* a live working directory.
+///
+/// A first cut matched at any depth, which made every file inside
+/// `ap-artifacts/`, `ncr-photos/`, `email-relay-attachments/` and `issued/`
+/// "protected evidence" — those directories are on the live allow-list but
+/// their CONTENTS are per-invoice/per-NCR files that no list can enumerate. It
+/// would have frozen, among others, the incoming-invoice ingest's rollback
+/// cleanup of an orphaned artifact file. A guard that blocks legitimate
+/// cleanup is a guard that gets switched off, which is the worst outcome
+/// available here.
+///
+/// Depth below a tenant directory is therefore governed by the FAMILY
+/// predicate alone ([`name_is_evidence_shaped`], which also matches on any
+/// ancestor component) — so `_evidence-20260627/notes.md` stays protected via
+/// its parent, while `ap-artifacts/inv-123.xml` does not.
+pub fn path_is_under_tenant_home(path: &Path) -> bool {
+    let comps = lower_components(path);
     for (i, c) in comps.iter().enumerate() {
-        let is_root = c
-            .to_str()
-            .is_some_and(|s| s.to_ascii_lowercase().starts_with(".aberp"));
-        // The root itself is index i, the tenant i+1, the artefact i+2 —
-        // so a path is "under a tenant home" once it has something inside
-        // the tenant directory.
-        if is_root && comps.len() >= i + 3 {
+        // root at i, tenant at i+1, the artefact at i+2 — and NOTHING after.
+        if c.starts_with(".aberp") && comps.len() == i + 3 {
             return true;
         }
     }
@@ -235,6 +254,20 @@ pub fn name_is_evidence_shaped(name: &str) -> bool {
         || EVIDENCE_SUFFIXES.iter().any(|f| lower.ends_with(f))
 }
 
+/// `true` if the name of `path` — **or of any directory above it** — is
+/// evidence-shaped.
+///
+/// The ancestor walk is what keeps the CONTENTS of an evidence directory
+/// protected once the inversion stopped applying at depth: `_evidence-20260627`
+/// and `RECOVERY-EVIDENCE-<tag>` are directories on disk, and a guard that
+/// protected the directory but not the files inside it would refuse the
+/// `remove_dir_all` while permitting an equivalent file-by-file walk.
+fn path_is_evidence_shaped(path: &Path) -> bool {
+    lower_components(path)
+        .iter()
+        .any(|c| name_is_evidence_shaped(c))
+}
+
 /// `true` if the file NAME is a known-live tenant artefact — either an exact
 /// [`LIVE_TENANT_NAMES`] entry or a code-owned transient
 /// ([`LIVE_TRANSIENT_INFIXES`]). Case-insensitive.
@@ -264,9 +297,11 @@ pub fn is_protected_evidence(path: &Path) -> bool {
         // something this guard can reason about. Refuse to bless it.
         return true;
     };
-    // (2) — family match applies everywhere, including the snapshot store
-    // and any side path an operator restored into.
-    if name_is_evidence_shaped(name) {
+    // (2) — family match applies everywhere, including the snapshot store and
+    // any side path an operator restored into, and to every ANCESTOR
+    // directory: the contents of `_evidence-<date>/` are evidence even though
+    // their own file names carry no family token.
+    if path_is_evidence_shaped(path) {
         return true;
     }
     // (1) — allow-list inversion, scoped to the homes/roots where evidence
