@@ -36,6 +36,20 @@
 #     system would put the cost on paths that do not carry the risk. The scope
 #     came from ONE incident.
 #
+# ── ADR-0116 D3.5 — why a RESTORE row is on this list ─────────────────────
+# It is not a money path, and it is here anyway. ADR-0116 D3.1 made the restore
+# INSTALL durable (it was the one file-install path in the tree with no fsync at
+# all). That created an asymmetry: the restored FILE is now in the power-loss
+# durable set while the audit row recording the restore is not — `Ledger::open`
+# sets only `disable_checkpoint_on_shutdown`, and `append` commits without a
+# flush. A power cut moments after a restore would therefore leave a
+# **silently-restored database**: the file is the snapshot's, and nothing in the
+# ledger says why or from what. That is the same class of consequence the money
+# paths are on this list for — an operator told an irreversible thing succeeded
+# — so it takes the same ack. The CLI arm is covered inside `emit_reopen_cli`
+# (a separate process with no Handle); the line below is the in-process
+# operator-UI HTTP arm.
+#
 # DEFENSE DIVERGENCE (read before reasoning from the Portable ADR).
 # On Portable the standing warning is "H4 — still unbuilt — is what would cover
 # the rest". That is FALSE here and the sentence has been removed rather than
@@ -49,6 +63,9 @@
 # DEFAULT_MIN_CHECKPOINT_INTERVAL (60s) rather than not at all. D3 exists here
 # to close the *window* on money paths (ack-time vs up-to-60s-later), not to
 # substitute for a checkpoint that does not exist.
+
+apps/aberp/src/snapshot.rs	restore_and_emit	"snapshot restored" (ADR-0116 D3.5 — the row recording an irreversible DB replacement)
+
 
 # ── D-22 (ADR-0114, 2026-08-26): the NAV money-submission CLI paths joined ────
 #

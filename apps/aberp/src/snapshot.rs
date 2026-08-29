@@ -794,6 +794,24 @@ pub fn restore_and_emit(
         actor,
     )
     .map_err(|e| anyhow::anyhow!("append SnapshotRestored: {e}"))?;
+    // ADR-0116 D3.5 — **the restore row must be durably acked, on BOTH routing
+    // arms.** The CLI arm acks inside `emit_reopen_cli`; the in-process arm
+    // (the operator-UI HTTP route) is acked here.
+    //
+    // Without it, post-D3.1 the restored FILE is durable while the row
+    // recording the restore is not — a power cut moments later leaves a
+    // **silently-restored database**: the DB is the snapshot's, and nothing in
+    // the ledger says why or from what.
+    //
+    // Called AFTER the append has fully returned, so the WriteGuard is dropped
+    // and the writer mutex is free — it is not reentrant, and acking under a
+    // live guard would self-deadlock. Per the D3 contract this is PROPAGATED,
+    // never downgraded to a `warn!` (cut-gate CHECK D3-C).
+    if let SnapshotAudit::Handle(handle) = audit {
+        handle
+            .durable_ack()
+            .map_err(|e| anyhow::anyhow!("durable ack of the SnapshotRestored row: {e}"))?;
+    }
     tracing::info!(seq = rec.meta.seq, target = %target.display(), "snapshot restored");
     Ok(rec)
 }
