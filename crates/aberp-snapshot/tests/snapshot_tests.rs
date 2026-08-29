@@ -98,6 +98,7 @@ fn record(seq: u64, created_at: OffsetDateTime, valid: bool) -> SnapshotRecord {
     SnapshotRecord {
         dir: PathBuf::from(format!("/nonexistent/snap-{seq}")),
         meta: SnapshotMeta {
+            meta_version: 2,
             seq,
             created_at,
             source_db_sha256: "deadbeef".into(),
@@ -107,6 +108,8 @@ fn record(seq: u64, created_at: OffsetDateTime, valid: bool) -> SnapshotRecord {
             audit_count: 1,
             chain_len: 1,
             validation_error: None,
+            anchor_count: -1,
+            anchored_through_seq: None,
         },
     }
 }
@@ -271,6 +274,11 @@ fn retention_keeps_last_n_and_prunes_older() {
         keep_last: 24,
         daily_days: 0,
         weekly_weeks: 0,
+        // ADR-0116 G8 — this test predates forensic retention of FAILED
+        // snapshots and uses an all-valid fixture, so 0/0 preserves its
+        // exact original intent. The G8 rule has its own tests below.
+        keep_failed: 0,
+        keep_failed_days: 0,
     };
     let base = datetime!(2026-05-01 00:00:00 UTC);
     let records: Vec<SnapshotRecord> = (1..=30)
@@ -294,6 +302,11 @@ fn retention_never_prunes_newest_valid() {
         keep_last: 0,
         daily_days: 0,
         weekly_weeks: 0,
+        // ADR-0116 G8 — this test predates forensic retention of FAILED
+        // snapshots and uses an all-valid fixture, so 0/0 preserves its
+        // exact original intent. The G8 rule has its own tests below.
+        keep_failed: 0,
+        keep_failed_days: 0,
     };
     let base = datetime!(2026-05-01 00:00:00 UTC);
     let records: Vec<SnapshotRecord> = (1..=5)
@@ -314,6 +327,11 @@ fn retention_keeps_one_per_day_within_window() {
         keep_last: 0,
         daily_days: 10,
         weekly_weeks: 0,
+        // ADR-0116 G8 — this test predates forensic retention of FAILED
+        // snapshots and uses an all-valid fixture, so 0/0 preserves its
+        // exact original intent. The G8 rule has its own tests below.
+        keep_failed: 0,
+        keep_failed_days: 0,
     };
     let mut records = Vec::new();
     let mut seq = 0;
@@ -337,9 +355,25 @@ fn retention_keeps_one_per_day_within_window() {
     assert!(plan.prune.contains(&2));
 }
 
+/// **ADR-0116 G8 reversed this test's original assertion, deliberately.**
+///
+/// It used to assert `plan.prune.contains(&3)` — that a snapshot which failed
+/// validation is deleted. That is the defect G8 names: `run_cycle` calls
+/// `take_and_emit` then `retention_and_emit` in the SAME cycle, so a snapshot
+/// that fails `validate_export` is written to disk and deleted milliseconds
+/// later. **Prod lost real forensic evidence to it twice** — on 2026-07-08 a
+/// snapshot caught a live audit-chain defect ("out of order: expected
+/// seq=7995, found seq=7994") and the system destroyed the only artefact of
+/// it in the same cycle; again on 2026-07-09. All that survives is the error
+/// string in the audit payload, and because the seq was recycled even the
+/// identifier is ambiguous.
+///
+/// Both halves are pinned here so the change stays visible: under the DEFAULT
+/// policy the failed snapshot is now KEPT, and under an explicitly disabled
+/// forensic policy the old behaviour is unchanged (proving the new rule is
+/// what does the keeping, not an unrelated floor).
 #[test]
-fn retention_prunes_invalid_but_keeps_newest_valid() {
-    let policy = RetentionPolicy::default();
+fn retention_keeps_failed_snapshots_as_forensic_evidence_g8() {
     let base = datetime!(2026-06-15 00:00:00 UTC);
     // seq 3 (newest) is INVALID; seq 2 valid; seq 1 valid.
     let records = vec![
@@ -348,10 +382,32 @@ fn retention_prunes_invalid_but_keeps_newest_valid() {
         record(3, base + time::Duration::hours(3), false),
     ];
     let now = base + time::Duration::hours(4);
-    let plan = plan_retention(&records, &policy, now);
-    // The invalid newest (seq 3) is pruned; newest VALID (seq 2) kept.
-    assert!(plan.keep.contains(&2));
-    assert!(plan.prune.contains(&3), "invalid snapshot pruned");
+
+    let plan = plan_retention(&records, &RetentionPolicy::default(), now);
+    // Newest VALID is still sacred — G8 does not displace it.
+    assert!(plan.keep.contains(&2), "newest valid still kept: {plan:?}");
+    // …and the FAILED snapshot survives the cycle that produced it.
+    assert!(
+        plan.keep.contains(&3),
+        "ADR-0116 G8 — a snapshot that failed validation is the highest-value forensic \
+         artefact the subsystem produces and must NOT be pruned by the cycle that made it: \
+         {plan:?}"
+    );
+    assert!(!plan.prune.contains(&3));
+
+    // With the forensic windows explicitly zeroed, the pre-G8 behaviour is
+    // restored — so the keep above is attributable to the new rule alone.
+    let no_forensics = RetentionPolicy {
+        keep_failed: 0,
+        keep_failed_days: 0,
+        ..RetentionPolicy::default()
+    };
+    let plan = plan_retention(&records, &no_forensics, now);
+    assert!(
+        plan.prune.contains(&3),
+        "with keep_failed=0/keep_failed_days=0 the invalid snapshot is pruned again, which \
+         is what proves the G8 rule is doing the work above: {plan:?}"
+    );
 }
 
 #[test]

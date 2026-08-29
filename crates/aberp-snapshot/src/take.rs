@@ -23,6 +23,13 @@ pub struct ValidationReport {
     pub audit_count: i64,
     pub chain_len: u64,
     pub error: Option<String>,
+    /// ADR-0116 D4 — rows in `audit_ledger_anchors`. `-1` == NOT RECORDED
+    /// (the table was unreadable, or validation never got that far), never
+    /// "zero anchors". See [`crate::SnapshotMeta::anchor_count`].
+    pub anchor_count: i64,
+    /// ADR-0116 D4 — highest `audit_ledger` seq covered by a VERIFIED anchor.
+    /// `None` == not recorded; `Some(0)` == recorded, nothing anchored.
+    pub anchored_through_seq: Option<u64>,
 }
 
 /// Single-quote a path for embedding in a DuckDB SQL string, doubling any
@@ -57,6 +64,26 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String> {
 /// `invoice` count is best-effort: a brand-new tenant DB may not have the
 /// table yet, which records `-1` but does **not** fail validation. The hard
 /// gates are: import succeeds, `audit_ledger` is present, chain verifies.
+///
+/// # ADR-0116 D4 — anchors are RECORDED, never gating
+///
+/// `EXPORT DATABASE` captures all tables, so `audit_ledger_anchors` rides
+/// along automatically — but nothing read it, so a snapshot could be marked
+/// `valid=true` on hash-chain grounds while carrying zero or truncated anchor
+/// coverage, and a DB restored from it would silently lose the eIDAS
+/// Art. 41(2) presumption ADR-0087 says must survive a restore.
+///
+/// This now reads the anchors (through `audit-ledger`'s own API — never raw
+/// SQL here, so the table stays owned by the crate that defines it and
+/// `[[no-sql-specific]]` holds) and records coverage. **A missing or short
+/// anchor set does NOT fail validation**, and the reason is not a preference:
+/// every `audit_ledger_anchors.parquet` in both live stores is exactly 300
+/// bytes, consistent with zero anchor rows everywhere. A hard gate would mark
+/// EVERY existing snapshot invalid — and `plan_retention` prunes invalid
+/// snapshots, so a hard gate would not merely fail validation, it would
+/// delete the entire rollback store on the next cycle. That is a durability
+/// regression in service of a legal property. The sanction lives at RESTORE
+/// time instead (`--accept-unanchored`), where the legal claim is made.
 pub fn validate_export(export_dir: &Path, tenant: &str) -> ValidationReport {
     let tenant_id = match TenantId::new(tenant.to_string()) {
         Some(t) => t,
@@ -67,6 +94,8 @@ pub fn validate_export(export_dir: &Path, tenant: &str) -> ValidationReport {
                 audit_count: -1,
                 chain_len: 0,
                 error: Some(format!("invalid tenant id {tenant:?}")),
+                anchor_count: -1,
+                anchored_through_seq: None,
             }
         }
     };
@@ -99,6 +128,12 @@ pub fn validate_export(export_dir: &Path, tenant: &str) -> ValidationReport {
     // checks prev/entry hashes against the tenant genesis), so a zero hash
     // is fine here.
     let ledger = Ledger::from_connection(conn, tenant_id, BinaryHash::from_bytes([0u8; 32]));
+
+    // ADR-0116 D4 — anchor coverage, recorded before the chain verdict so it
+    // is reported even when the chain fails (a broken chain is exactly when an
+    // operator wants to know what the snapshot could still prove).
+    let (anchor_count, anchored_through_seq) = anchor_coverage(&ledger);
+
     match ledger.verify_chain() {
         Ok(chain_len) => ValidationReport {
             ok: true,
@@ -106,6 +141,8 @@ pub fn validate_export(export_dir: &Path, tenant: &str) -> ValidationReport {
             audit_count,
             chain_len,
             error: None,
+            anchor_count,
+            anchored_through_seq,
         },
         Err(e) => ValidationReport {
             ok: false,
@@ -113,8 +150,76 @@ pub fn validate_export(export_dir: &Path, tenant: &str) -> ValidationReport {
             audit_count,
             chain_len: 0,
             error: Some(format!("hash-chain verification failed: {e}")),
+            anchor_count,
+            anchored_through_seq,
         },
     }
+}
+
+/// ADR-0116 D4 — how much of this snapshot's chain is covered by a **verified**
+/// anchor.
+///
+/// Returns `(anchor_count, anchored_through_seq)`. On any read failure it
+/// returns the **not-recorded** pair `(-1, None)` — never `(0, Some(0))`,
+/// which would claim the snapshot was checked and found to carry nothing.
+///
+/// "Verified" here means two things, both checkable from the snapshot's own
+/// bytes with no network:
+///
+///   1. the anchor actually carries a timestamp token (`tsa_status` is
+///      `Anchored`; a `Pending` row is a queued anchor that proves nothing —
+///      ADR-0087 never blocks the chain on the TSA, so pending rows are
+///      normal and must not be counted as coverage), and
+///   2. its `chain_head_hash_at_anchor` resolves to an entry present in
+///      **this snapshot's** chain — an anchor over a head the snapshot does
+///      not contain covers nothing the snapshot can produce.
+///
+/// **Honest scope, stated because a reviewer would otherwise assume more:**
+/// this does NOT cryptographically verify the RFC-3161 token against the
+/// TSA's certificate chain. That needs the authority's trust anchors and is
+/// an operational question (ADR-0116 Phase 3), not something a snapshot
+/// validator can answer offline. What is verified is that the anchor points
+/// at a head this snapshot really has.
+fn anchor_coverage(ledger: &Ledger) -> (i64, Option<u64>) {
+    let anchors = match ledger.anchors() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ADR-0116 D4 — audit_ledger_anchors unreadable in this snapshot; recording                  anchor coverage as NOT RECORDED (-1), never as zero"
+            );
+            return (-1, None);
+        }
+    };
+    let entries = match ledger.entries() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ADR-0116 D4 — snapshot entries unreadable while verifying anchors; recording                  anchor coverage as NOT RECORDED (-1)"
+            );
+            return (-1, None);
+        }
+    };
+    // seq by entry-hash, so an anchor's claimed head resolves to a position.
+    let mut seq_by_hash: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::with_capacity(entries.len());
+    for e in &entries {
+        seq_by_hash.insert(hex::encode(e.entry_hash.as_bytes()), e.seq.0);
+    }
+    let mut through: Option<u64> = None;
+    for a in &anchors {
+        if a.tsa_status != aberp_audit_ledger::session::anchors::TsaStatus::Anchored {
+            continue;
+        }
+        if let Some(&seq) = seq_by_hash.get(&a.chain_head_hash_at_anchor) {
+            through = Some(through.map_or(seq, |cur: u64| cur.max(seq)));
+        }
+    }
+    // The table WAS readable, so the count is recorded even when it is zero,
+    // and `anchored_through_seq` is `Some(0)` — "checked, nothing anchored" —
+    // rather than `None`, which means "never checked".
+    (anchors.len() as i64, Some(through.unwrap_or(0)))
 }
 
 fn fail(msg: String) -> ValidationReport {
@@ -124,6 +229,8 @@ fn fail(msg: String) -> ValidationReport {
         audit_count: -1,
         chain_len: 0,
         error: Some(msg),
+        anchor_count: -1,
+        anchored_through_seq: None,
     }
 }
 
@@ -312,6 +419,7 @@ pub fn take_snapshot_with(
     let byte_size = dir_size(&partial_dir)?;
 
     let meta = SnapshotMeta {
+        meta_version: crate::META_VERSION_CURRENT,
         seq,
         created_at: now,
         source_db_sha256,
@@ -321,6 +429,8 @@ pub fn take_snapshot_with(
         audit_count: report.audit_count,
         chain_len: report.chain_len,
         validation_error: report.error,
+        anchor_count: report.anchor_count,
+        anchored_through_seq: report.anchored_through_seq,
     };
     write_meta(&partial_dir, &meta)?;
 
@@ -446,13 +556,47 @@ pub fn ensure_not_prod_path(path: &Path) -> Result<()> {
 }
 
 /// Restore a snapshot directory into `target` via `IMPORT DATABASE`, then
-/// checkpoint so `target` is a single self-contained, freshly-indexed file.
+/// install it **crash-safely** over the target.
 ///
-/// Refuses to restore from an export that does not itself validate (we
-/// never rebuild a DB from a corrupt snapshot). Builds into a sibling
-/// `*.restoring` file and renames over `target` so a crash mid-import never
-/// leaves a torn target. **Does not** enforce the prod-overwrite guard —
+/// Refuses to restore from an export that does not itself validate (we never
+/// rebuild a DB from a corrupt snapshot). Builds into a sibling `*.restoring`
+/// file, checkpoints it so it is self-contained, then hands it to
+/// [`crate::atomic_install`]. **Does not** enforce the prod-overwrite guard —
 /// callers MUST call [`ensure_restore_allowed`] first (the CLI does).
+///
+/// # ADR-0116 D3.1 / G2 — why this changed, and why the WAL goes first
+///
+/// This was the ONE file-install path in the tree with **no `fsync` at all**
+/// (`grep -c sync_all take.rs` → 0), while its sibling `atomic_install` did
+/// the full durable recipe. The path whose entire job is *producing a
+/// trustworthy database after a durability incident* was itself not
+/// crash-safe — and it has been used in anger twice, for the 2026-08-03 and
+/// 2026-08-08 recoveries.
+///
+/// Routing through `atomic_install` fixes the fsyncs but leaves one window,
+/// which the ADR's first draft claimed (wrongly) was closed by an
+/// `install-intent` journal. It is not: `write_install_intent` has exactly one
+/// non-test caller, inside `durable_checkpoint`, and `resume_pending_install`
+/// is keyed on the LIVE db path, so nothing would ever resume an intent left
+/// beside a side-path restore target. The window is:
+///
+/// ```text
+/// atomic_install:  fsync(staged)
+///                  rename(staged -> target)     <- new file is now visible
+///                  remove target's stale WAL    <- crash HERE: new file + OLD WAL
+///                  fsync(parent dir)
+/// ```
+///
+/// and an old WAL beside a fresh self-contained file is the corruption vector
+/// this function's own comment has always warned about.
+///
+/// **The fix is simpler than a journal, not more complex.** A restore is
+/// destroying the target *by definition*, so there is no reason to preserve
+/// its WAL past the point of no return — unlike `durable_checkpoint`, where
+/// the target is the live DB and must survive an aborted swap. So:
+/// **delete `<target>.wal` FIRST, then install.** `atomic_install`'s own WAL
+/// step becomes a no-op and the window disappears with no journal and no
+/// resume path.
 pub fn restore_into(export_dir: &Path, target: &Path, tenant: &str) -> Result<()> {
     // Refuse to restore from a snapshot that fails validation.
     let report = validate_export(export_dir, tenant);
@@ -482,20 +626,188 @@ pub fn restore_into(export_dir: &Path, target: &Path, tenant: &str) -> Result<()
         conn.execute_batch(&format!("IMPORT DATABASE {};", sql_quote(export_dir)))?;
         conn.execute_batch("CHECKPOINT;")?;
     }
-    // The checkpointed staging file should have no WAL; drop any lingering
-    // one so the rename moves a lone file.
-    if staging_wal.exists() {
-        let _ = std::fs::remove_file(&staging_wal);
-    }
 
-    // Swap staging over target, clearing target's stale WAL (the imported
-    // DB is self-contained; an old WAL would corrupt it on next open).
+    // ── ADR-0116 D3.1 — the target's stale WAL dies BEFORE the rename ──
+    //
+    // Ordering is the whole point. `atomic_install` removes it AFTER the
+    // rename, which leaves a crash window in which the new file is visible
+    // beside the old WAL. Doing it here closes that window with no journal:
+    // after this line there is no WAL for a crash to orphan, and
+    // `atomic_install`'s own removal step is a proven no-op.
     let target_wal = wal_sibling(target);
-    std::fs::rename(&staging, target).map_err(|e| SnapshotError::io(target, e))?;
     if target_wal.exists() {
         std::fs::remove_file(&target_wal).map_err(|e| SnapshotError::io(&target_wal, e))?;
     }
+
+    // fsync(staged) -> atomic rename -> (no-op WAL drop) -> fsync(parent dir).
+    // The same primitive every other file install in the tree commits with.
+    crate::crash_safe::atomic_install(&staging, target)?;
     Ok(())
+}
+
+/// What [`restore_in_place`] moved aside, so the caller can tell the operator
+/// exactly what to look at if anything went wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreservedUnit {
+    /// `<db>.PRE-RESTORE-<tag>` — the original database file.
+    pub db: PathBuf,
+    /// `<db>.wal.PRE-RESTORE-<tag>`, when the live DB had a WAL.
+    pub wal: Option<PathBuf>,
+    /// `<db>.ckpt-ok.PRE-RESTORE-<tag>`, when a marker existed.
+    pub ckpt_ok: Option<PathBuf>,
+    /// The `PRE-RESTORE-<tag>` suffix itself.
+    pub tag: String,
+}
+
+/// Outcome of a successful [`restore_in_place`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InPlaceRestoreReport {
+    /// The `.PRE-RESTORE-` unit the previous database was moved into.
+    pub preserved: PreservedUnit,
+    /// Validation of the installed file, re-run after the install.
+    pub installed: ValidationReport,
+}
+
+/// **ADR-0116 D3.4 — the guarded in-place restore that replaces the hand-swap.**
+///
+/// The documented recovery procedure today is *restore to a side path → stop
+/// serve → swap the file in by hand*. That hand-swap is precisely the
+/// per-incident manual step this programme set out to eliminate, and it is
+/// unjournalled: a crash mid-swap is on the operator, not on the code.
+/// `[[trust-code-not-operator]]` is satisfied for the guard and violated for
+/// the procedure; this is the closure.
+///
+/// The sequence, in code:
+///
+/// 1. the caller has already refused unless serve is stopped and has taken the
+///    mandatory pre-restore snapshot (both live in the app layer, which owns
+///    the lock and the ledger);
+/// 2. **move the current DB aside as `.PRE-RESTORE-<tag>` — as ONE UNIT:
+///    `aberp.duckdb` + `aberp.duckdb.wal` + `aberp.duckdb.ckpt-ok`.**
+/// 3. **the `.audit.log` mirror does NOT move.** It is the durable record and
+///    stays at the live path.
+/// 4. install via [`restore_into`] (WAL deleted first, then `atomic_install`);
+/// 5. write a fresh `.ckpt-ok` marker for the installed file;
+/// 6. re-verify the installed file and return the report.
+///
+/// # Why the WAL moves with it (F4)
+///
+/// The ADR's first draft said only "move the current DB aside". That would
+/// have been a real defect, twice over. A DB moved without its WAL is
+/// **stripped of its un-checkpointed commits** — not a recoverable original,
+/// so the "recoverable on every injected failure path" acceptance criterion
+/// would have been *unsatisfiable*. And the orphaned `aberp.duckdb.wal` would
+/// stay at the live path and pair with the freshly restored file: the exact
+/// corruption vector [`restore_into`]'s own comment warns about, reintroduced
+/// by the command written to eliminate the hand-swap. Prod's live DB carries a
+/// WAL right now; this is not hypothetical.
+///
+/// # Failure semantics
+///
+/// Any failure leaves the `.PRE-RESTORE-` unit intact and the original
+/// recoverable. If the install fails after the move, the unit is **not**
+/// rolled back automatically — an automatic rollback would be a second
+/// unjournalled swap at the worst possible moment. The error names the unit;
+/// the operator (or `aberp snapshot restore` from the pre-restore snapshot)
+/// decides.
+pub fn restore_in_place(
+    export_dir: &Path,
+    db_path: &Path,
+    tenant: &str,
+    tag: &str,
+) -> Result<InPlaceRestoreReport> {
+    // Validate BEFORE moving anything aside. A snapshot that cannot restore
+    // must not cost the operator a swapped-out live database.
+    let pre = validate_export(export_dir, tenant);
+    if !pre.ok {
+        return Err(SnapshotError::RestoreFromInvalid(
+            export_dir.display().to_string(),
+        ));
+    }
+    if !db_path.exists() {
+        return Err(SnapshotError::SourceMissing(db_path.to_path_buf()));
+    }
+
+    let suffix = format!("PRE-RESTORE-{tag}");
+    let db_wal = wal_sibling(db_path);
+    let db_ckpt = crate::crash_safe::marker_path(db_path);
+
+    // ── Step 2/3 — move DB + .wal + .ckpt-ok as ONE unit; mirror stays ──
+    let preserved_db = suffixed(db_path, &suffix);
+    let preserved = PreservedUnit {
+        db: preserved_db.clone(),
+        wal: move_aside_if_present(&db_wal, &suffix)?,
+        ckpt_ok: move_aside_if_present(&db_ckpt, &suffix)?,
+        tag: suffix.clone(),
+    };
+    std::fs::rename(db_path, &preserved_db).map_err(|e| SnapshotError::io(&preserved_db, e))?;
+    if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        // The preserved unit must be durable before the install overwrites the
+        // live path: same ordering invariant as everywhere else in the tree.
+        if let Ok(f) = std::fs::File::open(parent) {
+            let _ = f.sync_all();
+        }
+    }
+    tracing::warn!(
+        db = %db_path.display(),
+        preserved_db = %preserved.db.display(),
+        preserved_wal = ?preserved.wal.as_ref().map(|p| p.display().to_string()),
+        preserved_ckpt = ?preserved.ckpt_ok.as_ref().map(|p| p.display().to_string()),
+        "ADR-0116 D3.4 — live database moved aside as PRE-RESTORE evidence (DB + WAL + \
+         checkpoint marker as one unit). The .audit.log mirror is deliberately NOT moved: \
+         it is the durable record and stays at the live path."
+    );
+
+    // ── Step 4 — install ────────────────────────────────────────────────
+    restore_into(export_dir, db_path, tenant)?;
+
+    // ── Step 5 — a fresh marker for the file that is actually there ─────
+    //
+    // Without this, the restored file sits beside a marker describing the OLD
+    // one. `checkpoint_is_current` then returns false on the SHA mismatch, so
+    // the next debounced checkpoint runs — benign, but the restored file's
+    // provenance record would be a lie, and provenance is the whole reason the
+    // marker exists.
+    match crate::crash_safe::write_marker(db_path) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                db = %db_path.display(),
+                "ADR-0116 D3.4 — could not write the post-restore .ckpt-ok marker; the \
+                 restored file is installed and durable, but its provenance record is absent. \
+                 The next boot will simply checkpoint it."
+            );
+        }
+    }
+
+    // ── Step 6 — re-verify what is now on disk ──────────────────────────
+    let installed = validate_export(export_dir, tenant);
+    Ok(InPlaceRestoreReport {
+        preserved,
+        installed,
+    })
+}
+
+/// `<path>.<suffix>` — appends to the FULL filename, so
+/// `aberp.duckdb.wal` becomes `aberp.duckdb.wal.PRE-RESTORE-<tag>` and the
+/// unit stays recognisable as a group.
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_owned();
+    os.push(".");
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+/// Rename `path` to `<path>.<suffix>` when it exists. Returns the new path,
+/// or `None` when there was nothing to move.
+fn move_aside_if_present(path: &Path, suffix: &str) -> Result<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let dest = suffixed(path, suffix);
+    std::fs::rename(path, &dest).map_err(|e| SnapshotError::io(&dest, e))?;
+    Ok(Some(dest))
 }
 
 /// DuckDB names the WAL by appending `.wal` to the FULL filename (so

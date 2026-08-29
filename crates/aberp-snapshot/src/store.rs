@@ -215,23 +215,90 @@ pub fn list_snapshots(store_dir: &Path) -> Result<Vec<SnapshotRecord>> {
     Ok(out)
 }
 
-/// Find a snapshot by seq (`"42"`) or by exact directory name
-/// (`"snap-42-20260615-143000"`). Used by the restore CLI.
-pub fn find_snapshot(store_dir: &Path, selector: &str) -> Result<SnapshotRecord> {
+/// ADR-0116 D3.3 / G6 — a snapshot's STABLE identity.
+///
+/// `seq` alone is not one. `next_seq` is `max(surviving seq) + 1`, so a
+/// pruned seq is **recycled**: seq 24 names three different snapshots in
+/// prod's ledger, two of which are the `validation_failed` pair. A
+/// `seq`-addressed restore CLI is therefore ambiguous *by construction*, and
+/// the ambiguity is worst exactly where it hurts most — around failed and
+/// pruned snapshots.
+///
+/// The identity is the triple `(seq, created_at, source_db_sha256)`. It is
+/// what `--dry-run` prints, what the audit payloads record, what `list`
+/// shows, and what a selector must resolve to exactly one of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotSelector {
+    /// The operator-typed string, kept verbatim for error messages.
+    pub raw: String,
+}
+
+/// Render a snapshot's stable identity as a single human/machine token:
+/// `<seq>@<created_at>#<sha8>`. Unambiguous across a recycled seq, and short
+/// enough to paste into a restore command.
+pub fn snapshot_identity(meta: &SnapshotMeta) -> String {
+    let ts = meta
+        .created_at
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| meta.created_at.unix_timestamp().to_string());
+    let sha8: String = meta.source_db_sha256.chars().take(8).collect();
+    format!("{}@{}#{}", meta.seq, ts, sha8)
+}
+
+/// Resolve `selector` against the store's snapshots and **refuse on
+/// ambiguity** (ADR-0116 D3.3).
+///
+/// Accepted forms, tried in order — the first form that matches ANY record
+/// decides, and if that form matches more than one the call REFUSES rather
+/// than silently taking the newest:
+///
+///   1. the full directory name — `snap-42-20260615-143000` (always unique
+///      on a filesystem, so this is the form to prefer);
+///   2. the stable identity token from [`snapshot_identity`] — `42@<ts>#<sha8>`
+///      — or any unambiguous prefix of it;
+///   3. a bare `seq` — **ambiguous after a prune**, so this refuses whenever
+///      two records share the seq;
+///   4. a timestamp substring.
+///
+/// A form that matches nothing falls through to the next; a form that matches
+/// several returns [`SnapshotError::AmbiguousSelector`] naming every
+/// candidate by its full identity, so the operator can retry with one.
+pub fn resolve_selector(store_dir: &Path, selector: &str) -> Result<SnapshotRecord> {
     let records = list_snapshots(store_dir)?;
+    resolve_selector_in(&records, selector)
+}
+
+/// [`resolve_selector`] over an already-listed set — pure, so the
+/// recycled-seq behaviour is testable without a filesystem.
+pub fn resolve_selector_in(records: &[SnapshotRecord], selector: &str) -> Result<SnapshotRecord> {
+    // (1) exact directory name.
+    let by_dir: Vec<&SnapshotRecord> = records
+        .iter()
+        .filter(|r| r.dir.file_name().and_then(|n| n.to_str()) == Some(selector))
+        .collect();
+    if let Some(one) = pick_one(&by_dir, selector)? {
+        return Ok(one);
+    }
+
+    // (2) the stable identity token (or a prefix of it).
+    let by_identity: Vec<&SnapshotRecord> = records
+        .iter()
+        .filter(|r| snapshot_identity(&r.meta).starts_with(selector))
+        .collect();
+    if let Some(one) = pick_one(&by_identity, selector)? {
+        return Ok(one);
+    }
+
+    // (3) a bare seq — the recycled-identity trap. Two records CAN share it.
     if let Ok(seq) = selector.parse::<u64>() {
-        if let Some(r) = records.iter().find(|r| r.meta.seq == seq) {
-            return Ok(r.clone());
+        let by_seq: Vec<&SnapshotRecord> = records.iter().filter(|r| r.meta.seq == seq).collect();
+        if let Some(one) = pick_one(&by_seq, selector)? {
+            return Ok(one);
         }
     }
-    if let Some(r) = records
-        .iter()
-        .find(|r| r.dir.file_name().and_then(|n| n.to_str()) == Some(selector))
-    {
-        return Ok(r.clone());
-    }
-    // Also accept a timestamp substring match (e.g. "20260615-143000").
-    let matches: Vec<&SnapshotRecord> = records
+
+    // (4) a timestamp / directory-name substring.
+    let by_substr: Vec<&SnapshotRecord> = records
         .iter()
         .filter(|r| {
             r.dir
@@ -240,10 +307,44 @@ pub fn find_snapshot(store_dir: &Path, selector: &str) -> Result<SnapshotRecord>
                 .is_some_and(|n| n.contains(selector))
         })
         .collect();
-    match matches.as_slice() {
-        [one] => Ok((*one).clone()),
-        _ => Err(SnapshotError::NotFound(selector.to_string())),
+    if let Some(one) = pick_one(&by_substr, selector)? {
+        return Ok(one);
     }
+
+    Err(SnapshotError::NotFound(selector.to_string()))
+}
+
+/// `Ok(None)` = this form matched nothing, try the next. `Ok(Some(_))` = a
+/// unique match. `Err(Ambiguous)` = REFUSE — never guess which snapshot the
+/// operator meant when one of them is a failed snapshot and the other is a
+/// good one.
+fn pick_one(matches: &[&SnapshotRecord], selector: &str) -> Result<Option<SnapshotRecord>> {
+    match matches {
+        [] => Ok(None),
+        [one] => Ok(Some((*one).clone())),
+        many => Err(SnapshotError::AmbiguousSelector {
+            selector: selector.to_string(),
+            count: many.len(),
+            candidates: many
+                .iter()
+                .map(|r| snapshot_identity(&r.meta))
+                .collect::<Vec<_>>()
+                .join(", "),
+        }),
+    }
+}
+
+/// Find a snapshot by seq (`"42"`), by exact directory name
+/// (`"snap-42-20260615-143000"`), by the stable identity token, or by a
+/// unique timestamp substring.
+///
+/// ADR-0116 D3.3 — this is now a thin alias for [`resolve_selector`], which
+/// **refuses on ambiguity**. The previous implementation returned the first
+/// seq match it found; after a prune recycles a seq that silently picked one
+/// of several snapshots, which around the `validation_failed` pair meant
+/// silently picking between a good snapshot and a broken one.
+pub fn find_snapshot(store_dir: &Path, selector: &str) -> Result<SnapshotRecord> {
+    resolve_selector(store_dir, selector)
 }
 
 /// Sum of regular-file sizes directly inside `dir` (the export is flat).
