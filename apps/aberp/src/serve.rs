@@ -1500,6 +1500,10 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     attempt_db_auto_recovery(&args.db, &tenant, &binary_hash_handle, "torn_open")?;
                 match recovery {
                     BootRecovery::Recovered => {
+                        // ADR-0116 D5 — see the mirror-ahead arm below.
+                        crate::snapshot::note_boot_recovery(
+                            crate::snapshot::BootRecoveryReason::TornOpen,
+                        );
                         DuckDbBillingStore::open(&args.db).with_context(|| {
                             format!(
                                 "re-open billing DuckDB at {} after ADR-0095 auto-recovery",
@@ -1865,6 +1869,15 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                 tracing::warn!(
                                     "ADR-0095 §1 — auto-recovery reconciled the ahead mirror \
                                      with the DB at boot"
+                                );
+                                // ADR-0116 D5 — make the RECOVERED state a
+                                // rollback point. Recorded here, acted on by
+                                // the snapshot daemon, which cannot exist
+                                // until recovery has returned — so
+                                // `recover_or_refuse` provably owns the mirror
+                                // at boot and no snapshot precedes it.
+                                crate::snapshot::note_boot_recovery(
+                                    crate::snapshot::BootRecoveryReason::MirrorAhead,
                                 );
                             }
                             Ok(BootRecovery::Refused(reason)) => {
@@ -3560,6 +3573,29 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // checkpoint's wait for the non-reentrant writer mutex is BOUNDED
         // inside `checkpoint_on_clean_shutdown`, and a miss is logged loud
         // rather than blocking exit (S213 / CLAUDE.md rule 12).
+        // ADR-0116 D5/G7 — leave a ROLLBACK POINT, not just a crash-safe file.
+        // The checkpoint below makes the live file safe to reopen; it produces
+        // no rollback point at all, and G7 is precisely that gap. Bounded so a
+        // snapshot can never wedge exit (S213), and skipped when the store
+        // already holds one within the cadence window.
+        //
+        // BEFORE the checkpoint, deliberately: the snapshot's audit row is a
+        // write through the shared handle, so taking it afterwards would
+        // immediately stale the verified-good marker the checkpoint just wrote.
+        match recovery_state.binary_hash.wait() {
+            Ok(bh) => crate::snapshot::snapshot_on_clean_shutdown(
+                &recovery_state.db,
+                &recovery_state.db_path,
+                &recovery_state.tenant,
+                bh,
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                "ADR-0116 D5 — no binary hash at shutdown; the clean-shutdown snapshot was \
+                 SKIPPED and no rollback point exists for this shutdown"
+            ),
+        }
+
         crate::snapshot::checkpoint_on_clean_shutdown(&recovery_state.db);
 
         // S291 / PR-272 — best-effort delete of the runtime-discovery

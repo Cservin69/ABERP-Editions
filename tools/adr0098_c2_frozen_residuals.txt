@@ -21,6 +21,17 @@
 #   Every residual below is pragma-guarded (disable_checkpoint_on_shutdown), asserted
 #   by cut-gate CHECK 10j;
 #   (c)=CLI-only one-shot subcommand (separate process, out of ADR-0098 scope);
+#
+# ── ADR-0116 D3.4: snapshot.rs 1 -> 2. `aberp restore --in-place` must REFUSE
+#   unless `aberp serve` is stopped, and DuckDB's own exclusive file lock is the
+#   ground truth for that. The alternatives are wrong in the DANGEROUS
+#   direction: a liveness touchfile is stale after a crash, so it answers
+#   "serve is stopped" while serve is up, and an in-place swap under a live
+#   writer strands the shared connection on an unlinked inode — the exact
+#   ADR-0111 orphan this programme closed. The new opener is
+#   `ensure_serve_is_stopped`, a CLI-only one-shot in a separate process
+#   (category (c)), pragma-guarded per CHECK 10j, opened and dropped without
+#   any read or write. It appends nothing, so CHECK 10M/10N/10P see no fork.
 #   (serve)=serve.rs request-handler audit reads (Ledger::open) C did not migrate;
 #   (boot)=pre-serve-loop create/provision.
 #
@@ -70,7 +81,7 @@
 1 apps/aberp/src/restore_from_nav_extract.rs
 9 apps/aberp/src/restore_from_nav_outgoing.rs
 27 apps/aberp/src/serve.rs
-1 apps/aberp/src/snapshot.rs
+2 apps/aberp/src/snapshot.rs
 1 apps/aberp/src/tenant_registry.rs
 1 modules/billing/src/adapters/duckdb_store.rs
 3 crates/audit-ledger/src/storage/mod.rs

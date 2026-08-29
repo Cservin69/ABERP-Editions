@@ -77,6 +77,7 @@ apps/aberp/src/serve.rs|record_upgrade_snapshot_mismatch_audit:let mut ledger = 
 apps/aberp/src/serve.rs|resolve_customer_identity:let ledger = Ledger::open(
 apps/aberp/src/serve.rs|resolve_invoice_xml_path:let ledger = Ledger::open(
 apps/aberp/src/snapshot.rs|emit_reopen_cli:let mut ledger = Ledger::open(db_path, tenant.clone(), binary_hash)
+apps/aberp/src/snapshot.rs|ensure_serve_is_stopped:let probe = duckdb::Connection::open(db_path);
 apps/aberp/src/tenant_registry.rs|emit_tenant_reopen:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs|run:let mut conn = Connection::open(&db_path)
 crates/audit-ledger/src/storage/mod.rs|append_reopen:let mut conn = Connection::open(db_path)?;

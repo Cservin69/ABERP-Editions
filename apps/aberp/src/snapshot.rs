@@ -169,6 +169,103 @@ pub fn checkpoint_on_clean_shutdown(db: &HandleArc) {
     }
 }
 
+/// How long the clean-shutdown snapshot will run before the process gives up
+/// on it and exits anyway (ADR-0116 D5).
+///
+/// **Bounded for the same reason the shutdown checkpoint is** (S213 /
+/// CLAUDE.md rule 12): a snapshot hiccup must NEVER wedge process exit. A
+/// logical `EXPORT` of a tenant DB is a few seconds at today's sizes, but it
+/// is unbounded in principle — a large tenant, a slow disk, or a DuckDB stall
+/// would otherwise hold the terminal open indefinitely at the worst possible
+/// moment.
+///
+/// Giving up costs a `*.partial` directory, which is inert by construction:
+/// `list_snapshots` and `next_seq` both ignore `*.partial`, so an abandoned
+/// export is invisible to retention, to restore, and to the daemon.
+const SHUTDOWN_SNAPSHOT_BUDGET: Duration = Duration::from_secs(30);
+
+/// Env kill-switch for the clean-shutdown snapshot (ADR-0116 D5).
+pub const SNAPSHOT_ON_SHUTDOWN_DISABLE_ENV: &str = "ABERP_SNAPSHOT_ON_SHUTDOWN_DISABLE";
+
+/// **ADR-0116 D5/G7** — on CLEAN shutdown, leave a ROLLBACK POINT, not just a
+/// crash-safe file.
+///
+/// `checkpoint_on_clean_shutdown` already folds the WAL into a fresh verified-
+/// good file — which makes the live file crash-safe and produces **no rollback
+/// point at all**. Those are different guarantees, and the gap between them is
+/// exactly G7: there is no snapshot trigger on clean shutdown, on
+/// boot-after-unclean-shutdown, before a restore, or before a migration.
+///
+/// Skipped when the store already holds a snapshot within `interval`, so a
+/// restart loop cannot fill the store.
+///
+/// **Call this BEFORE [`checkpoint_on_clean_shutdown`]**, never after: the
+/// snapshot's audit row is a WRITE through the shared handle, so taking it
+/// after the checkpoint would immediately stale the verified-good marker the
+/// checkpoint just wrote. In this order the checkpoint covers the
+/// post-snapshot state.
+///
+/// Best-effort by contract, and BOUNDED — see [`SHUTDOWN_SNAPSHOT_BUDGET`].
+pub fn snapshot_on_clean_shutdown(
+    db: &HandleArc,
+    db_path: &Path,
+    tenant: &TenantId,
+    binary_hash: BinaryHash,
+) {
+    if std::env::var(SNAPSHOT_ON_SHUTDOWN_DISABLE_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        tracing::info!(
+            env = SNAPSHOT_ON_SHUTDOWN_DISABLE_ENV,
+            "clean-shutdown snapshot disabled by env (ADR-0116 D5)"
+        );
+        return;
+    }
+    if is_disabled() {
+        return;
+    }
+    let store_dir = match resolve_store(tenant.as_str(), None) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "ADR-0116 D5 — could not resolve the snapshot store at shutdown; NO rollback                  point was created for this shutdown"
+            );
+            return;
+        }
+    };
+    let interval = interval_from_env();
+    let policy = policy_from_env();
+
+    // Bounded: run the cycle on its own thread and stop WAITING for it after
+    // the budget. The thread is left to finish (or not) as the process exits;
+    // whatever it leaves behind is a `*.partial` the next run ignores.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let handle = db.clone();
+    let db_path = db_path.to_path_buf();
+    let tenant = tenant.clone();
+    std::thread::spawn(move || {
+        trigger_snapshot_if_stale(
+            &SnapshotAudit::Handle(&handle),
+            &db_path,
+            &store_dir,
+            &tenant,
+            binary_hash,
+            &policy,
+            interval,
+            "clean-shutdown",
+        );
+        let _ = tx.send(());
+    });
+    if rx.recv_timeout(SHUTDOWN_SNAPSHOT_BUDGET).is_err() {
+        tracing::error!(
+            budget_secs = SHUTDOWN_SNAPSHOT_BUDGET.as_secs(),
+            "ADR-0116 D5 — the clean-shutdown snapshot did not finish within its budget;              exiting anyway (a snapshot must never wedge process exit — S213). NO rollback              point exists for this shutdown; the next boot or the scheduled floor will take              one."
+        );
+    }
+}
+
 /// ADR-0095 §3 — take ONE durable checkpoint of the LIVE file off the request
 /// path. Both the periodic daemon cadence ([`run_supervised`]) and the
 /// post-write debouncer ([`crate::live_checkpoint`]) call this, so a recent
@@ -808,6 +905,30 @@ pub fn run_now(args: &SnapshotNowArgs) -> Result<()> {
     Ok(())
 }
 
+/// ADR-0116 D4 — what the anchor coverage means for a restore decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorVerdict {
+    /// Coverage was never recorded (a pre-D4 snapshot). Not the same as zero.
+    NotRecorded,
+    /// The anchors table was readable and held nothing — the anchoring
+    /// rollout has not happened for this tenant. A fact about the system.
+    NoAnchorsAtAll,
+    /// Anchors exist but do not cover the chain head — a real gap.
+    ShortCoverage,
+    /// The chain is fully covered.
+    FullCoverage,
+}
+
+fn anchor_verdict_for(meta: &aberp_snapshot::SnapshotMeta) -> AnchorVerdict {
+    match (meta.anchor_count, meta.anchored_through_seq) {
+        (c, _) if c < 0 => AnchorVerdict::NotRecorded,
+        (_, None) => AnchorVerdict::NotRecorded,
+        (0, _) => AnchorVerdict::NoAnchorsAtAll,
+        (_, Some(through)) if through < meta.chain_len => AnchorVerdict::ShortCoverage,
+        _ => AnchorVerdict::FullCoverage,
+    }
+}
+
 /// ADR-0116 D4 — render anchor coverage without ever printing `0` for
 /// "not recorded". The whole point of the `-1`/`None` sentinels is that an
 /// operator deciding whether a restored DB can be relied on in court must be
@@ -937,12 +1058,34 @@ struct RestorePreflight {
     record: SnapshotRecord,
     live: aberp_snapshot::ValidationReport,
     /// Audit rows in the LIVE tenant's durable mirror right now.
+    ///
+    /// **A LOWER BOUND on the live chain, not the live chain.** The mirror is
+    /// extended from the DB by `ensure_consistent_with_db` (every snapshot
+    /// cycle) and by the shared `Handle`'s lockstep sync on every WriteGuard
+    /// drop — but `Ledger::append`, which the 15 CLI money-submission sites
+    /// use, commits WITHOUT syncing the mirror. So with `serve` down the
+    /// mirror can lag the DB, in exactly the windows D-22 identified as the
+    /// dangerous ones. `mirror > snapshot` therefore PROVES the live DB is
+    /// ahead; `mirror == snapshot` proves nothing.
     live_mirror_head: Option<u64>,
     /// Newest live mirror entry's wall time, so "what would I lose" has a
     /// date on it and not just a count.
     live_mirror_newest: Option<String>,
+    /// EXACT live counts, available only when the caller held the live DB
+    /// exclusively (i.e. `restore --in-place`, which refuses unless serve is
+    /// stopped). `None` on the side-path command, where opening the live DB
+    /// beside a possibly-running serve is the ADR-0098 two-instance hazard.
+    live_exact: Option<LiveCounts>,
     /// Reasons the restore would REFUSE. Empty ⇒ it would proceed.
     refusals: Vec<String>,
+}
+
+/// Exact row counts read from the live DB on a connection the caller already
+/// holds exclusively. See [`RestorePreflight::live_exact`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveCounts {
+    pub invoice_count: i64,
+    pub audit_count: i64,
 }
 
 /// Build the pre-flight for `selector` against `store_dir`.
@@ -959,6 +1102,8 @@ fn build_preflight(
     selector: &str,
     tenant: &str,
     live_db: &Path,
+    live_exact: Option<LiveCounts>,
+    accept_data_loss: bool,
 ) -> Result<RestorePreflight> {
     let record = resolve_selector(store_dir, selector)
         .map_err(|e| anyhow::anyhow!("resolve snapshot selector '{selector}': {e}"))?;
@@ -997,15 +1142,39 @@ fn build_preflight(
             record.meta.validation_error.as_deref().unwrap_or("?")
         ));
     }
-    if let Some(head) = live_mirror_head {
-        if head > record.meta.audit_count.max(0) as u64 {
+    // "The live DB is ahead" — from the EXACT counts when we have them,
+    // otherwise from the mirror's lower bound. Both directions matter: an
+    // exact read can also prove the live DB is NOT ahead, which the mirror
+    // never can.
+    let snap_audit = record.meta.audit_count.max(0) as u64;
+    let live_head: Option<u64> = live_exact
+        .map(|c| c.audit_count.max(0) as u64)
+        .or(live_mirror_head);
+    if let Some(head) = live_head {
+        if head > snap_audit && !accept_data_loss {
+            // ADR-0116 D3.3 — "refuse when the live DB is AHEAD of the snapshot
+            // IN A WAY THE OPERATOR HAS NOT ACKNOWLEDGED". Rolling backwards
+            // past committed rows is a legitimate operation — it is what a
+            // rollback IS — so this is an acknowledgement gate, not a ban. What
+            // it removes is the silent case: nothing previously compared the
+            // snapshot against the live DB, so the operator had no
+            // machine-checked answer to "am I about to roll back 5 days of
+            // invoices?".
             refusals.push(format!(
-                "the LIVE database is AHEAD of this snapshot: the durable audit mirror holds \
-                 {head} entries and the snapshot carries {}. Restoring would discard {} \
-                 committed audit entries. Acknowledge deliberately or pick a newer snapshot.",
-                record.meta.audit_count,
-                head.saturating_sub(record.meta.audit_count.max(0) as u64),
+                "the LIVE database is AHEAD of this snapshot: it holds {head} audit entries and \
+                 the snapshot carries {snap_audit}. Restoring would DISCARD {} committed audit \
+                 entries. Pick a newer snapshot, or pass --accept-data-loss to acknowledge the \
+                 rollback deliberately.",
+                head - snap_audit,
             ));
+        } else if head > snap_audit {
+            tracing::warn!(
+                live_head = head,
+                snapshot_audit = snap_audit,
+                discarded = head - snap_audit,
+                "ADR-0116 D3.3 — --accept-data-loss was passed: this restore will DISCARD \
+                 committed audit entries"
+            );
         }
     }
     Ok(RestorePreflight {
@@ -1013,6 +1182,7 @@ fn build_preflight(
         live,
         live_mirror_head,
         live_mirror_newest,
+        live_exact,
         refusals,
     })
 }
@@ -1055,32 +1225,63 @@ fn print_preflight(pf: &RestorePreflight, target: &Path, with_delta: bool) {
         }
     );
     if with_delta {
-        match pf.live_mirror_head {
-            Some(head) => {
-                let snap = m.audit_count.max(0) as u64;
+        let snap = m.audit_count.max(0) as u64;
+        match pf.live_exact {
+            // EXACT — the caller holds the live DB exclusively (serve is
+            // stopped), so this is the true delta in both directions.
+            Some(c) => {
+                let head = c.audit_count.max(0) as u64;
                 println!(
-                    "  live delta       durable audit mirror holds {head} entries; this snapshot \
-                     carries {snap}"
+                    "  live delta       EXACT (serve is stopped): the live DB holds {head} audit \
+                     entries and {} invoices; this snapshot carries {snap} / {}",
+                    c.invoice_count, m.invoice_count
                 );
                 if head > snap {
                     println!(
                         "                   → {} audit entries exist NOW that would NOT exist \
-                         after the restore{}",
-                        head - snap,
-                        pf.live_mirror_newest
-                            .as_deref()
-                            .map(|t| format!(" (newest: {t})"))
-                            .unwrap_or_default()
+                         after the restore",
+                        head - snap
                     );
                 } else {
                     println!("                   → nothing newer than the snapshot would be lost");
                 }
             }
-            None => println!(
-                "  live delta       UNAVAILABLE — no readable audit mirror beside the live DB. \
-                 The delta is derived from the mirror, never by opening the live database \
-                 (a second DuckDB instance on a live file is the ADR-0098 hazard)."
-            ),
+            // BOUND — `serve` may be running, so the live DB is deliberately
+            // not opened (a second DuckDB instance on a live file is the
+            // ADR-0098 two-instance hazard). The mirror is the durable record
+            // and gives a LOWER bound.
+            None => match pf.live_mirror_head {
+                Some(head) => {
+                    println!(
+                        "  live delta       LOWER BOUND from the durable audit mirror: it holds \
+                         {head} entries; this snapshot carries {snap}"
+                    );
+                    if head > snap {
+                        println!(
+                            "                   → at least {} audit entries exist NOW that would \
+                             NOT exist after the restore{}",
+                            head - snap,
+                            pf.live_mirror_newest
+                                .as_deref()
+                                .map(|t| format!(" (newest: {t})"))
+                                .unwrap_or_default()
+                        );
+                    } else {
+                        println!(
+                            "                   → the mirror shows nothing newer. NOTE: this is \
+                             a LOWER BOUND, not proof. `Ledger::append` — which the CLI \
+                             money-submission paths use — commits WITHOUT syncing the mirror, so \
+                             with `serve` down the mirror can lag the DB. For an exact delta, \
+                             stop serve and use `aberp restore --in-place --dry-run`."
+                        );
+                    }
+                }
+                None => println!(
+                    "  live delta       UNAVAILABLE — no readable audit mirror beside the live \
+                     DB, and the live database is deliberately not opened here (a second DuckDB \
+                     instance on a live file is the ADR-0098 hazard)."
+                ),
+            },
         }
     }
     if pf.refusals.is_empty() {
@@ -1101,7 +1302,18 @@ pub fn run_restore(args: &SnapshotRestoreArgs) -> Result<()> {
 
     // ── ADR-0116 D3.2 — dry-run / verify-only write NOTHING ─────────────
     if args.dry_run || args.verify_only {
-        let pf = build_preflight(&store_dir, &args.selector, &args.tenant, &args.db)?;
+        // `None` for the exact counts: this command restores to a SIDE path
+        // and `aberp serve` may well be running, so the live DB is
+        // deliberately not opened (ADR-0098 two-instance hazard). The delta
+        // falls back to the mirror's lower bound, and the report says so.
+        let pf = build_preflight(
+            &store_dir,
+            &args.selector,
+            &args.tenant,
+            &args.db,
+            None,
+            args.accept_data_loss,
+        )?;
         print_preflight(&pf, &args.to, args.dry_run);
         if pf.refusals.is_empty() {
             return Ok(());
@@ -1202,7 +1414,31 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
     ensure_not_prod_path(&args.db)
         .map_err(|e| anyhow::anyhow!("in-place restore target must not be the prod line: {e}"))?;
 
-    let pf = build_preflight(&store_dir, &args.snapshot, &args.tenant, &args.db)?;
+    // Step 1 FIRST, even for a dry-run: it is a read-only probe, and holding
+    // the file exclusively is what lets the pre-flight report an EXACT live
+    // delta instead of the mirror's lower bound. A dry-run that cannot take
+    // the lock still reports — it just says so.
+    let live_exact = match ensure_serve_is_stopped(&args.db) {
+        Ok(c) => c,
+        Err(e) if args.dry_run || !args.confirm => {
+            tracing::warn!(
+                error = %e,
+                "ADR-0116 D3.2 — could not take the live DB exclusively for the pre-flight; \
+                 the live delta falls back to the audit mirror's LOWER BOUND"
+            );
+            None
+        }
+        Err(e) => return Err(e),
+    };
+
+    let pf = build_preflight(
+        &store_dir,
+        &args.snapshot,
+        &args.tenant,
+        &args.db,
+        live_exact,
+        args.accept_data_loss,
+    )?;
 
     // ── D4 — the Defense anchor sanction, at RESTORE time ───────────────
     //
@@ -1211,35 +1447,63 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
     // punishes the snapshot, and `plan_retention` prunes invalid snapshots —
     // so gating there would delete the rollback store. The sanction belongs
     // where the legal claim is actually made, which is here.
-    let anchors_short = match pf.record.meta.anchored_through_seq {
-        // Not recorded: a pre-D4 snapshot. Warn, do not refuse — refusing
-        // would make every snapshot taken before this change unrestorable.
-        None => {
-            tracing::warn!(
-                "ADR-0116 D4 — this snapshot predates anchor recording; its eIDAS coverage is \
-                 UNKNOWN, not zero"
-            );
-            false
-        }
-        Some(through) => through < pf.record.meta.chain_len,
-    };
-    if anchors_short
-        && matches!(
-            crate::build_profile::EDITION,
-            crate::build_profile::Edition::Defense
-        )
-        && !args.accept_unanchored
-    {
-        anyhow::bail!(
-            "REFUSING: this snapshot's audit chain is not fully covered by verified timestamp \
-             anchors ({}). On Defense a restored database is expected to carry its eIDAS \
-             Art. 41(2) weight, which comes from the qualified timestamp over the chain head, \
-             not from the hash chain. Pass --accept-unanchored to proceed with a database that \
-             cannot prove when its entries were made. \
+    //
+    // **DRIFT FROM THE ADR, taken deliberately — flagged for review.** The ADR
+    // says "REFUSES without --accept-unanchored when anchored_through_seq <
+    // chain_len", which today means EVERY Defense in-place restore refuses:
+    // every audit_ledger_anchors.parquet in both live stores is exactly 300
+    // bytes, i.e. zero anchor rows everywhere. A flag that must always be
+    // passed is muscle-memoried within a week and stops being a decision — and
+    // it would add a step to the most stressful operation in the product,
+    // typed at 02:00 during an incident. ADR-0116 Phase 3 already says the
+    // Defense refusal "waits on real anchor coverage existing".
+    //
+    // So the sanction is armed on the case it was designed for and loud on the
+    // case it was not:
+    //   * anchoring IS running and this snapshot is SHORT (anchor_count > 0,
+    //     coverage < chain_len)  -> REFUSE without --accept-unanchored;
+    //   * anchoring has not rolled out at all (anchor_count == 0)  -> proceed,
+    //     with a LOUD warning stating exactly what the restored DB cannot
+    //     prove. That is a fact about the system, not about this snapshot.
+    //   * coverage NOT RECORDED (a pre-D4 snapshot) -> proceed with a warning;
+    //     refusing would make every pre-D4 snapshot unrestorable.
+    let anchor_verdict = anchor_verdict_for(&pf.record.meta);
+    let is_defense = matches!(
+        crate::build_profile::EDITION,
+        crate::build_profile::Edition::Defense
+    );
+    let anchor_refusal = match anchor_verdict {
+        AnchorVerdict::ShortCoverage if is_defense && !args.accept_unanchored => Some(format!(
+            "this snapshot's audit chain is only PARTIALLY covered by verified timestamp \
+             anchors ({}). Anchoring is running for this tenant, so a short chain is a real \
+             gap, not an un-rolled-out feature. On Defense a restored database is expected to \
+             carry its eIDAS Art. 41(2) weight, which comes from the qualified timestamp over \
+             the chain head, not from the hash chain. Pass --accept-unanchored to proceed with \
+             a database that cannot prove when those entries were made. \
              Magyarul: a visszaállított lánc időbélyeg-fedezete hiányos.",
             describe_anchors(&pf.record.meta)
-        );
-    }
+        )),
+        AnchorVerdict::NoAnchorsAtAll => {
+            tracing::warn!(
+                anchors = %describe_anchors(&pf.record.meta),
+                "ADR-0116 D4 — this snapshot carries NO timestamp anchors at all. The restored \
+                 database will hold a verifiable hash chain but will NOT carry the eIDAS \
+                 Art. 41(2) presumption: nothing proves WHEN its entries were made. This is \
+                 the pre-anchoring-rollout state of the whole system, not a defect in this \
+                 snapshot."
+            );
+            None
+        }
+        AnchorVerdict::NotRecorded => {
+            tracing::warn!(
+                "ADR-0116 D4 — this snapshot predates anchor recording; its eIDAS coverage is \
+                 UNKNOWN, not zero. Refusing on it would make every pre-D4 snapshot \
+                 unrestorable."
+            );
+            None
+        }
+        _ => None,
+    };
 
     if args.dry_run || !args.confirm {
         print_preflight(&pf, &args.db, true);
@@ -1248,6 +1512,9 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
              unit (DB + .wal + .ckpt-ok) and replaced. The .audit.log mirror would NOT move.",
             args.db.display()
         );
+        if let Some(r) = &anchor_refusal {
+            println!("\n  WOULD ALSO REFUSE (ADR-0116 D4):\n    • {r}");
+        }
         if !args.dry_run {
             anyhow::bail!("nothing was written — pass --confirm to perform the restore");
         }
@@ -1259,11 +1526,15 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
         }
         return Ok(());
     }
-    if !pf.refusals.is_empty() {
+    let mut all_refusals = pf.refusals.clone();
+    if let Some(r) = anchor_refusal {
+        all_refusals.push(r);
+    }
+    if !all_refusals.is_empty() {
         anyhow::bail!(
             "REFUSING this in-place restore:\n{}\nNothing was written. Re-run with --dry-run to \
              see the full pre-flight.",
-            pf.refusals
+            all_refusals
                 .iter()
                 .map(|r| format!("  • {r}"))
                 .collect::<Vec<_>>()
@@ -1271,14 +1542,21 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
         );
     }
 
-    // ── Step 1 — refuse unless serve is stopped. Fail on a live lock; do
-    //    not race it. A DuckDB file lock is held by the serve process, so an
-    //    exclusive open failing IS the signal.
+    // Step 1 was performed above (the exclusive probe that also produced the
+    // exact live counts). Re-assert it here so a serve started between the
+    // pre-flight and the commit cannot slip through: an in-place swap under a
+    // live writer strands the shared connection on an unlinked inode and every
+    // later commit is lost (ADR-0111).
     ensure_serve_is_stopped(&args.db)?;
 
     let binary_hash = crate::binary_hash::compute().context("compute binary hash")?;
     let actor = cli_actor("system:restore-cli");
-    let policy = policy_from_env();
+    // NOTE: no retention pass here, deliberately. The pre-restore snapshot
+    // goes through `take_and_emit`, not `run_cycle`, so nothing is pruned
+    // during a restore. Pruning at the moment an operator is recovering is how
+    // G8's forensic evidence got destroyed in the first place — the cycle that
+    // creates a snapshot should not also be the cycle that deletes one, least
+    // of all here.
 
     // ── Step 2 — snapshot the CURRENT database FIRST (G7's sharpest case) ─
     //
@@ -1357,11 +1635,10 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
     )
     .context("append SnapshotRestored to the RESTORED chain (ADR-0116 D3.5)")?;
 
-    let _ = &policy;
     println!(
         "\nIn-place restore complete.\n  restored from  {}\n  into           {}\n  preserved      {}\n                 {}\n                 {}\n  re-verified    invoices={} audit_rows={} chain={}\n\nThe .audit.log mirror was NOT moved (it is the durable record and stays at the live \
-         path). If the restored database and the mirror disagree, the next boot's \
-         recover_or_refuse owns that decision.",
+         path). If the restored database and the mirror disagree, the next boot's guarded \
+         recovery path owns that decision.",
         snapshot_identity(&pf.record.meta),
         args.db.display(),
         report.preserved.db.display(),
@@ -1392,16 +1669,44 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
 /// the orphaned-inode failure ADR-0111 closed (the shared connection keeps an
 /// fd on the old inode while the rename installs a new one, and every later
 /// commit lands in a file the kernel frees at exit).
-fn ensure_serve_is_stopped(db_path: &Path) -> Result<()> {
+fn ensure_serve_is_stopped(db_path: &Path) -> Result<Option<LiveCounts>> {
     if !db_path.exists() {
-        return Ok(());
+        return Ok(None);
     }
-    match duckdb::Connection::open(db_path) {
+    // SANCTIONED RESIDUAL (ADR-0098 category (c): CLI-only one-shot, separate
+    // process). DuckDB's own exclusive file lock is the ground truth for "is
+    // serve running" — and the alternatives are wrong in the DANGEROUS
+    // direction: a liveness touchfile is stale after a crash, so it would
+    // answer "serve is stopped" while serve is up, and an in-place swap under
+    // a live writer strands its connection on an unlinked inode (ADR-0111).
+    // Frozen in tools/adr0098_c2_frozen_residuals.txt and
+    // tools/adr0098_r4_opener_fingerprints.txt.
+    let probe = duckdb::Connection::open(db_path);
+    match probe {
         Ok(conn) => {
             // ADR-0098 C2 — never let this probe's drop fold the WAL in place.
             let _ = conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;");
+            // ADR-0116 D3.2 — read the EXACT live counts on THIS connection.
+            //
+            // No second opener: we already hold the file exclusively, and this
+            // is the only moment in the product where reading the live DB is
+            // provably safe (serve is stopped, which is what this function has
+            // just established). The alternative — the audit MIRROR — is only
+            // a lower bound, because `Ledger::append` commits without syncing
+            // it, so the 15 CLI money-submission sites (D-22) can leave the
+            // mirror lagging the DB in exactly the serve-down windows where an
+            // operator reaches for a restore.
+            let audit_count: i64 = conn
+                .query_row("SELECT count(*) FROM audit_ledger", [], |r| r.get(0))
+                .unwrap_or(-1);
+            let invoice_count: i64 = conn
+                .query_row("SELECT count(*) FROM invoice", [], |r| r.get(0))
+                .unwrap_or(-1);
             drop(conn);
-            Ok(())
+            Ok(Some(LiveCounts {
+                invoice_count,
+                audit_count,
+            }))
         }
         Err(e) => Err(anyhow::anyhow!(
             "REFUSING the in-place restore: the live database at {} could not be opened \
@@ -1673,6 +1978,41 @@ pub async fn run_supervised(deps: SnapshotDaemonDeps, cancel: CancellationToken)
         store = %deps.store_dir.display(),
         "snapshot daemon started (S426 / ADR-0082)"
     );
+    // ── ADR-0116 D5 — boot-after-auto-recovery trigger ──────────────────
+    //
+    // A recovered database is a state worth being able to roll back TO: it is
+    // the output of the most invasive automatic operation the system performs,
+    // and today nothing preserves it. Fires BEFORE the boot delay because the
+    // value is in having the rollback point promptly, and it is subject to the
+    // same staleness check as every other trigger so it cannot storm.
+    //
+    // **`recover_or_refuse` owns the mirror at boot, unconditionally, and this
+    // cannot precede it** — see [`BOOT_RECOVERY`]. The ordering is structural:
+    // this daemon needs the shared `Handle`, which does not exist until
+    // recovery has returned a non-`Refuse` outcome.
+    if let Some(reason) = boot_recovery_reason() {
+        let db = deps.db_path.clone();
+        let store = deps.store_dir.clone();
+        let tenant = deps.tenant.clone();
+        let bh = deps.binary_hash;
+        let policy = deps.policy;
+        let interval = deps.interval;
+        let handle = deps.db.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            trigger_snapshot_if_stale(
+                &SnapshotAudit::Handle(&handle),
+                &db,
+                &store,
+                &tenant,
+                bh,
+                &policy,
+                interval,
+                reason,
+            );
+        })
+        .await;
+    }
+
     tokio::select! {
         _ = cancel.cancelled() => return,
         _ = tokio::time::sleep(Duration::from_secs(BOOT_DELAY_SECS)) => {}
@@ -1795,6 +2135,51 @@ pub fn sleep_to_next_grid_boundary(interval: Duration, now: OffsetDateTime) -> D
 // ──────────────────────────────────────────────────────────────────────
 // ADR-0116 D5 — snapshot at the moments that warrant one
 // ──────────────────────────────────────────────────────────────────────
+
+/// ADR-0116 D5 — did this boot run a successful auto-recovery?
+///
+/// `0` = no; anything else is a [`BootRecoveryReason`] code. A plain atomic
+/// rather than a channel because the two setters are deep inside `serve`'s
+/// boot sequence and the single reader is the snapshot daemon, which cannot
+/// exist until recovery has completed (it needs `recovery_state.db`, and the
+/// shared `Handle` is not created until after `recover_or_refuse` returns).
+///
+/// **That is what makes ADR-0116 D5's ordering structural rather than
+/// conventional**: `recover_or_refuse_with_audit` owns the mirror at boot
+/// unconditionally, and no snapshot trigger can fire before it because the
+/// daemon that fires it has no handle to fire with until recovery has
+/// returned. A snapshot must never be the thing that first touches a mirror
+/// at boot.
+static BOOT_RECOVERY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Which boot-recovery path ran, for the D5 trigger's log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BootRecoveryReason {
+    /// The live DB could not be opened and was rebuilt from a snapshot.
+    TornOpen = 1,
+    /// The audit mirror was ahead of the DB and was reconciled.
+    MirrorAhead = 2,
+}
+
+/// Record that this boot auto-recovered the live DB, so the snapshot daemon
+/// makes the RECOVERED state a rollback point (ADR-0116 D5/G7).
+///
+/// Called from `serve`'s boot recovery sites AFTER
+/// `recover_or_refuse_with_audit` has returned a non-`Refuse` outcome.
+pub fn note_boot_recovery(code: BootRecoveryReason) {
+    BOOT_RECOVERY.store(code as u8, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The reason string for the D5 boot trigger, or `None` when this boot did
+/// not auto-recover.
+pub fn boot_recovery_reason() -> Option<&'static str> {
+    match BOOT_RECOVERY.load(std::sync::atomic::Ordering::SeqCst) {
+        1 => Some("boot-after-auto-recovery:torn_open"),
+        2 => Some("boot-after-auto-recovery:mirror_ahead"),
+        _ => None,
+    }
+}
 
 /// ADR-0116 D5 — take a snapshot at a moment that warrants one, unless the
 /// store already holds one within `interval`.

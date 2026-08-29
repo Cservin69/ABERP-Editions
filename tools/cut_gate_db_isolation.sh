@@ -1308,6 +1308,120 @@ else
   rm -f "$tf_files" "$tf_raw" "$tf_cur" "$tf_froz"
 fi
 
+# ── CHECK 11 — ADR-0116 D2: the RECOVERY-EVIDENCE guard.
+#
+#    Recovery evidence (*CORRUPT*, *RECOVERY*, *DEFORK*, *PRE-*, healed-*,
+#    INDEXDESYNC*, the 22 lowercase corrupt-<nanos>.bak, …) lives as SIBLINGS
+#    of the live DB inside a tenant home, NOT in the snapshot store. So
+#    `plan_retention` — which operates on records built from `snap-*` dirs with
+#    a parseable meta.json — is structurally blind to it, and the "never prune
+#    evidence" guarantee was satisfied BY ACCIDENT rather than by a rule.
+#
+#    ADR-0116 D2.3 states the consequence precisely: `prune` only ever touches
+#    the snapshot store, so **a refusal inside `prune` alone protects nothing**.
+#    The load-bearing half is that every TENANT-HOME helper consults the same
+#    predicate, and this check is what enforces it. The hazard is concrete, not
+#    theoretical: `recover::cleanup_siblings_with_infix` already enumerated a
+#    tenant home and unlinked by prefix with no guard whatsoever.
+#
+#    11a — the shared guard must EXIST and be reachable: `is_protected_evidence`
+#          + `guarded_remove` exported from aberp-snapshot, matching
+#          case-INSENSITIVELY (58 of 101 real artefacts escaped a case-sensitive
+#          match; this bug class was closed once already in this repo's edition
+#          DB-guard), and inverted to a live-file ALLOW-LIST (14 escaped even
+#          case-insensitively, including all 9 healed-*.bak and the 24 MB
+#          INDEXDESYNC-BACKUP — neither matches any deny-list family in any
+#          case).
+#    11b — the TENANT_HOME removal-site set may only SHRINK. A NEW unguarded
+#          removal that reaches a tenant-home path fails here.
+#    11c — corpus liveness: a scanner that classifies nothing makes 11b
+#          vacuously green, so a floor is required in the SAFE direction too.
+#    Teeth: cut_gate_negative_probes.sh "[CHECK 11]".
+#    ENFORCE_EVIDENCE_GUARD=0 disables it for a deliberate, temporary local probe.
+echo "[CHECK 11] ADR-0116 D2 — recovery-evidence guard present + tenant-home removal sites frozen (ENFORCED · D5)"
+enforce11="${ENFORCE_EVIDENCE_GUARD:-1}"
+flag11() { note "$1"; if [[ "$enforce11" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+ev_src="crates/aberp-snapshot/src/evidence.rs"
+ev_lib="crates/aberp-snapshot/src/lib.rs"
+ev_scan="tools/adr0116_evidence_removal_scan.awk"
+ev_manifest="tools/adr0116_tenant_home_removal_sites.txt"
+
+# 11a — the guard exists, is exported, is case-insensitive, and is an
+#       allow-list rather than a deny-list.
+if [[ ! -f "$ev_src" ]]; then
+  flag11 "✗ ADR-0116 D2 evidence guard missing: $ev_src"
+else
+  for sym in "pub fn is_protected_evidence" "pub fn guarded_remove" "LIVE_TENANT_NAMES" "EVIDENCE_FRAGMENTS"; do
+    grep -q "$sym" "$ev_src" || flag11 "✗ $ev_src is missing '$sym' — the shared ADR-0116 D2 guard is incomplete"
+  done
+  grep -q "is_protected_evidence" "$ev_lib" \
+    || flag11 "✗ is_protected_evidence is not re-exported from $ev_lib — tenant-home helpers in other crates cannot call it"
+  # Case-insensitivity is the non-negotiable part (F3).
+  grep -q "to_ascii_lowercase" "$ev_src" \
+    || flag11 "✗ $ev_src does not lowercase before matching — 58 of 101 real evidence artefacts escape a case-SENSITIVE guard (ADR-0116 F3)"
+  # The allow-list inversion: the primary predicate must be "not live => evidence".
+  grep -q '!name_is_live' "$ev_src" \
+    || flag11 "✗ $ev_src has lost the allow-list INVERSION (!name_is_live). A deny-list of named families missed 14 artefacts even case-insensitively, including every healed-*.bak and the sole 2026-08-03 INDEXDESYNC backup (ADR-0116 D2.2)"
+  # prune must consult it — the belt half of D2.3.
+  grep -q "is_protected_evidence" "crates/aberp-snapshot/src/retention.rs" \
+    || flag11 "✗ retention::prune does not consult is_protected_evidence — the pruner's blindness to evidence must be a DELIBERATE refusal, not a structural accident (ADR-0116 D2.3)"
+fi
+
+# 11b/11c — the frozen TENANT_HOME set.
+if [[ ! -f "$ev_scan" || ! -f "$ev_manifest" ]]; then
+  flag11 "✗ evidence removal scanner or frozen manifest missing: $ev_scan / $ev_manifest"
+else
+  ev_files="$(mktemp "${TMPDIR:-/tmp}/ev_files.XXXXXX")"
+  ev_raw="$(mktemp "${TMPDIR:-/tmp}/ev_raw.XXXXXX")"
+  ev_cur="$(mktemp "${TMPDIR:-/tmp}/ev_cur.XXXXXX")"
+  ev_froz="$(mktemp "${TMPDIR:-/tmp}/ev_froz.XXXXXX")"
+  find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/' | sort > "$ev_files"
+  ev_rc=0
+  awk -f "$ev_scan" $(cat "$ev_files") > "$ev_raw" 2>/dev/null || ev_rc=$?
+  if [[ "$ev_rc" -ne 0 ]]; then
+    flag11 "✗ ADR-0116 evidence removal scanner errored (exit $ev_rc) — treat as a HARNESS FAULT, never as a clean tree"
+  else
+    # `cut`, NOT a sed alternation: BSD sed (macOS, where this gate is also run
+    # by hand) has no BRE alternation, so an `s/:\(A\|B\):.*//` pattern matches
+    # NOTHING and every record stays fully-qualified, never matching the frozen
+    # key — a silent green. Records are <file>:<fn>:<VERDICT>:<tok>@L<n> and
+    # neither a path nor a Rust fn name can contain `:`, so fields 1-2 are the
+    # stable key.
+    grep ':TENANT_HOME:' "$ev_raw" | cut -d: -f1,2 | sort -u > "$ev_cur" || true
+    grep -vE '^#' "$ev_manifest" | sed 's/[[:space:]]*#.*$//;s/[[:space:]]*$//' \
+      | grep -vE '^$' | sort -u > "$ev_froz" || true
+    ev_grew="$(comm -13 "$ev_froz" "$ev_cur")"
+    if [[ -n "$ev_grew" ]]; then
+      flag11 "✗ a NEW UNGUARDED tenant-home removal appeared. Route it through aberp_snapshot::guarded_remove (ADR-0116 D2) — an unlink beside the live DB destroys the ONLY record of a durability incident, permanently:"
+      printf '%s\n' "$ev_grew" | sed 's/^/      /'
+      printf '%s\n' "$ev_grew" | while IFS= read -r k; do
+        grep -F "$k:" "$ev_raw" | sed 's/^/        at: /'
+      done
+    fi
+    ev_shrunk="$(comm -23 "$ev_froz" "$ev_cur")"
+    if [[ -n "$ev_shrunk" ]]; then
+      note "  (info) tenant-home removal sites guarded/removed since freeze — refresh $ev_manifest to lock the smaller set:"
+      printf '%s\n' "$ev_shrunk" | sed 's/^/      /'
+    fi
+    # 11c — liveness. A scanner that emits nothing makes 11b vacuously green.
+    # The tree has ~30 removal sites across the three classes; require the
+    # classification to be non-trivial so "no violations" cannot mean "no scan".
+    ev_total="$(grep -c ':\(GUARDED\|TENANT_HOME\|OTHER\):' "$ev_raw" || true)"
+    ev_guarded="$(grep -c ':GUARDED:' "$ev_raw" || true)"
+    if [[ "${ev_total:-0}" -lt 15 ]]; then
+      flag11 "✗ HARNESS: only ${ev_total:-0} removal sites classified across the workspace — the corpus or the scanner is broken, so a green CHECK 11b means nothing"
+    fi
+    if [[ "${ev_guarded:-0}" -lt 1 ]]; then
+      flag11 "✗ HARNESS: the scanner classified ZERO removals as GUARDED — it can no longer RECOGNISE the guard, so every guarded site would read as unguarded (or, worse, a future guarded site would read as safe for the wrong reason)"
+    fi
+    if [[ -z "$ev_grew" ]]; then
+      ev_n="$(grep -vcE '^#|^$' "$ev_manifest" || true)"
+      note "✓ evidence guard holds (${ev_total:-0} removal sites classified, ${ev_guarded:-0} guarded; ${ev_n:-0} frozen tenant-home sites, all removing live-allow-listed artefacts)"
+    fi
+  fi
+  rm -f "$ev_files" "$ev_raw" "$ev_cur" "$ev_froz"
+fi
+
 echo
 if [[ "$fail" -ne 0 ]]; then echo "CUT-GATE: ✗ FAILED"; exit 1; fi
 echo "CUT-GATE: ✓ PASSED"

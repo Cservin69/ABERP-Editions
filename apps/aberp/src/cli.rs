@@ -1714,6 +1714,18 @@ pub struct RestoreInPlaceArgs {
     #[arg(long)]
     pub confirm: bool,
 
+    /// ADR-0116 D3.3 — acknowledge that the live database is AHEAD of the
+    /// snapshot and that restoring will DISCARD committed rows.
+    ///
+    /// Rolling backwards past committed data is a legitimate operation — it is
+    /// what a rollback IS — but it must be a decision, not a side effect. The
+    /// pre-flight refuses without this whenever it can prove the live chain
+    /// holds entries the snapshot does not, so an operator reaching for a
+    /// stale snapshot at 02:00 is told exactly how much they are about to
+    /// throw away before they throw it away.
+    #[arg(long)]
+    pub accept_data_loss: bool,
+
     /// ADR-0116 D4 — proceed even though the snapshot's audit chain is not
     /// fully covered by verified timestamp anchors.
     ///
@@ -1829,6 +1841,11 @@ pub struct SnapshotRestoreArgs {
     /// no live DB to compare against).
     #[arg(long)]
     pub verify_only: bool,
+
+    /// ADR-0116 D3.3 — acknowledge that the live database is AHEAD of the
+    /// snapshot. See `aberp restore --in-place --help`.
+    #[arg(long)]
+    pub accept_data_loss: bool,
 
     /// Tenant identifier — selects the per-tenant snapshot store and is
     /// recorded on the `snapshot.restored` audit event.

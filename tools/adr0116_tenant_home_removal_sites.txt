@@ -1,0 +1,60 @@
+# ADR-0116 D2 — FROZEN tenant-home removal sites (gate CHECK 11).
+#
+# Format: <file>:<fn>  (line numbers deliberately dropped so a benign line
+#   shift does not churn this set; the FILE and FUNCTION are what is frozen.)
+#
+# CHECK 11 re-derives the TENANT_HOME set with
+# tools/adr0116_evidence_removal_scan.awk and FAILS if a site appears that is
+# not listed here. The set may only SHRINK. A site leaves the set by routing
+# its removals through `aberp_snapshot::guarded_remove` /
+# `is_protected_evidence` — at which point the scanner classifies it GUARDED
+# and it must be deleted from this file.
+#
+# ## Why this check exists
+#
+# Recovery evidence lives as SIBLINGS of the live DB inside a tenant home,
+# where `plan_retention` cannot see it. The protection the brief asked for
+# ("*CORRUPT*/*RECOVERY*/*DEFORK*/*PRE-* must never be pruned") was therefore
+# satisfied BY ACCIDENT: the pruner is structurally blind to those files rather
+# than deliberately protective of them, and — as ADR-0116 D2.3 puts it — "a
+# refusal inside `prune` alone protects nothing", because `prune` only ever
+# touches the snapshot store.
+#
+# The hazard is a helper that enumerates a tenant home and unlinks by name or
+# prefix. That is not hypothetical: `recover::cleanup_siblings_with_infix`
+# already had exactly that shape and met no guard at all. It is safe TODAY only
+# because the two infixes its two call sites pass happen not to collide with an
+# evidence family — a property of the call sites, not of the function. It now
+# routes through `guarded_remove`, which is why it is absent below.
+#
+# ## Every site below is legitimate, and here is the specific reason
+#
+# All seven remove artefacts that are on the guard's own LIVE allow-list, so
+# routing them through `guarded_remove` would change nothing but noise. They
+# are frozen rather than migrated because they are the durability primitives
+# themselves, and each is pinned by its own tests.
+#
+#   crash_safe.rs:atomic_install          — drops the staged file's WAL and the
+#                                           target's stale WAL around the
+#                                           rename. `<db>.wal` is live.
+#   crash_safe.rs:clear_install_intent    — removes `<db>.install-intent`,
+#                                           a live journal file.
+#   crash_safe.rs:durable_checkpoint      — clears its own `.creating-*`
+#                                           staging + export dir (transients).
+#   crash_safe.rs:resume_pending_install  — clears a stale WAL while resuming a
+#                                           journalled install.
+#   recover.rs:cleanup_temp               — removes a `.recover-*` temp + WAL.
+#   take.rs:restore_into                  — clears its `.restoring` staging and
+#                                           the target's WAL BEFORE the install
+#                                           (ADR-0116 D3.1 — the WAL-first
+#                                           ordering that closes G2's window).
+#   take.rs:take_snapshot_with            — clears a crashed `*.partial` export
+#                                           directory in the snapshot store.
+#
+crates/aberp-snapshot/src/crash_safe.rs:atomic_install
+crates/aberp-snapshot/src/crash_safe.rs:clear_install_intent
+crates/aberp-snapshot/src/crash_safe.rs:durable_checkpoint
+crates/aberp-snapshot/src/crash_safe.rs:resume_pending_install
+crates/aberp-snapshot/src/recover.rs:cleanup_temp
+crates/aberp-snapshot/src/take.rs:restore_into
+crates/aberp-snapshot/src/take.rs:take_snapshot_with

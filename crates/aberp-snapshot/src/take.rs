@@ -733,11 +733,27 @@ pub fn restore_in_place(
     let db_ckpt = crate::crash_safe::marker_path(db_path);
 
     // ── Step 2/3 — move DB + .wal + .ckpt-ok as ONE unit; mirror stays ──
+    //
+    // **The siblings are named off the PRESERVED path, not suffixed in place.**
+    // `<db>.PRE-RESTORE-<tag>` + `<db>.PRE-RESTORE-<tag>.wal`, NOT
+    // `<db>.wal.PRE-RESTORE-<tag>`. DuckDB finds a WAL by appending `.wal` to
+    // the FULL database filename, so the second spelling produces a WAL that
+    // pairs with nothing: the preserved unit would look complete on disk and
+    // silently open WITHOUT its un-checkpointed commits — which is F4's defect
+    // wearing a different mask, and it is not hypothetical (this exact test
+    // caught it here).
+    //
+    // This follows the in-tree ADR-0099 R3 precedent set by
+    // `recover::preserve_corrupt_db`, which copies to `wal_sibling(&dest)` for
+    // the same reason and states it: "Copying the WAL to `<dest>.wal` keeps the
+    // evidence an openable database." The marker follows the same rule via
+    // `marker_path`, so `checkpoint_is_current` can be asked about the
+    // preserved file directly.
     let preserved_db = suffixed(db_path, &suffix);
     let preserved = PreservedUnit {
+        wal: move_aside_to(&db_wal, &wal_sibling(&preserved_db))?,
+        ckpt_ok: move_aside_to(&db_ckpt, &crate::crash_safe::marker_path(&preserved_db))?,
         db: preserved_db.clone(),
-        wal: move_aside_if_present(&db_wal, &suffix)?,
-        ckpt_ok: move_aside_if_present(&db_ckpt, &suffix)?,
         tag: suffix.clone(),
     };
     std::fs::rename(db_path, &preserved_db).map_err(|e| SnapshotError::io(&preserved_db, e))?;
@@ -799,15 +815,16 @@ fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
-/// Rename `path` to `<path>.<suffix>` when it exists. Returns the new path,
-/// or `None` when there was nothing to move.
-fn move_aside_if_present(path: &Path, suffix: &str) -> Result<Option<PathBuf>> {
+/// Rename `path` to `dest` when it exists. Returns the new path, or `None`
+/// when there was nothing to move (a freshly-checkpointed DB has no WAL, and a
+/// never-checkpointed one has no marker — both are normal, neither is an
+/// error).
+fn move_aside_to(path: &Path, dest: &Path) -> Result<Option<PathBuf>> {
     if !path.exists() {
         return Ok(None);
     }
-    let dest = suffixed(path, suffix);
-    std::fs::rename(path, &dest).map_err(|e| SnapshotError::io(&dest, e))?;
-    Ok(Some(dest))
+    std::fs::rename(path, dest).map_err(|e| SnapshotError::io(dest, e))?;
+    Ok(Some(dest.to_path_buf()))
 }
 
 /// DuckDB names the WAL by appending `.wal` to the FULL filename (so

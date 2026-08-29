@@ -681,6 +681,58 @@ perl -0pi -e 's/if \(stmt ~ \/\\\.write\[ \\t\]\*\\\(\[ \\t\]\*\\\)\/\)      src
 expect_fail "$c" "NON-SHARED audit writer appeared outside the frozen residual" "CHECK 10P — a scanner that stops recognising the shared writer goes RED instead of reporting a clean tree"
 
 
+# ── ADR-0116 D2 — the recovery-evidence guard (CHECK 11) ────────────────
+#
+# The class these probes pin is permanent data loss: an unlink beside the live
+# DB destroys the ONLY record of a durability incident. Prod holds ~330 MB of
+# such artefacts in the tenant homes and ~271 MB outside them, and before this
+# guard the pruner's protection of them was a structural accident.
+
+echo "[CHECK 11] the ADR-0116 hazard, exactly: a new 'clean up the tenant home' helper that enumerates the home and unlinks by prefix, with no guard"
+c="$(fresh)"
+printf '\npub fn _adr0116_probe_tidy_tenant_home(db_path: &std::path::Path) {\n    let parent = db_path.parent().unwrap();\n    for entry in std::fs::read_dir(parent).unwrap().flatten() {\n        let _ = std::fs::remove_file(entry.path());\n    }\n}\n' >> "$c/apps/aberp/src/snapshot.rs"
+expect_fail "$c" "NEW UNGUARDED tenant-home removal appeared" "CHECK 11 — an unguarded tenant-home sweeper is caught (this is recover::cleanup_siblings_with_infix's exact shape, which shipped unguarded)"
+
+echo "[CHECK 11] the same helper INSIDE crates/aberp-snapshot, where the evidence actually lives and where 10i/10k/10L all exclude the corpus"
+c="$(fresh)"
+printf 'pub fn _adr0116_probe_scope(db_path: &std::path::Path) {\n    let wal = db_path.with_extension("wal");\n    let _ = std::fs::remove_file(&wal);\n}\n' > "$c/crates/aberp-snapshot/src/zz_adr0116_probe_scope.rs"
+expect_fail "$c" "NEW UNGUARDED tenant-home removal appeared" "CHECK 11 — a new unguarded removal inside aberp-snapshot (outside every opener check's corpus) is caught"
+
+echo "[CHECK 11] NON-TRIGGER — the SAME helper routed through guarded_remove must be GREEN (a gate that reddens the correct fix would be switched off)"
+c="$(fresh)"
+printf '\npub fn _adr0116_probe_guarded(db_path: &std::path::Path) {\n    let parent = db_path.parent().unwrap();\n    for entry in std::fs::read_dir(parent).unwrap().flatten() {\n        let _ = aberp_snapshot::guarded_remove(&entry.path());\n        let _ = std::fs::remove_file(entry.path());\n    }\n}\n' >> "$c/apps/aberp/src/snapshot.rs"
+expect_pass "$c" "CHECK 11 — a tenant-home removal that consults the guard is correctly GREEN"
+
+echo "[CHECK 11] deleting the shared guard must be RED (it is the predicate every tenant-home helper calls)"
+c="$(fresh)"
+rm -f "$c/crates/aberp-snapshot/src/evidence.rs"
+expect_fail "$c" "ADR-0116 D2 evidence guard missing" "CHECK 11 — a deleted evidence.rs is RED, not vacuously green"
+
+echo "[CHECK 11] F3's REAL defect: making the guard case-SENSITIVE again. 58 of 101 on-disk artefacts escape that, and this bug class was already closed once in this repo's edition DB-guard"
+c="$(fresh)"
+perl -0pi -e 's/to_ascii_lowercase/to_ascii_uppercase_NOT/g' "$c/crates/aberp-snapshot/src/evidence.rs"
+expect_fail "$c" "does not lowercase before matching" "CHECK 11 — a case-SENSITIVE evidence guard is RED"
+
+echo "[CHECK 11] F3's other half: reverting the allow-list INVERSION to a deny-list. 14 artefacts escape even case-insensitively — every healed-*.bak and the sole 2026-08-03 INDEXDESYNC backup"
+c="$(fresh)"
+perl -0pi -e 's/return !name_is_live\(name\);/return false;/' "$c/crates/aberp-snapshot/src/evidence.rs"
+expect_fail "$c" "has lost the allow-list INVERSION" "CHECK 11 — a deny-list-only guard is RED"
+
+echo "[CHECK 11] removing prune's consultation of the guard (D2.3's belt half) must be RED"
+c="$(fresh)"
+perl -0pi -e 's/crate::evidence::is_protected_evidence\(&rec\.dir\)/false/' "$c/crates/aberp-snapshot/src/retention.rs"
+expect_fail "$c" "retention::prune does not consult is_protected_evidence" "CHECK 11 — a pruner that no longer consults the guard is RED (its blindness must be a deliberate refusal, not an accident)"
+
+echo "[CHECK 11] HARNESS — a scanner that stops recognising the guard must be RED (liveness), not a silent green"
+c="$(fresh)"
+perl -0pi -e 's/ng  = split\("is_protected_evidence\|guarded_remove", GUARD, "\|"\)/ng = 0/' "$c/tools/adr0116_evidence_removal_scan.awk"
+expect_fail "$c" "classified ZERO removals as GUARDED" "CHECK 11 — a scanner blind to the guard goes RED instead of reporting a clean tree"
+
+echo "[CHECK 11] HARNESS — deleting the scanner must NOT read as \"no violations\""
+c="$(fresh)"
+rm -f "$c/tools/adr0116_evidence_removal_scan.awk"
+expect_fail "$c" "evidence removal scanner or frozen manifest missing" "CHECK 11 — a deleted scanner is RED, not vacuously green"
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi
