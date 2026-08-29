@@ -721,7 +721,7 @@ expect_fail "$c" "has lost the allow-list INVERSION" "CHECK 11 — a deny-list-o
 echo "[CHECK 11] removing prune's consultation of the guard (D2.3's belt half) must be RED"
 c="$(fresh)"
 perl -0pi -e 's/crate::evidence::is_protected_evidence\(&rec\.dir\)/false/' "$c/crates/aberp-snapshot/src/retention.rs"
-expect_fail "$c" "retention::prune does not consult is_protected_evidence" "CHECK 11 — a pruner that no longer consults the guard is RED (its blindness must be a deliberate refusal, not an accident)"
+expect_fail "$c" "retention::prune does not CONSULT is_protected_evidence" "CHECK 11 — a pruner that no longer consults the guard is RED (its blindness must be a deliberate refusal, not an accident). NOTE the signature is the SCANNER-verdict wording: the first cut of CHECK 11 asserted this with a bare grep, which its own DOC COMMENT satisfied, and this probe ESCAPED"
 
 echo "[CHECK 11] HARNESS — a scanner that stops recognising the guard must be RED (liveness), not a silent green"
 c="$(fresh)"
