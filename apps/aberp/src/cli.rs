@@ -638,6 +638,24 @@ pub enum Command {
     /// atomically install + write the verified-good marker. Refuses (changing
     /// nothing) unless snapshot + mirror prove consistent.
     Recover(RecoverArgs),
+
+    /// **ADR-0116 D3.4** — the guarded IN-PLACE restore that replaces the
+    /// documented hand-swap (`restore to a side path → stop serve → swap the
+    /// file in by hand`).
+    ///
+    /// That hand-swap is the per-incident manual step the durability
+    /// programme set out to eliminate, and it is unjournalled: a crash
+    /// mid-swap is on the operator, not on the code. This performs the same
+    /// sequence in code — refuse unless serve is stopped, snapshot the
+    /// current DB FIRST, move it aside as a `.PRE-RESTORE-<tag>` unit
+    /// (DB + `.wal` + `.ckpt-ok`; the `.audit.log` mirror stays), install
+    /// crash-safely, write a fresh marker, re-verify, and record the restore
+    /// on the restored chain with a durable ack.
+    Restore(RestoreInPlaceArgs),
+
+    /// ADR-0116 D2 — inventory and (explicitly) release recovery evidence.
+    #[command(subcommand)]
+    Evidence(EvidenceCommand),
 }
 
 /// `aberp snapshot <now|list|restore>` (S426 / ADR-0082).
@@ -656,9 +674,46 @@ pub enum SnapshotCommand {
     ///
     /// **Refuses** unless `--confirm` is passed AND `--to` is NOT under
     /// any live `~/.aberp/` tenant home — a fat-fingered restore can never
-    /// clobber the live prod DB. Recover prod by restoring to a side path,
-    /// stopping serve, then swapping the file in.
+    /// clobber the live prod DB. For an in-place recovery use
+    /// `aberp restore --in-place`, which journals the swap the operator
+    /// used to perform by hand (ADR-0116 D3.4).
     Restore(SnapshotRestoreArgs),
+
+    /// ADR-0116 — apply retention to the store ON DEMAND, not only via the
+    /// 4-hourly daemon. `--dry-run` prints the plan and removes nothing.
+    ///
+    /// Failed snapshots are retained as forensic evidence (ADR-0116 G8) and
+    /// recovery evidence is never removable at all (D2), so this can only
+    /// ever remove ordinary superseded rollback points.
+    Prune(SnapshotPruneArgs),
+}
+
+/// `aberp evidence <list|archive>` — ADR-0116 D2, the recovery-evidence
+/// lifecycle.
+///
+/// Evidence lives as siblings of the live DB inside a tenant home, where
+/// `plan_retention` cannot see it: it operates on snapshot records built from
+/// `snap-*` directories with a parseable `meta.json`, and evidence has
+/// neither. ~330 MB accumulated in the tenant homes (plus ~271 MB outside
+/// them) with no way for an operator to even SEE it, and the pruner's
+/// protection of it was a structural accident rather than a deliberate rule.
+///
+/// **Nothing is ever deleted without an explicit command, and the periodic
+/// daemon never runs either of these** — evidence deletion is not a
+/// background activity.
+#[derive(Debug, Subcommand)]
+pub enum EvidenceCommand {
+    /// Inventory the recovery evidence in a tenant home: name, size, age,
+    /// incident tag, and whether the release policy would retain it (and
+    /// why). Read-only.
+    List(EvidenceListArgs),
+
+    /// **Archive-then-remove.** Copy releasable evidence to
+    /// `~/Documents/ABERP-evidence/<tenant>/<incident-tag>/`, verify the copy
+    /// by SHA-256, and only then unlink the original — so "pruned" never
+    /// means "gone". `--dry-run` by default in spirit: `--confirm` is
+    /// required to write anything.
+    Archive(EvidenceArchiveArgs),
 }
 
 /// `aberp recover` (ADR-0095 §1) — guarded, reversible crash recovery; the
@@ -1543,6 +1598,136 @@ pub struct PrintInvoiceArgs {
     pub seller_toml: Option<PathBuf>,
 }
 
+/// `aberp snapshot prune` — ADR-0116, retention on demand.
+#[derive(Debug, Parser)]
+pub struct SnapshotPruneArgs {
+    /// Tenant identifier — selects the per-tenant snapshot store.
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Live DB whose audit ledger records the `snapshot.pruned` event.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Override the snapshot store directory (default per-tenant).
+    #[arg(long)]
+    pub store: Option<PathBuf>,
+
+    /// Print the retention plan and remove NOTHING. Mutually exclusive with
+    /// `--confirm`.
+    #[arg(long, conflicts_with = "confirm")]
+    pub dry_run: bool,
+
+    /// Acknowledge that this removes superseded snapshot directories.
+    #[arg(long)]
+    pub confirm: bool,
+}
+
+/// `aberp evidence list` — ADR-0116 D2.
+#[derive(Debug, Parser)]
+pub struct EvidenceListArgs {
+    /// Tenant identifier — names the tenant home whose evidence is listed.
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Override the tenant home directory (default: the edition-scoped
+    /// `~/.aberp-<edition>/<tenant>/`). Refused if it points at the frozen
+    /// prod line.
+    #[arg(long)]
+    pub home: Option<PathBuf>,
+
+    /// Machine-readable JSON output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `aberp evidence archive` — ADR-0116 D2, archive-then-remove.
+#[derive(Debug, Parser)]
+pub struct EvidenceArchiveArgs {
+    /// Tenant identifier.
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Override the tenant home directory (default per-edition/tenant).
+    #[arg(long)]
+    pub home: Option<PathBuf>,
+
+    /// Live DB whose audit ledger records each `evidence.archived` event.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Only release evidence older than this many days. The policy floor
+    /// (90 days) still applies and cannot be lowered by this flag — a
+    /// smaller value narrows the release, never widens it.
+    #[arg(long, default_value_t = 90)]
+    pub older_than_days: i64,
+
+    /// Override the archive root (default `~/Documents/ABERP-evidence/`).
+    #[arg(long)]
+    pub archive_root: Option<PathBuf>,
+
+    /// Print what would be archived and write NOTHING.
+    #[arg(long, conflicts_with = "confirm")]
+    pub dry_run: bool,
+
+    /// Acknowledge that this moves evidence out of the live tenant home.
+    /// Required; without it nothing is written.
+    #[arg(long)]
+    pub confirm: bool,
+}
+
+/// `aberp restore --in-place` — ADR-0116 D3.4.
+#[derive(Debug, Parser)]
+pub struct RestoreInPlaceArgs {
+    /// Required, and spelled out: this command overwrites a LIVE tenant
+    /// database. There is no other mode — the flag exists so the intent is
+    /// visible in shell history and in a runbook.
+    #[arg(long = "in-place")]
+    pub in_place: bool,
+
+    /// Tenant identifier — selects the tenant home and the snapshot store.
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Which snapshot to restore. `seq` alone is AMBIGUOUS after a prune
+    /// (seq is recycled — ADR-0116 G6); prefer the full directory name or
+    /// the `<seq>@<created_at>#<sha8>` identity that `snapshot list` prints.
+    #[arg(long)]
+    pub snapshot: String,
+
+    /// Path to the live tenant DB to restore INTO (default
+    /// `./aberp.duckdb`; the live one is
+    /// `~/.aberp-<edition>/<tenant>/aberp.duckdb`).
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Override the snapshot store directory (default per-tenant).
+    #[arg(long)]
+    pub store: Option<PathBuf>,
+
+    /// Print the full pre-flight — including the delta against the live DB —
+    /// and write NOTHING.
+    #[arg(long, conflicts_with = "confirm")]
+    pub dry_run: bool,
+
+    /// Acknowledge that this overwrites the live database at `--db`.
+    #[arg(long)]
+    pub confirm: bool,
+
+    /// ADR-0116 D4 — proceed even though the snapshot's audit chain is not
+    /// fully covered by verified timestamp anchors.
+    ///
+    /// On Defense the restore REFUSES without this when
+    /// `anchored_through_seq < chain_len`: the edition's premise is
+    /// court-admissibility, and eIDAS Art. 41(2) weight comes from the
+    /// qualified timestamp over the chain head, not from the hash chain. The
+    /// sanction sits here rather than in validation because a validation gate
+    /// punishes the SNAPSHOT — and `plan_retention` prunes invalid snapshots,
+    /// so gating there would delete the rollback store.
+    #[arg(long)]
+    pub accept_unanchored: bool,
+}
+
 /// `aberp snapshot now` — take one managed, validated snapshot (S426).
 #[derive(Debug, Parser)]
 pub struct SnapshotNowArgs {
@@ -1561,6 +1746,16 @@ pub struct SnapshotNowArgs {
     /// OUTSIDE `~/.aberp/`).
     #[arg(long)]
     pub store: Option<PathBuf>,
+
+    /// ADR-0116 D1.3 — no-op (exit 0) if the store already holds a snapshot
+    /// newer than this many seconds.
+    ///
+    /// This is what makes the out-of-process floor and the in-process daemon
+    /// idempotent against each other: whichever runs first satisfies the
+    /// window and the other no-ops, so a scheduled floor cannot double the
+    /// store's growth rate.
+    #[arg(long)]
+    pub if_stale_secs: Option<u64>,
 }
 
 /// `aberp snapshot list` — list managed snapshots (S426).
@@ -1573,25 +1768,67 @@ pub struct SnapshotListArgs {
     /// Override the snapshot store directory (default per-tenant).
     #[arg(long)]
     pub store: Option<PathBuf>,
+
+    /// ADR-0116 — machine-readable output, for the scheduled floor's job and
+    /// for an operator UI.
+    #[arg(long)]
+    pub json: bool,
+
+    /// ADR-0116 — re-run validation LIVE against each snapshot on disk
+    /// instead of trusting its recorded `meta.json` verdict.
+    ///
+    /// `restore_into` re-runs validation and refuses a snapshot that fails,
+    /// which is correct — but it means a store whose snapshots have bit-rotted
+    /// is UNRESTORABLE with no warning until the incident. This is the
+    /// visibility half of that; running it on the floor's schedule is the
+    /// proactive half.
+    #[arg(long)]
+    pub verify: bool,
 }
 
 /// `aberp snapshot restore <seq|ts> --to <path> --confirm` — guarded
 /// restore via `IMPORT DATABASE` (S426 / ADR-0082).
 #[derive(Debug, Parser)]
 pub struct SnapshotRestoreArgs {
-    /// Which snapshot to restore — a seq (`42`), a full directory name
-    /// (`snap-42-20260615-143000`), or a unique timestamp substring.
+    /// Which snapshot to restore — a full directory name
+    /// (`snap-42-20260615-143000`), the stable identity
+    /// `<seq>@<created_at>#<sha8>` that `snapshot list` prints, a seq
+    /// (`42`), or a unique timestamp substring.
+    ///
+    /// **A bare seq is not a stable identity.** `next_seq` is
+    /// `max(surviving) + 1`, so a pruned seq is RECYCLED — seq 24 names three
+    /// different snapshots in prod's ledger, two of them the
+    /// `validation_failed` pair. A selector that resolves to more than one
+    /// snapshot is REFUSED, never guessed (ADR-0116 D3.3/G6).
     pub selector: String,
 
     /// Target path to rebuild the database INTO. Must NOT be under any
-    /// live `~/.aberp/` tenant home — restore to a side path, then swap.
+    /// live `~/.aberp/` tenant home — for an in-place recovery use
+    /// `aberp restore --in-place` (ADR-0116 D3.4).
     #[arg(long)]
     pub to: PathBuf,
 
     /// Acknowledge that this writes a database at `--to`. Required; the
     /// safety guard refuses without it (`[[trust-code-not-operator]]`).
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["dry_run", "verify_only"])]
     pub confirm: bool,
+
+    /// ADR-0116 D3.2 — print what would happen and write NOTHING: the chosen
+    /// snapshot and its stable identity, age, size, a LIVE re-run of its
+    /// validation, its invoice/audit/chain counts and anchor coverage, the
+    /// resolved target and whether it exists, and **the delta against the
+    /// live DB** — the rows and invoices that exist now and would not exist
+    /// after.
+    ///
+    /// Exit code distinguishes *would proceed* (0) from *would refuse* (1).
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// ADR-0116 D3.2 — run the pre-flight, report, and exit without writing.
+    /// Like `--dry-run` but without the live-DB delta (useful when there is
+    /// no live DB to compare against).
+    #[arg(long)]
+    pub verify_only: bool,
 
     /// Tenant identifier — selects the per-tenant snapshot store and is
     /// recorded on the `snapshot.restored` audit event.

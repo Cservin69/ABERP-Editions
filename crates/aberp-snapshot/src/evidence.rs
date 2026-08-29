@@ -90,6 +90,28 @@ pub const LIVE_TENANT_NAMES: &[&str] = &[
     "issued",
 ];
 
+/// Code-owned TRANSIENT infixes: crash leftovers of operations this crate
+/// performs, which are live-set members rather than evidence.
+///
+/// The allow-list inversion would otherwise freeze every crashed temp file
+/// forever — a helper like [`crate::recover`]'s orphan sweeper would meet a
+/// refusal on `aberp.duckdb.creating-<nanos>` and the tenant home would grow
+/// without bound. These infixes satisfy the same test the named live files
+/// do: **enumerable and stable**, because this crate is the only thing that
+/// writes them and it writes them from named constants.
+///
+/// Safety of the ordering: [`is_protected_evidence`] evaluates
+/// [`EVIDENCE_FRAGMENTS`] FIRST, so a name that is both transient-shaped and
+/// evidence-shaped (`aberp.duckdb.CORRUPT-….creating-1`) is protected. A
+/// transient infix can never un-protect an evidence artefact.
+pub const LIVE_TRANSIENT_INFIXES: &[&str] = &[
+    ".creating-", // recover.rs CREATING_INFIX — a half-built rebuild
+    ".recover-",  // recover.rs RECOVER_INFIX — a half-built recovery
+    ".restoring", // take.rs restore_into staging file
+    ".partial",   // store.rs PARTIAL_SUFFIX — an unfinished EXPORT dir
+    ".tmp.",      // tenant_registry.rs atomic-write staging
+];
+
 /// Evidence name families — the belt-and-braces SECOND predicate, applied
 /// everywhere (not only under a tenant home) and case-insensitively.
 ///
@@ -193,10 +215,13 @@ pub fn name_is_evidence_shaped(name: &str) -> bool {
     EVIDENCE_FRAGMENTS.iter().any(|f| lower.contains(f))
 }
 
-/// `true` if the file NAME is a known-live tenant artefact. Case-insensitive.
+/// `true` if the file NAME is a known-live tenant artefact — either an exact
+/// [`LIVE_TENANT_NAMES`] entry or a code-owned transient
+/// ([`LIVE_TRANSIENT_INFIXES`]). Case-insensitive.
 pub fn name_is_live(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     LIVE_TENANT_NAMES.iter().any(|n| *n == lower)
+        || LIVE_TRANSIENT_INFIXES.iter().any(|i| lower.contains(i))
 }
 
 /// **The shared guard.** `true` if `path` is recovery evidence that must

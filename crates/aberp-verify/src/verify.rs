@@ -1230,6 +1230,12 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::SnapshotValidationFailed
         | EventKind::SnapshotRestored
         | EventKind::SnapshotPruned
+        // ADR-0116 D2 — evidence.* recovery-evidence lifecycle family.
+        // Source/destination paths, byte size, verified SHA-256, incident
+        // tag; app-layer JSON payload, never NAV XML bytes. A durability-ops
+        // row, never swept by a per-OUTGOING-invoice bundle. Exhaustiveness
+        // arm only.
+        | EventKind::EvidenceArchived
         | EventKind::DbAutoRecovered
         // S427 — mes.* machine master-data + quote.* lead-time family.
         // Machine id / name / family / capacity knobs, quote id + day
@@ -1365,7 +1371,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 196,
+        EventKind::ALL_KINDS_COUNT == 197,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

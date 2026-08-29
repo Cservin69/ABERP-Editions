@@ -48,8 +48,17 @@ fn main() -> Result<()> {
             cli::SnapshotCommand::Now(a) => snapshot::run_now(&a),
             cli::SnapshotCommand::List(a) => snapshot::run_list(&a),
             cli::SnapshotCommand::Restore(a) => snapshot::run_restore(&a),
+            cli::SnapshotCommand::Prune(a) => snapshot::run_prune(&a),
         },
         cli::Command::Recover(a) => serve::run_recover(&a),
+        // ADR-0116 D3.4 — the guarded in-place restore that replaces the
+        // documented hand-swap.
+        cli::Command::Restore(a) => snapshot::run_restore_in_place(&a),
+        // ADR-0116 D2 — the recovery-evidence lifecycle.
+        cli::Command::Evidence(cmd) => match cmd {
+            cli::EvidenceCommand::List(a) => snapshot::run_evidence_list(&a),
+            cli::EvidenceCommand::Archive(a) => snapshot::run_evidence_archive(&a),
+        },
     }
 }
 

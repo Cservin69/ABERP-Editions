@@ -62,6 +62,7 @@ pub use evidence::{
     name_is_evidence_shaped, name_is_live, normalise_incident_tag, path_is_under_evidence_root,
     path_is_under_tenant_home, plan_evidence_release, ArchivedArtefact, EvidenceArtefact,
     EvidenceDisposition, EvidencePolicy, RetainReason, EVIDENCE_FRAGMENTS, LIVE_TENANT_NAMES,
+    LIVE_TRANSIENT_INFIXES,
 };
 pub use recover::{
     live_durable_checkpoint, provision_atomic, recover_or_refuse, recover_or_refuse_with_audit,

@@ -991,6 +991,24 @@ fn cleanup_temp(path: &Path) {
 /// left by a crash, without ever touching the live DB or the retained
 /// `.CORRUPT-*` evidence (distinct infixes). Pure best-effort cleanup that
 /// never fails the caller.
+///
+/// # ADR-0116 D2 — this is the helper the evidence guard exists for
+///
+/// This function enumerates a **tenant home** and unlinks by prefix. It is
+/// exactly the shape the ADR names when it says the pruner's protection of
+/// recovery evidence was "satisfied by accident — the pruner is structurally
+/// blind to those files rather than deliberately protective of them… any
+/// future 'clean up the tenant home' helper would meet no guard at all."
+/// This one already existed. It is safe *today* only because the two infixes
+/// it is called with happen not to collide with an evidence family, which is
+/// a property of its two call sites rather than of the function.
+///
+/// Every unlink therefore goes through [`crate::guarded_remove`], which
+/// refuses (loudly) any path [`crate::is_protected_evidence`] protects. The
+/// code-owned transients this sweeps (`.creating-*`, `.recover-*`) are on the
+/// guard's live allow-list, so the sweep keeps working — and a future caller
+/// that passes an infix reaching real evidence gets a refusal and an ERROR
+/// line instead of permanent data loss.
 fn cleanup_siblings_with_infix(db_path: &Path, infix: &str) {
     let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
         return;
@@ -1005,7 +1023,10 @@ fn cleanup_siblings_with_infix(db_path: &Path, infix: &str) {
     for entry in entries.flatten() {
         if let Some(name) = entry.file_name().to_str() {
             if name.starts_with(&prefix) {
-                let _ = std::fs::remove_file(entry.path());
+                // ADR-0116 D2 — guarded, never a bare remove_file. The guard
+                // logs its own refusal LOUD; a plain IO error here stays
+                // best-effort, exactly as before.
+                let _ = crate::evidence::guarded_remove(&entry.path());
             }
         }
     }

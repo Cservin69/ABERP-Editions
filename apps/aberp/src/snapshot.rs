@@ -30,18 +30,22 @@ use tokio_util::sync::CancellationToken;
 use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId};
 use aberp_db::HandleArc;
 use aberp_snapshot::{
-    edition_store_dir, ensure_not_prod_path, ensure_restore_allowed, find_snapshot, list_snapshots,
-    plan_retention, prune, restore_into, take_snapshot_with, MirrorReconcile, RetentionPolicy,
-    SnapshotRecord,
+    edition_store_dir, ensure_not_prod_path, ensure_restore_allowed, list_snapshots,
+    plan_retention, prune, resolve_selector, restore_in_place, restore_into, snapshot_identity,
+    take_snapshot_with, validate_export, MirrorReconcile, RetentionPolicy, SnapshotRecord,
 };
 
 use crate::build_profile;
 
+use crate::audit_payloads::EvidenceArchivedPayload;
 use crate::audit_payloads::{
     SnapshotCreatedPayload, SnapshotPrunedPayload, SnapshotRestoredPayload,
     SnapshotValidationFailedPayload,
 };
-use crate::cli::{SnapshotListArgs, SnapshotNowArgs, SnapshotRestoreArgs};
+use crate::cli::{
+    EvidenceArchiveArgs, EvidenceListArgs, RestoreInPlaceArgs, SnapshotListArgs, SnapshotNowArgs,
+    SnapshotPruneArgs, SnapshotRestoreArgs,
+};
 
 /// Default snapshot cadence: every 4 hours (ADR-0082). Overridable via
 /// `ABERP_SNAPSHOT_INTERVAL_SECS`.
@@ -250,6 +254,13 @@ pub fn policy_from_env() -> RetentionPolicy {
         keep_last: env_usize("ABERP_SNAPSHOT_KEEP_LAST", d.keep_last),
         daily_days: env_i64("ABERP_SNAPSHOT_DAILY_DAYS", d.daily_days),
         weekly_weeks: env_i64("ABERP_SNAPSHOT_WEEKLY_WEEKS", d.weekly_weeks),
+        // ADR-0116 G8 — forensic retention of FAILED snapshots. Overridable
+        // like the rest, but note that setting either to 0 restores the
+        // pre-G8 behaviour in which a snapshot that CAUGHT a defect is
+        // deleted by the cycle that created it. Prod lost real evidence to
+        // that twice.
+        keep_failed: env_usize("ABERP_SNAPSHOT_KEEP_FAILED", d.keep_failed),
+        keep_failed_days: env_i64("ABERP_SNAPSHOT_KEEP_FAILED_DAYS", d.keep_failed_days),
     }
 }
 
@@ -354,6 +365,64 @@ fn emit_reopen_cli(
     ledger
         .append(kind, payload, actor, None)
         .map_err(|e| anyhow::anyhow!("append snapshot audit event (CLI): {e}"))?;
+    // ADR-0116 D3.5 — durably ack the row before returning.
+    //
+    // `Ledger::open` sets `PRAGMA disable_checkpoint_on_shutdown` and nothing
+    // else, and `append` commits a transaction WITHOUT a `durable_ack` and
+    // without syncing the mirror. So after D3.1 the restored FILE is durable
+    // while the row recording the restore is not — a power cut moments later
+    // leaves a **silently-restored database**: the DB is the snapshot's, and
+    // nothing in the ledger says why. On the D-22 precedent the restore event
+    // gets a real flush.
+    durable_ack_cli(db_path)?;
+    Ok(())
+}
+
+/// ADR-0116 D3.5 — flush a CLI-appended audit row (and the DB it landed in)
+/// to the device.
+///
+/// The separate-process CLI has no `aberp_db::Handle`, so `Handle::durable_ack`
+/// — which claims a parked outcome from a `WriteGuard` drop — is unavailable
+/// by construction. This is the equivalent for a process that owns the file
+/// outright: fsync the main DB file and its WAL, then the parent directory.
+///
+/// **Honest scope.** On macOS `File::sync_all` is routed by the stdlib to
+/// `fcntl(F_FULLFSYNC)`, so this is a device flush, not merely a hand-off to
+/// the OS page cache. Linux gets `fsync`; Windows `FlushFileBuffers`. The
+/// residual bottoms out at the drive honouring the flush.
+///
+/// A failure is PROPAGATED, never downgraded to a `warn!` — the whole point
+/// is that the operator learns the restore record is not durable while they
+/// are still at the terminal.
+fn durable_ack_cli(db_path: &Path) -> Result<()> {
+    let mut wal = db_path.as_os_str().to_owned();
+    wal.push(".wal");
+    let wal = PathBuf::from(wal);
+    for p in [db_path, wal.as_path()] {
+        match std::fs::File::open(p) {
+            Ok(f) => f
+                .sync_all()
+                .with_context(|| format!("durable ack: fsync {}", p.display()))?,
+            // No WAL is the normal case after a checkpoint; an absent main DB
+            // would already have failed the append above.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "durable ack: open {} for fsync: {e}",
+                    p.display()
+                ))
+            }
+        }
+    }
+    if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(f) = std::fs::File::open(parent) {
+            // A platform that refuses to open a directory is a soft failure:
+            // the file contents are already flushed, and only the directory
+            // ENTRY (which did not change here — the file already existed) is
+            // at stake.
+            let _ = f.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -600,8 +669,12 @@ pub fn restore_and_emit(
     ensure_not_prod_path(db_path_for_audit).map_err(|e| {
         anyhow::anyhow!("restore audit DB must not be under the frozen prod line: {e}")
     })?;
-    let rec = find_snapshot(store_dir, selector)
-        .map_err(|e| anyhow::anyhow!("find snapshot '{selector}': {e}"))?;
+    // ADR-0116 D3.3 — resolve against the STABLE identity and refuse on
+    // ambiguity. `seq` is recycled after a prune, so the previous
+    // first-match-wins behaviour could silently pick between a good snapshot
+    // and one of the `validation_failed` pair that shared its seq.
+    let rec = resolve_selector(store_dir, selector)
+        .map_err(|e| anyhow::anyhow!("resolve snapshot selector '{selector}': {e}"))?;
     restore_into(&rec.dir, target, tenant.as_str())
         .map_err(|e| anyhow::anyhow!("restore snapshot '{selector}': {e}"))?;
 
@@ -632,11 +705,71 @@ pub fn restore_and_emit(
 // CLI entry points
 // ──────────────────────────────────────────────────────────────────────
 
+/// ADR-0116 D1.2/D1.3 — how stale is the store?
+///
+/// `None` when the store is empty (which is maximally stale). Otherwise the
+/// age of the newest snapshot, valid or not: a failed snapshot still proves
+/// the cadence RAN, and re-running immediately because the last attempt failed
+/// would turn one broken DB into a snapshot storm.
+pub fn newest_snapshot_age(store_dir: &Path, now: OffsetDateTime) -> Option<time::Duration> {
+    let records = list_snapshots(store_dir).ok()?;
+    records.iter().map(|r| r.age(now)).min()
+}
+
+/// `true` if the store has no snapshot newer than `window`.
+///
+/// The shared idempotency predicate behind `--if-stale-secs`, the daemon's
+/// catch-up (D1.2), and every D5 trigger. **This is what makes the
+/// out-of-process floor and the in-process daemon safe to run together**:
+/// whichever fires first satisfies the window and the other no-ops, so
+/// scheduling a floor cannot multiply the store's growth rate.
+pub fn store_is_stale(store_dir: &Path, window: Duration, now: OffsetDateTime) -> bool {
+    match newest_snapshot_age(store_dir, now) {
+        None => true,
+        Some(age) => age.whole_seconds().max(0) as u64 >= window.as_secs(),
+    }
+}
+
 /// `aberp snapshot now` — take one managed, validated snapshot immediately
 /// and apply retention.
 pub fn run_now(args: &SnapshotNowArgs) -> Result<()> {
     let tenant = tenant_id(&args.tenant)?;
     let store_dir = resolve_store(&args.tenant, args.store.as_deref())?;
+
+    // ── ADR-0116 D1.3 — the out-of-process floor's kill switch + window ──
+    //
+    // `ABERP_SNAPSHOT_DISABLE` turns the IN-PROCESS daemon off. The scheduled
+    // floor HONOURS it too: "disabled" must mean disabled, and a backup daemon
+    // that ignores its own kill switch is worse than one that can be switched
+    // off. But it logs LOUD every time it no-ops for this reason, because a
+    // disable set for an unrelated reason must not silently remove the floor —
+    // a floor that no-ops silently is indistinguishable from one that never
+    // existed, which is exactly the condition G1 measured (18.5 % of cadence).
+    if is_disabled() {
+        tracing::error!(
+            env = POLL_DISABLE_ENV,
+            store = %store_dir.display(),
+            "ADR-0116 D1.3 — `aberp snapshot now` is NO-OPPING because {POLL_DISABLE_ENV} is \
+             set. If this is the scheduled daily floor, the RPO floor is currently ABSENT: \
+             nothing outside `aberp serve` is creating rollback points. \
+             Magyarul: a pillanatfelvétel ki van kapcsolva — nincs visszaállítási pont.",
+        );
+        println!("Snapshot skipped: {POLL_DISABLE_ENV} is set. No rollback point was created.");
+        return Ok(());
+    }
+    if let Some(secs) = args.if_stale_secs {
+        let now = OffsetDateTime::now_utc();
+        if !store_is_stale(&store_dir, Duration::from_secs(secs), now) {
+            let age = newest_snapshot_age(&store_dir, now).unwrap_or(time::Duration::ZERO);
+            println!(
+                "Snapshot skipped: the store already holds a snapshot {} old (< {}s window).",
+                human_age(age),
+                secs
+            );
+            return Ok(());
+        }
+    }
+
     let binary_hash = crate::binary_hash::compute().context("compute binary hash")?;
     let actor = cli_actor("system:snapshot-cli");
     let policy = policy_from_env();
@@ -653,61 +786,339 @@ pub fn run_now(args: &SnapshotNowArgs) -> Result<()> {
     )?;
     if rec.meta.valid {
         println!(
-            "Snapshot #{} written and validated → {}\n  invoices={}  audit_rows={}  chain={}  size={}",
+            "Snapshot #{} written and validated → {}\n  id={}  invoices={}  audit_rows={}  chain={}  anchors={}  size={}",
             rec.meta.seq,
             rec.dir.display(),
+            snapshot_identity(&rec.meta),
             rec.meta.invoice_count,
             rec.meta.audit_count,
             rec.meta.chain_len,
+            describe_anchors(&rec.meta),
             human_size(rec.meta.byte_size),
         );
     } else {
         println!(
-            "Snapshot #{} FAILED validation (kept for inspection) → {}\n  reason: {}",
+            "Snapshot #{} FAILED validation (kept as forensic evidence — ADR-0116 G8) → {}\n  id={}\n  reason: {}",
             rec.meta.seq,
             rec.dir.display(),
+            snapshot_identity(&rec.meta),
             rec.meta.validation_error.as_deref().unwrap_or("?"),
         );
     }
     Ok(())
 }
 
-/// `aberp snapshot list` — show seq / timestamp / size / validation / age.
+/// ADR-0116 D4 — render anchor coverage without ever printing `0` for
+/// "not recorded". The whole point of the `-1`/`None` sentinels is that an
+/// operator deciding whether a restored DB can be relied on in court must be
+/// able to tell "checked, none" from "never checked".
+fn describe_anchors(meta: &aberp_snapshot::SnapshotMeta) -> String {
+    match (meta.anchor_count, meta.anchored_through_seq) {
+        (c, _) if c < 0 => "not-recorded".to_string(),
+        (c, None) => format!("{c} rows, coverage not-recorded"),
+        (c, Some(0)) => format!("{c} rows, NONE verified"),
+        (c, Some(through)) => {
+            let short = through < meta.chain_len;
+            format!(
+                "{c} rows, verified through seq {through}/{}{}",
+                meta.chain_len,
+                if short { " (SHORT)" } else { "" }
+            )
+        }
+    }
+}
+
+/// `aberp snapshot list` — show identity / timestamp / size / validation /
+/// age, newest first.
 pub fn run_list(args: &SnapshotListArgs) -> Result<()> {
     let store_dir = resolve_store(&args.tenant, args.store.as_deref())?;
     let records = list_snapshots(&store_dir).context("list snapshots")?;
+    let now = OffsetDateTime::now_utc();
+
+    // ADR-0116 — `--verify` re-runs validation LIVE rather than trusting the
+    // recorded verdict. `restore_into` refuses a snapshot that fails, so a
+    // bit-rotted store is UNRESTORABLE with no warning until the incident.
+    let live: Vec<Option<aberp_snapshot::ValidationReport>> = if args.verify {
+        records
+            .iter()
+            .map(|r| Some(validate_export(&r.dir, &args.tenant)))
+            .collect()
+    } else {
+        records.iter().map(|_| None).collect()
+    };
+
+    if args.json {
+        let rows: Vec<serde_json::Value> = records
+            .iter()
+            .zip(live.iter())
+            .map(|(r, v)| {
+                serde_json::json!({
+                    "id": snapshot_identity(&r.meta),
+                    "seq": r.meta.seq,
+                    "created_at": rfc3339(r.meta.created_at),
+                    "source_db_sha256": r.meta.source_db_sha256,
+                    "dir": r.dir.display().to_string(),
+                    "byte_size": r.meta.byte_size,
+                    "age_seconds": r.age(now).whole_seconds(),
+                    "meta_version": r.meta.meta_version,
+                    "valid_recorded": r.meta.valid,
+                    "valid_live": v.as_ref().map(|v| v.ok),
+                    "invoice_count": r.meta.invoice_count,
+                    "audit_count": r.meta.audit_count,
+                    "chain_len": r.meta.chain_len,
+                    "anchor_count": r.meta.anchor_count,
+                    "anchored_through_seq": r.meta.anchored_through_seq,
+                    "validation_error": r.meta.validation_error,
+                    // G8 — a retained failed snapshot is FORENSIC, not a
+                    // rollback point. A consumer that treats `valid=false` as
+                    // "restorable" would be badly wrong.
+                    "retained_as": if r.meta.valid { "rollback-point" } else { "forensic-evidence" },
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "store": store_dir.display().to_string(),
+                "count": rows.len(),
+                "snapshots": rows,
+            }))?
+        );
+        return Ok(());
+    }
+
     if records.is_empty() {
         println!("No snapshots in {}", store_dir.display());
         return Ok(());
     }
-    let now = OffsetDateTime::now_utc();
     println!("Snapshots in {} (newest first):", store_dir.display());
     println!(
-        "  {:>5}  {:<20}  {:>9}  {:<8}  {:<10}",
-        "SEQ", "TIMESTAMP (UTC)", "SIZE", "STATUS", "AGE"
+        "  {:<34}  {:>9}  {:<18}  {:<8}",
+        "ID (seq@created_at#sha8)", "SIZE", "STATUS", "AGE"
     );
-    for r in &records {
+    for (r, v) in records.iter().zip(live.iter()) {
+        // ADR-0116 G8 — invalid snapshots are RETAINED now, so `list` must
+        // show them distinctly: a rollback store whose newest entries are all
+        // invalid is an incident, not an inventory.
+        let status = match (r.meta.valid, v.as_ref().map(|v| v.ok)) {
+            (true, Some(true)) | (true, None) => "valid".to_string(),
+            (true, Some(false)) => "BIT-ROTTED".to_string(),
+            (false, Some(true)) => "FORENSIC(now-ok)".to_string(),
+            (false, _) => "FORENSIC(invalid)".to_string(),
+        };
         println!(
-            "  {:>5}  {:<20}  {:>9}  {:<8}  {:<10}",
-            r.meta.seq,
-            rfc3339(r.meta.created_at),
+            "  {:<34}  {:>9}  {:<18}  {:<8}",
+            snapshot_identity(&r.meta),
             human_size(r.meta.byte_size),
-            if r.meta.valid { "valid" } else { "INVALID" },
+            status,
             human_age(r.age(now)),
         );
+        if !r.meta.valid {
+            println!(
+                "      ↳ kept as forensic evidence (ADR-0116 G8), NOT restorable: {}",
+                r.meta.validation_error.as_deref().unwrap_or("?")
+            );
+        }
+        if let Some(v) = v {
+            if !v.ok && r.meta.valid {
+                println!(
+                    "      ↳ LIVE re-validation FAILED — this rollback point has bit-rotted: {}",
+                    v.error.as_deref().unwrap_or("?")
+                );
+            }
+        }
     }
     Ok(())
 }
 
-/// `aberp snapshot restore <seq|ts> --to <path> --confirm` — guarded
-/// restore. Refuses without `--confirm` or onto any live `~/.aberp` DB,
-/// BEFORE touching the store (`[[trust-code-not-operator]]`).
+/// The pre-flight ADR-0116 D3.2 prints, shared by `--dry-run`,
+/// `--verify-only`, and the in-place restore's own pre-flight.
+struct RestorePreflight {
+    record: SnapshotRecord,
+    live: aberp_snapshot::ValidationReport,
+    /// Audit rows in the LIVE tenant's durable mirror right now.
+    live_mirror_head: Option<u64>,
+    /// Newest live mirror entry's wall time, so "what would I lose" has a
+    /// date on it and not just a count.
+    live_mirror_newest: Option<String>,
+    /// Reasons the restore would REFUSE. Empty ⇒ it would proceed.
+    refusals: Vec<String>,
+}
+
+/// Build the pre-flight for `selector` against `store_dir`.
+///
+/// The live side is read from the audit-ledger **mirror file**, never by
+/// opening the live database. That is deliberate: `aberp serve` may be
+/// running, and a second DuckDB instance on the live file is the ADR-0098
+/// two-instance hazard this tree spent three sessions closing. The mirror is
+/// the durable record of the chain, so it answers the question that matters
+/// ("how many audit rows exist now that would not exist after") without
+/// touching the file at all.
+fn build_preflight(
+    store_dir: &Path,
+    selector: &str,
+    tenant: &str,
+    live_db: &Path,
+) -> Result<RestorePreflight> {
+    let record = resolve_selector(store_dir, selector)
+        .map_err(|e| anyhow::anyhow!("resolve snapshot selector '{selector}': {e}"))?;
+    // Re-run validation LIVE — never trust the recorded verdict for a
+    // decision this destructive.
+    let live = validate_export(&record.dir, tenant);
+
+    let mirror_path = aberp_audit_ledger::mirror_path_for(live_db);
+    let (live_mirror_head, live_mirror_newest) =
+        match aberp_audit_ledger::read_mirror_entries(&mirror_path) {
+            Ok(entries) => (
+                entries.iter().map(|e| e.seq).max(),
+                entries.last().map(|e| e.time_wall.clone()),
+            ),
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    mirror = %mirror_path.display(),
+                    "ADR-0116 D3.2 — no readable audit mirror beside the live DB; the \
+                     pre-flight reports the snapshot's own numbers without a live delta"
+                );
+                (None, None)
+            }
+        };
+
+    let mut refusals = Vec::new();
+    if !live.ok {
+        refusals.push(format!(
+            "snapshot fails validation LIVE: {}",
+            live.error.as_deref().unwrap_or("?")
+        ));
+    }
+    if !record.meta.valid {
+        refusals.push(format!(
+            "snapshot is recorded valid=false (retained as forensic evidence, ADR-0116 G8): {}",
+            record.meta.validation_error.as_deref().unwrap_or("?")
+        ));
+    }
+    if let Some(head) = live_mirror_head {
+        if head > record.meta.audit_count.max(0) as u64 {
+            refusals.push(format!(
+                "the LIVE database is AHEAD of this snapshot: the durable audit mirror holds \
+                 {head} entries and the snapshot carries {}. Restoring would discard {} \
+                 committed audit entries. Acknowledge deliberately or pick a newer snapshot.",
+                record.meta.audit_count,
+                head.saturating_sub(record.meta.audit_count.max(0) as u64),
+            ));
+        }
+    }
+    Ok(RestorePreflight {
+        record,
+        live,
+        live_mirror_head,
+        live_mirror_newest,
+        refusals,
+    })
+}
+
+fn print_preflight(pf: &RestorePreflight, target: &Path, with_delta: bool) {
+    let m = &pf.record.meta;
+    let now = OffsetDateTime::now_utc();
+    println!("Restore pre-flight (ADR-0116 D3.2 — NOTHING is written):");
+    println!("  snapshot id      {}", snapshot_identity(m));
+    println!("  directory        {}", pf.record.dir.display());
+    println!(
+        "  taken            {}  ({} ago)",
+        rfc3339(m.created_at),
+        human_age(pf.record.age(now))
+    );
+    println!("  size             {}", human_size(m.byte_size));
+    println!("  source DB sha256 {}", m.source_db_sha256);
+    println!(
+        "  validation       recorded={}  live-rerun={}{}",
+        if m.valid { "valid" } else { "INVALID" },
+        if pf.live.ok { "valid" } else { "INVALID" },
+        pf.live
+            .error
+            .as_deref()
+            .map(|e| format!("  ({e})"))
+            .unwrap_or_default()
+    );
+    println!(
+        "  contents         invoices={}  audit_rows={}  chain_len={}",
+        m.invoice_count, m.audit_count, m.chain_len
+    );
+    println!("  anchors          {}", describe_anchors(m));
+    println!(
+        "  target           {}  ({})",
+        target.display(),
+        if target.exists() {
+            "EXISTS — would be overwritten"
+        } else {
+            "does not exist — would be created"
+        }
+    );
+    if with_delta {
+        match pf.live_mirror_head {
+            Some(head) => {
+                let snap = m.audit_count.max(0) as u64;
+                println!(
+                    "  live delta       durable audit mirror holds {head} entries; this snapshot \
+                     carries {snap}"
+                );
+                if head > snap {
+                    println!(
+                        "                   → {} audit entries exist NOW that would NOT exist \
+                         after the restore{}",
+                        head - snap,
+                        pf.live_mirror_newest
+                            .as_deref()
+                            .map(|t| format!(" (newest: {t})"))
+                            .unwrap_or_default()
+                    );
+                } else {
+                    println!("                   → nothing newer than the snapshot would be lost");
+                }
+            }
+            None => println!(
+                "  live delta       UNAVAILABLE — no readable audit mirror beside the live DB. \
+                 The delta is derived from the mirror, never by opening the live database \
+                 (a second DuckDB instance on a live file is the ADR-0098 hazard)."
+            ),
+        }
+    }
+    if pf.refusals.is_empty() {
+        println!("\n  VERDICT: would PROCEED.");
+    } else {
+        println!("\n  VERDICT: would REFUSE —");
+        for r in &pf.refusals {
+            println!("    • {r}");
+        }
+    }
+}
+
+/// `aberp snapshot restore <selector> --to <path> --confirm` — guarded
+/// restore to a SIDE PATH. Refuses without `--confirm` or onto any live
+/// `~/.aberp` DB, BEFORE touching the store (`[[trust-code-not-operator]]`).
 pub fn run_restore(args: &SnapshotRestoreArgs) -> Result<()> {
+    let store_dir = resolve_store(&args.tenant, args.store.as_deref())?;
+
+    // ── ADR-0116 D3.2 — dry-run / verify-only write NOTHING ─────────────
+    if args.dry_run || args.verify_only {
+        let pf = build_preflight(&store_dir, &args.selector, &args.tenant, &args.db)?;
+        print_preflight(&pf, &args.to, args.dry_run);
+        if pf.refusals.is_empty() {
+            return Ok(());
+        }
+        // Exit code distinguishes "would proceed" from "would refuse", so the
+        // scheduled floor's `list --verify` job and any operator script can
+        // branch on it without parsing prose.
+        anyhow::bail!(
+            "pre-flight REFUSES this restore ({} reason(s) above); nothing was written",
+            pf.refusals.len()
+        );
+    }
+
     // Guard first — the safety lives in the binary, not the operator.
     ensure_restore_allowed(&args.to, args.confirm).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let tenant = tenant_id(&args.tenant)?;
-    let store_dir = resolve_store(&args.tenant, args.store.as_deref())?;
     let binary_hash = crate::binary_hash::compute().context("compute binary hash")?;
     let actor = cli_actor("system:snapshot-cli");
 
@@ -722,10 +1133,504 @@ pub fn run_restore(args: &SnapshotRestoreArgs) -> Result<()> {
         actor,
     )?;
     println!(
-        "Restored snapshot #{} → {}\n(verify it, then stop `aberp serve` and swap it into place if this is a prod recovery)",
-        rec.meta.seq,
+        "Restored snapshot {} → {}\n(verify it; for an IN-PLACE recovery use `aberp restore \
+         --in-place`, which journals the swap instead of leaving it to hand)",
+        snapshot_identity(&rec.meta),
         args.to.display()
     );
+    Ok(())
+}
+
+/// `aberp snapshot prune` — ADR-0116, retention on demand.
+pub fn run_prune(args: &SnapshotPruneArgs) -> Result<()> {
+    let tenant = tenant_id(&args.tenant)?;
+    let store_dir = resolve_store(&args.tenant, args.store.as_deref())?;
+    let policy = policy_from_env();
+    let records = list_snapshots(&store_dir).context("list snapshots for retention")?;
+    let plan = plan_retention(&records, &policy, OffsetDateTime::now_utc());
+
+    println!(
+        "Retention plan for {} ({} snapshots):",
+        store_dir.display(),
+        records.len()
+    );
+    println!("  keep  {:?}", plan.keep);
+    println!("  prune {:?}", plan.prune);
+    for r in records.iter().filter(|r| !r.meta.valid) {
+        println!(
+            "  (forensic) seq {} is INVALID and retained as evidence — ADR-0116 G8",
+            r.meta.seq
+        );
+    }
+    if args.dry_run || !args.confirm {
+        println!(
+            "\nNothing removed.{}",
+            if args.dry_run {
+                ""
+            } else {
+                " Pass --confirm to apply, or --dry-run to silence this line."
+            }
+        );
+        return Ok(());
+    }
+    let binary_hash = crate::binary_hash::compute().context("compute binary hash")?;
+    let actor = cli_actor("system:snapshot-cli");
+    let removed = retention_and_emit(
+        &SnapshotAudit::Reopen,
+        &args.db,
+        &store_dir,
+        &tenant,
+        binary_hash,
+        actor,
+        &policy,
+    )?;
+    println!("\nRemoved {} snapshot(s): {:?}", removed.len(), removed);
+    Ok(())
+}
+
+/// **ADR-0116 D3.4** — `aberp restore --in-place`, the guarded in-place
+/// restore that replaces the documented hand-swap.
+pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
+    if !args.in_place {
+        anyhow::bail!(
+            "`aberp restore` has no mode other than --in-place. To restore to a side path use \
+             `aberp snapshot restore <selector> --to <path> --confirm`."
+        );
+    }
+    let tenant = tenant_id(&args.tenant)?;
+    let store_dir = resolve_store(&args.tenant, args.store.as_deref())?;
+    ensure_not_prod_path(&args.db)
+        .map_err(|e| anyhow::anyhow!("in-place restore target must not be the prod line: {e}"))?;
+
+    let pf = build_preflight(&store_dir, &args.snapshot, &args.tenant, &args.db)?;
+
+    // ── D4 — the Defense anchor sanction, at RESTORE time ───────────────
+    //
+    // Defense's premise is court-admissibility, so the instinct to hard-gate
+    // anchors is right in spirit and wrong in placement: a VALIDATION gate
+    // punishes the snapshot, and `plan_retention` prunes invalid snapshots —
+    // so gating there would delete the rollback store. The sanction belongs
+    // where the legal claim is actually made, which is here.
+    let anchors_short = match pf.record.meta.anchored_through_seq {
+        // Not recorded: a pre-D4 snapshot. Warn, do not refuse — refusing
+        // would make every snapshot taken before this change unrestorable.
+        None => {
+            tracing::warn!(
+                "ADR-0116 D4 — this snapshot predates anchor recording; its eIDAS coverage is \
+                 UNKNOWN, not zero"
+            );
+            false
+        }
+        Some(through) => through < pf.record.meta.chain_len,
+    };
+    if anchors_short
+        && matches!(
+            crate::build_profile::EDITION,
+            crate::build_profile::Edition::Defense
+        )
+        && !args.accept_unanchored
+    {
+        anyhow::bail!(
+            "REFUSING: this snapshot's audit chain is not fully covered by verified timestamp \
+             anchors ({}). On Defense a restored database is expected to carry its eIDAS \
+             Art. 41(2) weight, which comes from the qualified timestamp over the chain head, \
+             not from the hash chain. Pass --accept-unanchored to proceed with a database that \
+             cannot prove when its entries were made. \
+             Magyarul: a visszaállított lánc időbélyeg-fedezete hiányos.",
+            describe_anchors(&pf.record.meta)
+        );
+    }
+
+    if args.dry_run || !args.confirm {
+        print_preflight(&pf, &args.db, true);
+        println!(
+            "\n  This is an IN-PLACE restore: {} would be moved aside as a .PRE-RESTORE-<tag> \
+             unit (DB + .wal + .ckpt-ok) and replaced. The .audit.log mirror would NOT move.",
+            args.db.display()
+        );
+        if !args.dry_run {
+            anyhow::bail!("nothing was written — pass --confirm to perform the restore");
+        }
+        if !pf.refusals.is_empty() {
+            anyhow::bail!(
+                "pre-flight REFUSES this restore ({} reason(s) above); nothing was written",
+                pf.refusals.len()
+            );
+        }
+        return Ok(());
+    }
+    if !pf.refusals.is_empty() {
+        anyhow::bail!(
+            "REFUSING this in-place restore:\n{}\nNothing was written. Re-run with --dry-run to \
+             see the full pre-flight.",
+            pf.refusals
+                .iter()
+                .map(|r| format!("  • {r}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    // ── Step 1 — refuse unless serve is stopped. Fail on a live lock; do
+    //    not race it. A DuckDB file lock is held by the serve process, so an
+    //    exclusive open failing IS the signal.
+    ensure_serve_is_stopped(&args.db)?;
+
+    let binary_hash = crate::binary_hash::compute().context("compute binary hash")?;
+    let actor = cli_actor("system:restore-cli");
+    let policy = policy_from_env();
+
+    // ── Step 2 — snapshot the CURRENT database FIRST (G7's sharpest case) ─
+    //
+    // Restoring is the single most destructive operation the system offers,
+    // and until now it did not first preserve what it was about to overwrite.
+    //
+    // F5 — this runs `take_snapshot`, which unconditionally runs
+    // `ensure_consistent_with_db` on the live DB, and THAT can trim the live
+    // mirror in place and mint a `.bak`. It runs BEFORE anything is
+    // overwritten, on the DB that is about to be replaced, and it is the same
+    // reconcile the 4-hourly daemon has been performing all along — so it
+    // introduces no new behaviour, only a new occasion. It is logged as a
+    // DISTINCT pre-restore reconcile so a mirror trim in this window is
+    // attributable, and a mirror that is ahead or deeply corrupt at the moment
+    // of an in-place restore ABORTS the restore rather than being logged past.
+    tracing::warn!(
+        db = %args.db.display(),
+        "ADR-0116 D3.4 step 2 / F5 — PRE-RESTORE snapshot of the live database (this \
+         reconciles the audit mirror; any outcome other than clean/extended aborts)"
+    );
+    let pre_snapshot = take_and_emit(
+        &SnapshotAudit::Reopen,
+        &args.db,
+        &store_dir,
+        &tenant,
+        binary_hash,
+        actor.clone(),
+    )
+    .context("ADR-0116 D3.4 step 2 — mandatory pre-restore snapshot of the live database")?;
+    if !pre_snapshot.meta.valid {
+        anyhow::bail!(
+            "ABORTING the in-place restore: the mandatory pre-restore snapshot of the CURRENT \
+             database failed validation ({}). The live database is untouched. A database that \
+             cannot be snapshotted cannot be safely replaced — investigate first; the failed \
+             snapshot is retained at {} as forensic evidence (ADR-0116 G8).",
+            pre_snapshot.meta.validation_error.as_deref().unwrap_or("?"),
+            pre_snapshot.dir.display()
+        );
+    }
+    println!(
+        "Pre-restore snapshot of the CURRENT database: {} → {}",
+        snapshot_identity(&pre_snapshot.meta),
+        pre_snapshot.dir.display()
+    );
+
+    // ── Steps 3-6 — preserve the unit, install, re-marker, re-verify ────
+    let tag = restore_tag(OffsetDateTime::now_utc());
+    let report = restore_in_place(&pf.record.dir, &args.db, &args.tenant, &tag)
+        .map_err(|e| anyhow::anyhow!("ADR-0116 D3.4 in-place restore: {e}"))?;
+
+    // ── Step 7 — the restore event, on the RESTORED chain ───────────────
+    //
+    // ADR-0116 D3.5 / F8 — WHICH ledger differs per command, and a single
+    // global rule would regress shipped behaviour. `aberp snapshot restore`
+    // (side path) writes to the LIVE ledger, deliberately, so the operator's
+    // main timeline shows a restore happened. Here the live DB IS the restored
+    // DB, so the two collapse and the row is simply the next seq on the
+    // restored chain. No pre-seeded seq, no out-of-band edit of the restored
+    // file (the 2026-08-03 heal-path lesson), and no mirror reconcile AFTER
+    // the install — if the mirror disagrees with the restored DB, that is
+    // `recover_or_refuse`'s decision at next boot.
+    let payload = crate::audit_payloads::SnapshotRestoredPayload {
+        seq: pf.record.meta.seq,
+        snapshot_dir: pf.record.dir.display().to_string(),
+        target: args.db.display().to_string(),
+        restored_at: rfc3339(OffsetDateTime::now_utc()),
+    };
+    emit_snapshot_event(
+        &SnapshotAudit::Reopen,
+        &args.db,
+        &tenant,
+        binary_hash,
+        EventKind::SnapshotRestored,
+        payload.to_bytes(),
+        actor,
+    )
+    .context("append SnapshotRestored to the RESTORED chain (ADR-0116 D3.5)")?;
+
+    let _ = &policy;
+    println!(
+        "\nIn-place restore complete.\n  restored from  {}\n  into           {}\n  preserved      {}\n                 {}\n                 {}\n  re-verified    invoices={} audit_rows={} chain={}\n\nThe .audit.log mirror was NOT moved (it is the durable record and stays at the live \
+         path). If the restored database and the mirror disagree, the next boot's \
+         recover_or_refuse owns that decision.",
+        snapshot_identity(&pf.record.meta),
+        args.db.display(),
+        report.preserved.db.display(),
+        report
+            .preserved
+            .wal
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(no WAL to preserve)".into()),
+        report
+            .preserved
+            .ckpt_ok
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(no checkpoint marker to preserve)".into()),
+        report.installed.invoice_count,
+        report.installed.audit_count,
+        report.installed.chain_len,
+    );
+    Ok(())
+}
+
+/// ADR-0116 D3.4 step 1 — refuse unless `aberp serve` is stopped.
+///
+/// DuckDB holds an exclusive file lock while a read-write connection is open,
+/// so an exclusive open failing IS the signal that serve is up. **Fail on the
+/// lock; never race it** — an in-place swap under a live writer is precisely
+/// the orphaned-inode failure ADR-0111 closed (the shared connection keeps an
+/// fd on the old inode while the rename installs a new one, and every later
+/// commit lands in a file the kernel frees at exit).
+fn ensure_serve_is_stopped(db_path: &Path) -> Result<()> {
+    if !db_path.exists() {
+        return Ok(());
+    }
+    match duckdb::Connection::open(db_path) {
+        Ok(conn) => {
+            // ADR-0098 C2 — never let this probe's drop fold the WAL in place.
+            let _ = conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;");
+            drop(conn);
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "REFUSING the in-place restore: the live database at {} could not be opened \
+             exclusively ({e}). `aberp serve` is almost certainly running. Stop it and re-run — \
+             swapping the file under a live writer strands its connection on an unlinked inode \
+             and every later commit is lost (ADR-0111). \
+             Magyarul: állítsd le az `aberp serve`-t a visszaállítás előtt.",
+            db_path.display()
+        )),
+    }
+}
+
+/// `PRE-RESTORE-<tag>` timestamp, ISO-shaped so it groups with every other
+/// evidence artefact under the ADR-0116 D2 incident keying.
+fn restore_tag(now: OffsetDateTime) -> String {
+    use time::macros::format_description;
+    const TS: &[time::format_description::FormatItem<'_>] =
+        format_description!("[year][month][day]T[hour][minute][second]Z");
+    now.format(TS)
+        .unwrap_or_else(|_| now.unix_timestamp().to_string())
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ADR-0116 D2 — the evidence commands
+// ──────────────────────────────────────────────────────────────────────
+
+/// Resolve the tenant home `~/.aberp-<edition>/<tenant>/`, or an explicit
+/// override. Refused if it points at the frozen prod line.
+pub fn resolve_tenant_home(tenant: &str, explicit: Option<&Path>) -> Result<PathBuf> {
+    let home = match explicit {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let base = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("HOME is not set — cannot resolve tenant home"))?;
+            base.join(crate::build_profile::edition_data_dirname())
+                .join(tenant)
+        }
+    };
+    ensure_not_prod_path(&home)
+        .map_err(|e| anyhow::anyhow!("tenant home must not be under the frozen prod line: {e}"))?;
+    Ok(home)
+}
+
+/// The archive store `~/Documents/ABERP-evidence/`, mirroring the snapshot
+/// store's "outside the repo, outside `~/.aberp/`" property.
+fn resolve_archive_root(explicit: Option<&Path>) -> Result<PathBuf> {
+    let root = match explicit {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let base = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("HOME is not set — cannot resolve archive root"))?;
+            base.join("Documents").join("ABERP-evidence")
+        }
+    };
+    ensure_not_prod_path(&root)
+        .map_err(|e| anyhow::anyhow!("archive root must not be under the frozen prod line: {e}"))?;
+    Ok(root)
+}
+
+/// `aberp evidence list` — the ~600 MB nobody could previously see.
+pub fn run_evidence_list(args: &EvidenceListArgs) -> Result<()> {
+    let home = resolve_tenant_home(&args.tenant, args.home.as_deref())?;
+    let artefacts = aberp_snapshot::list_evidence(&home)
+        .map_err(|e| anyhow::anyhow!("list evidence in {}: {e}", home.display()))?;
+    let policy = aberp_snapshot::EvidencePolicy::default();
+    let dispositions =
+        aberp_snapshot::plan_evidence_release(&artefacts, &policy, OffsetDateTime::now_utc());
+    let total: u64 = artefacts.iter().map(|a| a.byte_size).sum();
+
+    if args.json {
+        let rows: Vec<serde_json::Value> = dispositions
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "name": d.artefact.name,
+                    "path": d.artefact.path.display().to_string(),
+                    "byte_size": d.artefact.byte_size,
+                    "modified_at": rfc3339(d.artefact.modified_at),
+                    "incident_tag": d.artefact.incident_tag,
+                    "credential_material": d.artefact.is_credential_material,
+                    "releasable": d.retained_because.is_none(),
+                    "retained_because": d.retained_because.as_ref().map(|r| format!("{r:?}")),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "tenant_home": home.display().to_string(),
+                "count": rows.len(),
+                "total_bytes": total,
+                "artefacts": rows,
+            }))?
+        );
+        return Ok(());
+    }
+
+    if artefacts.is_empty() {
+        println!("No recovery evidence in {}", home.display());
+        return Ok(());
+    }
+    println!(
+        "Recovery evidence in {} — {} artefact(s), {}:",
+        home.display(),
+        artefacts.len(),
+        human_size(total)
+    );
+    println!(
+        "  {:<58}  {:>9}  {:<18}  STATUS",
+        "NAME", "SIZE", "INCIDENT"
+    );
+    for d in &dispositions {
+        println!(
+            "  {:<58}  {:>9}  {:<18}  {}",
+            d.artefact.name,
+            human_size(d.artefact.byte_size),
+            d.artefact.incident_tag.as_deref().unwrap_or("(untagged)"),
+            match &d.retained_because {
+                None => "releasable".to_string(),
+                Some(r) => format!("RETAINED: {r:?}"),
+            }
+        );
+    }
+    println!(
+        "\nNothing here is ever deleted by the periodic daemon. `aberp evidence archive` \
+         copies releasable artefacts to the archive store, verifies the copy, and only then \
+         unlinks the original — release is never deletion."
+    );
+    Ok(())
+}
+
+/// `aberp evidence archive` — the ONLY sanctioned release path.
+pub fn run_evidence_archive(args: &EvidenceArchiveArgs) -> Result<()> {
+    let tenant = tenant_id(&args.tenant)?;
+    let home = resolve_tenant_home(&args.tenant, args.home.as_deref())?;
+    let archive_root = resolve_archive_root(args.archive_root.as_deref())?;
+    let artefacts = aberp_snapshot::list_evidence(&home)
+        .map_err(|e| anyhow::anyhow!("list evidence in {}: {e}", home.display()))?;
+
+    // The 90-day floor cannot be LOWERED by the flag: `--older-than-days`
+    // narrows the release, never widens it. An operator who wants a shorter
+    // floor is asking to delete evidence from a live incident.
+    let default = aberp_snapshot::EvidencePolicy::default();
+    let policy = aberp_snapshot::EvidencePolicy {
+        age_floor_days: args.older_than_days.max(default.age_floor_days),
+        ..default
+    };
+    if args.older_than_days < default.age_floor_days {
+        tracing::warn!(
+            requested = args.older_than_days,
+            enforced = policy.age_floor_days,
+            "ADR-0116 D2 — --older-than-days is below the {}-day policy floor and was RAISED to \
+             it. The floor narrows a release, never widens one.",
+            default.age_floor_days
+        );
+    }
+    let dispositions =
+        aberp_snapshot::plan_evidence_release(&artefacts, &policy, OffsetDateTime::now_utc());
+    let releasable: Vec<_> = dispositions
+        .iter()
+        .filter(|d| d.retained_because.is_none())
+        .collect();
+
+    println!(
+        "Evidence release plan for {} (archive → {}):",
+        home.display(),
+        archive_root.display()
+    );
+    for d in &dispositions {
+        println!(
+            "  {:<58}  {}",
+            d.artefact.name,
+            match &d.retained_because {
+                None => "would ARCHIVE".to_string(),
+                Some(r) => format!("retained ({r:?})"),
+            }
+        );
+    }
+    if releasable.is_empty() {
+        println!("\nNothing is releasable under the policy. Nothing written.");
+        return Ok(());
+    }
+    if args.dry_run || !args.confirm {
+        println!(
+            "\n{} artefact(s) would be archived. Nothing written.{}",
+            releasable.len(),
+            if args.dry_run {
+                ""
+            } else {
+                " Pass --confirm to apply."
+            }
+        );
+        return Ok(());
+    }
+
+    let binary_hash = crate::binary_hash::compute().context("compute binary hash")?;
+    let actor = cli_actor("system:evidence-cli");
+    let mut archived = 0usize;
+    for d in &releasable {
+        let out = aberp_snapshot::archive_then_remove(&d.artefact, &archive_root, &args.tenant)
+            .map_err(|e| anyhow::anyhow!("archive {}: {e}", d.artefact.path.display()))?;
+        let payload = EvidenceArchivedPayload {
+            archived_from: out.from.display().to_string(),
+            archived_to: out.to.display().to_string(),
+            byte_size: out.byte_size,
+            sha256: out.sha256,
+            incident_tag: d
+                .artefact
+                .incident_tag
+                .clone()
+                .unwrap_or_else(|| "untagged".into()),
+            archived_at: rfc3339(OffsetDateTime::now_utc()),
+        };
+        emit_snapshot_event(
+            &SnapshotAudit::Reopen,
+            &args.db,
+            &tenant,
+            binary_hash,
+            EventKind::EvidenceArchived,
+            payload.to_bytes(),
+            actor.clone(),
+        )
+        .context("append EvidenceArchived")?;
+        archived += 1;
+        println!("  archived {} → {}", out.from.display(), out.to.display());
+    }
+    println!("\n{archived} artefact(s) archived. Each was verified by SHA-256 before its original was unlinked.");
     Ok(())
 }
 
@@ -772,9 +1677,44 @@ pub async fn run_supervised(deps: SnapshotDaemonDeps, cancel: CancellationToken)
         _ = cancel.cancelled() => return,
         _ = tokio::time::sleep(Duration::from_secs(BOOT_DELAY_SECS)) => {}
     }
+
+    // ── ADR-0116 D1.2 — CATCH-UP on start ───────────────────────────────
+    //
+    // Before entering the loop, compare `now` against the newest snapshot in
+    // the store; if the store is staler than `interval`, take one immediately
+    // instead of waiting a full interval.
+    //
+    // **This is a FRESHNESS improvement, not an RPO improvement**, and the
+    // ADR's first draft had that backwards. Trace it through the real incident
+    // gap: catch-up takes a snapshot at `restart + 60 s`, which in the
+    // 2026-08-17 → 08-23 gap lands a rollback point on 08-23 — *after* the
+    // 08-22 incident. A post-incident rollback point cannot roll back the
+    // incident. D1.2 creates ZERO rollback points inside a gap; its whole
+    // benefit is bounding staleness to <= `interval` once serve is back. The
+    // change that creates rollback points inside a gap is the out-of-process
+    // floor (D1.3), which is a host-level `launchd` artefact, not this loop.
     loop {
         if cancel.is_cancelled() {
             return;
+        }
+        // The staleness check applies to EVERY tick, not only the first: a
+        // scheduled out-of-process floor (D1.3) or a D5 trigger may already
+        // have satisfied this window, and taking a second snapshot for the
+        // same window is pure store growth. Whichever ran first wins; the
+        // other no-ops. This is what makes the floor and the daemon safe to
+        // run together.
+        if !store_is_stale(&deps.store_dir, deps.interval, OffsetDateTime::now_utc()) {
+            tracing::debug!(
+                store = %deps.store_dir.display(),
+                "ADR-0116 D1.2 — the store already holds a snapshot within one interval; \
+                 skipping this tick's snapshot (the floor or a trigger got there first)"
+            );
+            let nap = sleep_to_next_grid_boundary(deps.interval, OffsetDateTime::now_utc());
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(nap) => {}
+            }
+            continue;
         }
         let db = deps.db_path.clone();
         let store = deps.store_dir.clone();
@@ -818,10 +1758,101 @@ pub async fn run_supervised(deps: SnapshotDaemonDeps, cancel: CancellationToken)
                 tracing::error!(error = %join, "snapshot cycle task panicked; daemon continues")
             }
         }
+        // ── ADR-0116 D1.1 — sleep to the next wall-clock GRID boundary ──
+        //
+        // The loop used to sleep `interval` AFTER the cycle completed, so each
+        // tick drifted by however long the cycle took. Measured drift on the
+        // clean runs is ~0.27 s per tick (20:01:09.406 → 00:01:09.679 →
+        // 04:01:09.948), so this is **cosmetic** — it is here because it is
+        // nearly free, and it must not be counted as part of the risk
+        // reduction. The RPO fix is the out-of-process floor.
+        let nap = sleep_to_next_grid_boundary(deps.interval, OffsetDateTime::now_utc());
         tokio::select! {
             _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(deps.interval) => {}
+            _ = tokio::time::sleep(nap) => {}
         }
+    }
+}
+
+/// ADR-0116 D1.1 — how long until the next `interval` boundary on the UTC
+/// wall-clock grid.
+///
+/// Pure (the caller passes `now`) so the boundary arithmetic is testable
+/// without waiting four hours. Never returns zero: landing exactly on a
+/// boundary sleeps a full interval rather than spinning.
+pub fn sleep_to_next_grid_boundary(interval: Duration, now: OffsetDateTime) -> Duration {
+    let secs = interval.as_secs();
+    if secs == 0 {
+        return interval;
+    }
+    let epoch = now.unix_timestamp().max(0) as u64;
+    let past = epoch % secs;
+    let remaining = secs - past;
+    // `past == 0` gives `remaining == secs`, which is what we want.
+    Duration::from_secs(remaining)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ADR-0116 D5 — snapshot at the moments that warrant one
+// ──────────────────────────────────────────────────────────────────────
+
+/// ADR-0116 D5 — take a snapshot at a moment that warrants one, unless the
+/// store already holds one within `interval`.
+///
+/// Every D5 trigger routes through here, so none of them can produce a
+/// snapshot storm: the same staleness check D1.2 uses bounds them all.
+/// Best-effort by contract — a trigger that fails logs LOUD and returns; a
+/// snapshot hiccup must never wedge a shutdown or a boot.
+///
+/// `reason` names the trigger in the log so a snapshot appearing outside the
+/// 4-hourly cadence is attributable.
+pub fn trigger_snapshot_if_stale(
+    audit: &SnapshotAudit<'_>,
+    db_path: &Path,
+    store_dir: &Path,
+    tenant: &TenantId,
+    binary_hash: BinaryHash,
+    policy: &RetentionPolicy,
+    interval: Duration,
+    reason: &'static str,
+) {
+    let now = OffsetDateTime::now_utc();
+    if !store_is_stale(store_dir, interval, now) {
+        tracing::debug!(
+            reason,
+            "ADR-0116 D5 — trigger skipped: the store already holds a snapshot within one \
+             interval"
+        );
+        return;
+    }
+    tracing::info!(
+        reason,
+        db = %db_path.display(),
+        "ADR-0116 D5 — taking a snapshot at a moment that warrants one"
+    );
+    let actor = cli_actor("system:snapshot-trigger");
+    match run_cycle(
+        audit,
+        db_path,
+        store_dir,
+        tenant,
+        binary_hash,
+        actor,
+        policy,
+    ) {
+        Ok(rec) => tracing::info!(
+            reason,
+            seq = rec.meta.seq,
+            valid = rec.meta.valid,
+            "ADR-0116 D5 — trigger snapshot taken"
+        ),
+        Err(e) => tracing::error!(
+            reason,
+            error = %e,
+            "ADR-0116 D5 — trigger snapshot FAILED. This is logged and swallowed: a snapshot \
+             must never wedge a shutdown or a boot. The rollback point for this moment does \
+             NOT exist."
+        ),
     }
 }
 

@@ -959,6 +959,10 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::SnapshotValidationFailed
         | EventKind::SnapshotRestored
         | EventKind::SnapshotPruned
+        // ADR-0116 D2 — evidence.* recovery-evidence lifecycle. Filesystem
+        // paths, byte size, verified SHA-256, incident tag; app-layer JSON,
+        // never NAV XML bytes, never swept by a per-OUTGOING-invoice bundle.
+        | EventKind::EvidenceArchived
         | EventKind::DbAutoRecovered
         // S427 — mes.* machine master-data + quote.* lead-time family.
         // Machine id / name / family / capacity knobs, quote id + day
@@ -1100,7 +1104,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 196,
+        EventKind::ALL_KINDS_COUNT == 197,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

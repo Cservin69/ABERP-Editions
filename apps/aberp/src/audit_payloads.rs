@@ -5659,6 +5659,38 @@ impl SnapshotPrunedPayload {
     }
 }
 
+/// Payload for [`aberp_audit_ledger::EventKind::EvidenceArchived`] —
+/// ADR-0116 D2.
+///
+/// Recovery evidence released from a live tenant home by the explicit
+/// `aberp evidence archive` command. **Release is not deletion**: the
+/// artefact was copied to `archived_to`, the copy was verified against
+/// `sha256`, and only then was the original unlinked. `evidence.*` family;
+/// app-layer JSON only, never NAV XML bytes.
+///
+/// The paths are recorded verbatim so a later investigation can find the
+/// artefact. They are filesystem paths under the operator's own home — no
+/// customer data, no credentials, and (by policy) credential material is
+/// never archived at all, so a `*keychain*` path can never appear here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceArchivedPayload {
+    pub archived_from: String,
+    pub archived_to: String,
+    pub byte_size: u64,
+    /// SHA-256 of the archived bytes, verified by re-reading the copy from
+    /// disk before the original was unlinked.
+    pub sha256: String,
+    /// Normalised ISO incident tag the artefact was grouped under.
+    pub incident_tag: String,
+    pub archived_at: String,
+}
+
+impl EvidenceArchivedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // ADR-0095 §1 — boot/CLI auto-recovery of a torn DB or ahead mirror.
 // `db.*` family payload. App-layer JSON only, never NAV XML bytes.

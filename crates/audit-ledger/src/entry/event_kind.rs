@@ -2658,6 +2658,20 @@ pub enum EventKind {
     /// count. `snapshot.*` family.
     SnapshotPruned,
 
+    /// **ADR-0116 D2** — recovery evidence was released from a live tenant
+    /// home by the explicit `aberp evidence archive` command: copied to
+    /// `~/Documents/ABERP-evidence/<tenant>/<incident-tag>/`, verified by
+    /// SHA-256, and only then unlinked. Payload
+    /// (`EvidenceArchivedPayload`) carries the source and destination paths,
+    /// the byte size, the verified hash, and the incident tag.
+    ///
+    /// **Release is not deletion.** The artefact still exists; it has moved.
+    /// Emitted only from the operator command — never from the periodic
+    /// daemon, because evidence deletion is not a background activity.
+    /// `evidence.*` family; app-layer JSON only, never NAV XML bytes, and
+    /// never swept into a per-invoice export bundle.
+    EvidenceArchived,
+
     /// ADR-0095 §1 — the boot/CLI auto-recovery engine repaired a
     /// torn/unopenable live DB or an ahead-of-DB mirror by rebuilding from
     /// the latest valid snapshot + a verbatim REPLAY of the preserved mirror
@@ -3413,6 +3427,7 @@ impl EventKind {
             EventKind::SnapshotValidationFailed => "snapshot.validation_failed",
             EventKind::SnapshotRestored => "snapshot.restored",
             EventKind::SnapshotPruned => "snapshot.pruned",
+            EventKind::EvidenceArchived => "evidence.archived",
             EventKind::DbAutoRecovered => "db.auto_recovered",
             EventKind::MachineCreated => "mes.machine_created",
             EventKind::MachineEdited => "mes.machine_edited",
@@ -3641,6 +3656,7 @@ impl EventKind {
             "snapshot.validation_failed" => Ok(EventKind::SnapshotValidationFailed),
             "snapshot.restored" => Ok(EventKind::SnapshotRestored),
             "snapshot.pruned" => Ok(EventKind::SnapshotPruned),
+            "evidence.archived" => Ok(EventKind::EvidenceArchived),
             "db.auto_recovered" => Ok(EventKind::DbAutoRecovered),
             "mes.machine_created" => Ok(EventKind::MachineCreated),
             "mes.machine_edited" => Ok(EventKind::MachineEdited),
@@ -3859,6 +3875,7 @@ impl EventKind {
         EventKind::SnapshotValidationFailed,
         EventKind::SnapshotRestored,
         EventKind::SnapshotPruned,
+        EventKind::EvidenceArchived,
         EventKind::DbAutoRecovered,
         EventKind::MachineCreated,
         EventKind::MachineEdited,
@@ -4083,6 +4100,8 @@ mod tests {
             EventKind::SnapshotValidationFailed,
             EventKind::SnapshotRestored,
             EventKind::SnapshotPruned,
+            EventKind::EvidenceArchived,
+            EventKind::EvidenceArchived,
             EventKind::DbAutoRecovered,
             EventKind::MachineCreated,
             EventKind::MachineEdited,

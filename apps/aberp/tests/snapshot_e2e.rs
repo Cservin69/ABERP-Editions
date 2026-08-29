@@ -187,6 +187,11 @@ fn retention_emits_pruned_event_and_removes_dirs() {
         keep_last: 1,
         daily_days: 0,
         weekly_weeks: 0,
+        // ADR-0116 G8 — this e2e predates forensic retention of FAILED
+        // snapshots and uses an all-valid fixture, so 0/0 preserves its
+        // original intent exactly.
+        keep_failed: 0,
+        keep_failed_days: 0,
     };
     let removed = retention_and_emit(
         &SnapshotAudit::Reopen,
