@@ -522,8 +522,10 @@ under-match silently reopens F1. It covers the discriminations the journey canno
 an empty home, live files, evidence from OTHER incident families (`PRE-DEDUP`,
 `PRE-RECONCILE`, `CORRUPT-BACKUP`, all of which sit in real tenant homes today), a unit
 belonging to a DIFFERENT database in the same home, and the four-files-one-finding fold.
-Non-vacuous under two mutations: dropping the db-name discrimination (over-match) and
-dropping the sibling fold (four findings for one interruption) each turn it RED.
+Non-vacuous under three mutations, each turning it RED: dropping the db-name
+discrimination (over-match — it then fires on `other.duckdb`'s unit and would refuse a
+boot because a DIFFERENT database was restored), making the detector return nothing
+(under-match), and dropping the sibling fold (four findings for one interruption).
 
 ### F2 — a refusal that named a flag which cannot work
 
@@ -555,6 +557,21 @@ unreadable `audit_ledger`, no flag) and `journey_the_pre_restore_snapshot_abort_
 (a tampered chain, `--accept-data-loss` passed — the dead end the adversarial walked as
 `p18`). Both also assert the refusal is still a refusal and the live DB is untouched, so a
 future "fix" that turned a message into a permission would be RED.
+
+**Both pins were vacuous as first written, and the mutation run is what caught it.**
+They asserted `contains("aberp recover")` plus the two paths *separately*, against the
+command's whole combined stdout+stderr. Gutting `recover_hint` to return a bare string
+left `journey_the_pre_restore_snapshot_abort_names_recover` **GREEN**: the phrase survives
+in the prose that introduces the hint, the store path appears anyway inside the retained
+forensic snapshot's own directory, and the db path had already been printed by the
+pre-flight. The pin could not distinguish a pasteable command from a gutted one — which
+is the entire content of F2. Both now assert the exact
+`aberp recover --db … --tenant … --store …` string and are RED under that mutation.
+
+The general shape is worth keeping: **asserting on a whole captured output is a weak pin,
+because the output has many authors.** A substring that the message under test is supposed
+to contribute may already be contributed by three other lines, and the test then passes
+for reasons unrelated to the behaviour it names.
 
 ### CHECK 11 — the two remaining spellings, deliberately deferred
 
