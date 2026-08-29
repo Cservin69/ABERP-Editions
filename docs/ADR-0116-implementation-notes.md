@@ -620,6 +620,35 @@ No de-gating, no `continue-on-error`, no skipped probe.
 
 No enforcement flag was disabled and no check was skipped.
 
+### Rev 4 measured results (2026-08-29, worktree `~/Documents/Claude/Projects/ABERP-snap-wt`, `--features production`, `--locked`)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo build --workspace --locked --all-targets` | clean |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | clean |
+| `cargo build --workspace --locked --release` | clean |
+| `cargo test --workspace --locked --no-fail-fast` | **205 test binaries, 3 465 tests, 0 failures** |
+| ADR-0098 Handle e2e / ADR-0105 lock-domain e2e / ADR-0110 durable-ack fault injection | PASSED / PASSED / PASSED |
+| Edition-isolation (`aberp` ×2, `aberp-snapshot`), crash-safe checkpoint, mirror-ahead | PASSED |
+| `ADR-0093 DB-isolation cut-gate` (CHECK 1-11, all ENFORCED) | **PASSED** — 29 removal sites classified, 3 guarded, 9 frozen tenant-home sites |
+| `ADR-0111 checkpoint-site cut-gate` + probes | PASSED |
+| `ADR-0110 D3 durable-ack gate` + probes | PASSED |
+| `cut_gate_negative_probes.sh` | **PASSED — `probes passed: 77   broken/escaped: 0`**, `ALL CHECKS HAVE TEETH` |
+| `cargo deny check` | advisories ok, bans ok, licenses ok, sources ok |
+
+No enforcement flag was disabled, no check skipped, no `continue-on-error`.
+
+**The two `aberp_cad_extract` reds did not occur** — the venv at
+`~/Documents/Claude/Projects/ABERP-snap-venv` (editable install of
+`python/aberp-cad-extract[step]`, `ABERP_TEST_PYTHON` absolute) was provisioned, and both
+`step_extract_smoke` and `hole_mining_failure` passed. They remain environmental, not code.
+`serve_numbering_route::put_preserves_identity_and_bank_sections` also passed (see the rev-3
+note below — pre-existing, out of scope).
+
+CHECK 11 classifies **29 removal sites / 3 guarded / 9 frozen**, identical to rev 3:
+rev 4's scanner change is header comment only and moves no verdict.
+
 ### Rev 3 note — a test-isolation flake that is NOT ours
 
 `apps/aberp/tests/serve_numbering_route.rs::put_preserves_identity_and_bank_sections`
