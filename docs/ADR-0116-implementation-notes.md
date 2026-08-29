@@ -198,6 +198,23 @@ Said here rather than papered over.
 
 ---
 
+## The one probe that escaped, and what it says about the check
+
+CHECK 11's first cut asserted "prune consults the guard" with a bare
+`grep -q is_protected_evidence crates/aberp-snapshot/src/retention.rs`. The negative
+probe that neuters the real call **ESCAPED**: the function's own DOC COMMENT names
+`is_protected_evidence`, so the grep still matched and the gate stayed green.
+
+That is the flip-by-editing-a-comment class already on record in this repo (the ADR-0098
+opener-scan char-literal bug) — reproduced by me, in a brand-new check, while writing the
+check whose whole purpose is to not be fooled. It is the strongest argument in this
+branch for why negative probes are non-optional: the gate was green, the code was
+correct, and the check was worthless.
+
+Now asserted via the SCANNER's `GUARDED` verdict, which strips comments and strings
+before matching. Verified: with the call neutered, `grep -c` still returns 1 and the gate
+goes RED.
+
 ## Gate results
 
 Recorded in the branch's final commit message. Both required checks

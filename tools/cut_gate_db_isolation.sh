@@ -1362,9 +1362,6 @@ else
   # The allow-list inversion: the primary predicate must be "not live => evidence".
   grep -q '!name_is_live' "$ev_src" \
     || flag11 "✗ $ev_src has lost the allow-list INVERSION (!name_is_live). A deny-list of named families missed 14 artefacts even case-insensitively, including every healed-*.bak and the sole 2026-08-03 INDEXDESYNC backup (ADR-0116 D2.2)"
-  # prune must consult it — the belt half of D2.3.
-  grep -q "is_protected_evidence" "crates/aberp-snapshot/src/retention.rs" \
-    || flag11 "✗ retention::prune does not consult is_protected_evidence — the pruner's blindness to evidence must be a DELIBERATE refusal, not a structural accident (ADR-0116 D2.3)"
 fi
 
 # 11b/11c — the frozen TENANT_HOME set.
@@ -1402,6 +1399,19 @@ else
     if [[ -n "$ev_shrunk" ]]; then
       note "  (info) tenant-home removal sites guarded/removed since freeze — refresh $ev_manifest to lock the smaller set:"
       printf '%s\n' "$ev_shrunk" | sed 's/^/      /'
+    fi
+    # 11d — `retention::prune` must actually CALL the guard (D2.3's belt half).
+    #
+    # Asserted via the SCANNER's verdict, never with a bare grep. The first cut
+    # grepped retention.rs for the string `is_protected_evidence`, and its own
+    # DOC COMMENT names the function — so neutering the real call left the gate
+    # green and the negative probe ESCAPED. That is the flip-by-editing-a-
+    # comment class already on record in this repo (the ADR-0098 opener-scan
+    # char-literal bug), reproduced here in a new check. The scanner strips
+    # comments and strings before matching, so its GUARDED verdict means the
+    # call is real code.
+    if ! grep -q '^crates/aberp-snapshot/src/retention.rs:prune:GUARDED:' "$ev_raw"; then
+      flag11 "✗ retention::prune does not CONSULT is_protected_evidence (scanner verdict, comment-aware) — the pruner's blindness to evidence must be a DELIBERATE refusal, not a structural accident (ADR-0116 D2.3)"
     fi
     # 11c — liveness. A scanner that emits nothing makes 11b vacuously green.
     # The tree has ~30 removal sites across the three classes; require the
