@@ -457,6 +457,146 @@ back to adversarial before the v0.6.3 cut, and a wide diff is harder to attack.
 
 ---
 
+## Revision 4 — the rev-3 adversarial's FIX-FIRST verdict, applied
+
+Source: `docs/_adversarial-adr-0116-snapshot-rev2.md` (branch @ `252e8b5`), verdict
+**FIX-FIRST**, two findings. The blocker and all seven rev-3 fix-firsts were re-verified
+BY PROBE and confirmed closed, with the F2 and F6 pins proven non-vacuous under mutation.
+Both findings below are RED before their fix.
+
+### F1 — the blocker fix deleted the only detector of an INTERRUPTED restore
+
+The rev-3 fix moved the `.audit.log` mirror into the preserved unit. That closed the
+boot-after-rollback blocker and, in the same stroke, removed the signal that caught a
+restore interrupted mid-flight. The adversarial reproduced it end to end with a real
+SIGINT:
+
+| | mirror left at the live path (rev 2) | mirror moved into the unit (rev 3) |
+|---|---|---|
+| `^C` mid-restore, then `aberp serve` | `ERROR audit_mirror_AHEAD_of_db` → **REFUSES**, loudly | `boot-check: PASSED` on an **EMPTY company** |
+
+40 005 invoices and 8 audit rows before; `0` and `0` after; the only log lines `INFO`.
+
+**No data is lost** — the `.PRE-RESTORE-` unit is intact and complete (DB + WAL + mirror),
+and it is protected evidence. But a fresh empty tenant provisioned over a half-done
+restore, reported as `PASSED`, is strictly worse than the refusal it replaced. It is the
+same sentence as rev 2's finding one level down: **on disk, a completed restore and an
+interrupted one were indistinguishable.**
+
+The mechanism: `restore_in_place` moves the live DB aside at step 2 and installs the
+replacement at step 3. Between them the live path holds nothing, which is byte-for-byte
+what a first launch looks like from `serve.rs`'s provisioning branch — so it provisioned.
+`grep -n "PRE-RESTORE" apps/aberp/src/serve.rs` returned nothing.
+
+**The fix.** `serve.rs`'s `if !args.db.exists()` branch now asks
+`aberp_snapshot::find_pre_restore_units(&args.db)` first, and **bails** when a unit is
+found — naming the unit, saying the state is an INTERRUPTED restore, and giving the two
+recoveries (move the unit back, or `aberp recover`). It needs no journal and no second
+source of truth: **the preserved unit IS the marker**, and it is the right one because it
+cannot be lost independently of the thing it describes — which is the objection rev 3
+raised against a separate rollback-marker file.
+
+Precise in both directions, and both directions are pinned:
+
+- a **successful** restore leaves the live DB in place, so the branch is never reached;
+- a genuine **first launch** has no `.PRE-RESTORE-` sibling, so the vector is empty and
+  provisioning is untouched (`journey_a_clean_first_boot_still_provisions`).
+
+**One spelling, two readers.** The infix is now the constant
+`aberp_snapshot::PRE_RESTORE_INFIX`, written by `restore_in_place` and read by
+`find_pre_restore_units`. A rename that touched only the writer would otherwise leave the
+detector matching nothing and the refusal silently gone — the "a public rename blinded the
+name-keyed gate" class this tree has already paid for twice (ADR-0099 round 6, PR #41).
+
+The new journey step is `journey_an_interrupted_in_place_restore_refuses_to_boot_empty`.
+It drives a REAL `restore --in-place` through the shipped CLI so the preserved unit is
+named by the product rather than by the test, then reproduces the disk state the SIGINT
+left. Reverting the `serve.rs` guard turns it RED with exactly the adversarial's output
+(`boot-check: PASSED` over a `(0, 0)` tenant), while the clean-first-boot pin stays green
+— so the pin is behavioural, not a compile check.
+
+The detector itself is pinned separately at crate level by
+`f1_the_pre_restore_detector_folds_a_unit_and_ignores_everything_else`, because `serve.rs`
+refuses on anything it returns: an over-match bricks a legitimate first launch and an
+under-match silently reopens F1. It covers the discriminations the journey cannot reach —
+an empty home, live files, evidence from OTHER incident families (`PRE-DEDUP`,
+`PRE-RECONCILE`, `CORRUPT-BACKUP`, all of which sit in real tenant homes today), a unit
+belonging to a DIFFERENT database in the same home, and the four-files-one-finding fold.
+Non-vacuous under two mutations: dropping the db-name discrimination (over-match) and
+dropping the sibling fold (four findings for one interruption) each turn it RED.
+
+### F2 — a refusal that named a flag which cannot work
+
+The D3.3 gate refused an unreadable live head with *"Pass `--accept-data-loss` to proceed
+anyway"*. Pass it, and the command aborts one step later: the **mandatory pre-restore
+snapshot** cannot validate a database whose `audit_ledger` is unreadable or whose chain is
+broken (`!pre_snapshot.meta.valid` → bail). The adversarial confirmed **no** flag
+combination gets `restore --in-place` through the damaged-DB case, including
+`--accept-data-loss --accept-unanchored`, and that **neither refusal named `aberp
+recover`** — the command that does work, verified working on the same fixture.
+
+Pre-existing, not a rev-3 regression: F4 only made the dead end visible by adding the
+first refusal.
+
+**No guard is weakened.** The abort is right and unchanged — a database that cannot be
+snapshotted cannot be safely replaced. What was wrong is the operator contract: at 02:00,
+on the path this whole programme exists to make non-manual, the product told the operator
+to type a flag it knew would fail. Three messages now name the route that works, through
+one helper (`recover_hint`) so the invocation is spelled once and carries THIS tenant's
+`--db` and `--store` rather than a bare command name that would rebuild from the wrong
+store:
+
+1. the `build_preflight` refusal — and it says explicitly why the flag does not help;
+2. the pre-flight's `live delta UNKNOWN` display line;
+3. the step-2 pre-restore-snapshot abort.
+
+Pinned by `journey_the_damaged_db_refusal_names_recover_not_an_impossible_flag` (an
+unreadable `audit_ledger`, no flag) and `journey_the_pre_restore_snapshot_abort_names_recover`
+(a tampered chain, `--accept-data-loss` passed — the dead end the adversarial walked as
+`p18`). Both also assert the refusal is still a refusal and the live DB is untouched, so a
+future "fix" that turned a message into a permission would be RED.
+
+### CHECK 11 — the two remaining spellings, deliberately deferred
+
+The rev-3 review planted nine mutations; seven are RED at the gate or at the behavioural
+pin. Two walk past the scanner — an **aliased import** (`use std::fs::remove_file as rm;`)
+and **destruction by truncation** (`fs::write(p, b"")`). Neither is a one-line matcher
+addition:
+
+- the alias needs a per-file `use … as X;` binding table, not a wider regex (a regex wide
+  enough without the binding fires on every short call in the tree);
+- truncation is a different **verb**, not a spelling of removal. Folding `fs::write` /
+  `File::create` into a REMOVAL matcher would classify every legitimate write in every
+  tenant-home helper and flood the frozen manifest — precisely the "the check gets switched
+  off" failure the in-gate `self.remove_file()` probe already exists to prevent.
+
+Both are killed by `f7_prune_refuses_a_protected_directory_and_does_not_report_it_removed`,
+which the review verified RED under four independent neuterings, and the twin neutering
+inside the other guarded function is killed by `ac6_…`. The scanner is one layer of a
+two-layer design and the behavioural layer is the load-bearing one. So: the **scope limit
+is now stated in the scanner's own header** (the review's own cheapest close), and the
+work is filed in `SAW-OFF.md` with an acceptance criterion that forbids closing it by
+widening the removal regex. The `expect_pass`/`assert_planted` asymmetry the review noted
+is filed in the same entry.
+
+What a green CHECK 11 means, stated precisely: *no NEW removal site, spelled the way
+removals are spelled in this tree, reaches a tenant home unguarded* — not *no code can ever
+destroy evidence*.
+
+### Not fixed in rev 4, and why
+
+The review's §5 note that the completion message's *"the next `aberp serve` boot has
+nothing to reconcile"* is false on every successful restore (the CLI appends
+`SnapshotRestored` after the mirror is written, so the mirror is one entry behind and boot
+reports `Extended`) is **correct and unfixed** — it is a wording/ordering choice, not a
+safety defect, and rev 4 keeps the diff to the two FIX-FIRST findings so the focused
+re-check has a small surface. Same for the review's §3 note that the export directory
+carries no integrity binding of its own, which is the offline-unverifiability the branch
+already declares for RFC-3161 (Phase 3). F9/F10/F11 and the three rev-2 notes are
+unchanged, for the reasons recorded above.
+
+---
+
 ## Gate results
 
 Recorded in the branch's final commit message. Both required checks

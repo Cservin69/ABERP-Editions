@@ -74,9 +74,9 @@ pub use store::{
     resolve_selector_in, snapshot_identity, SnapshotRecord, SnapshotSelector,
 };
 pub use take::{
-    ensure_not_prod_path, ensure_restore_allowed, restore_in_place, restore_into, take_snapshot,
-    take_snapshot_with, validate_export, validate_installed_db, InPlaceRestoreReport,
-    MirrorReconcile, PreservedUnit, ValidationReport,
+    ensure_not_prod_path, ensure_restore_allowed, find_pre_restore_units, restore_in_place,
+    restore_into, take_snapshot, take_snapshot_with, validate_export, validate_installed_db,
+    InPlaceRestoreReport, MirrorReconcile, PreservedUnit, ValidationReport, PRE_RESTORE_INFIX,
 };
 
 /// Typed error surface for the snapshot subsystem. Library crate → no

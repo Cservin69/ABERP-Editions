@@ -1197,6 +1197,22 @@ pub struct LiveCounts {
     pub audit_count: Option<i64>,
 }
 
+/// **ADR-0116 rev 4 / F2** — the exact `aberp recover` invocation for THIS
+/// tenant, ready to paste.
+///
+/// Every refusal on the damaged-database path ends here, so it is spelled once.
+/// It carries `--store` because the pre-flight may be running against an
+/// overridden store and a hint that silently pointed at the default one would
+/// rebuild from the wrong snapshots — the same "name the thing precisely"
+/// discipline the selector fix (F3) landed for.
+fn recover_hint(db: &Path, tenant: &str, store_dir: &Path) -> String {
+    format!(
+        "aberp recover --db {} --tenant {tenant} --store {}",
+        db.display(),
+        store_dir.display()
+    )
+}
+
 /// Build the pre-flight for `selector` against `store_dir`.
 ///
 /// The live side is read from the audit-ledger **mirror file**, never by
@@ -1280,13 +1296,37 @@ fn build_preflight(
     };
     let live_head_unknown = matches!(live_exact, Some(c) if c.audit_count.is_none());
     if live_head_unknown && !accept_data_loss {
+        // **ADR-0116 rev 4 / F2 — name the tool that WORKS, not a flag that
+        // cannot.**
+        //
+        // This message used to end *"Pass --accept-data-loss to proceed
+        // anyway"*. It cannot: the operator types the flag, this refusal
+        // clears, and the command aborts one step later because the MANDATORY
+        // pre-restore snapshot of the current database cannot validate a
+        // database whose `audit_ledger` is unreadable (`!pre_snapshot.meta.
+        // valid` → bail). Verified across every flag combination, including
+        // `--accept-data-loss --accept-unanchored`, on both an unreadable table
+        // and a tampered chain. No flag gets `restore --in-place` through the
+        // damaged-DB case, which is the ONE case this whole programme exists
+        // for, and neither refusal named the command that does work.
+        //
+        // The abort itself is right and stays exactly as it is — a database
+        // that cannot be snapshotted cannot be safely replaced. What was wrong
+        // is the operator contract: the product told an operator at 02:00 to
+        // type a flag it knew would fail. `aberp recover` rebuilds from the
+        // snapshot store WITHOUT requiring the damaged database to be
+        // snapshottable first, and it is the route nobody named.
+        let recover_cmd = recover_hint(live_db, tenant, store_dir);
         refusals.push(format!(
             "the LIVE database's audit_ledger could NOT be read, so how much this restore \
              would discard is UNKNOWN — not zero. The snapshot carries {snap_audit} audit \
              entries. A database whose tables cannot be read is exactly the case a restore \
              exists for, and it is also the case in which nothing can prove the rollback is \
-             safe. Pass --accept-data-loss to proceed anyway, having accepted that the amount \
-             of committed audit history discarded is unmeasurable."
+             safe.\n    --accept-data-loss does NOT get past this: it clears this refusal and \
+             the command then ABORTS at the mandatory pre-restore snapshot, which cannot \
+             validate a database whose audit_ledger is unreadable. Use `aberp recover` \
+             instead — it rebuilds from the snapshot store and does not require the damaged \
+             database to be snapshottable first:\n      {recover_cmd}"
         ));
     } else if live_head_unknown {
         tracing::warn!(
@@ -1405,7 +1445,9 @@ fn print_preflight(pf: &RestorePreflight, target: &Path, with_delta: bool) {
                 );
                 println!(
                     "                   → how much would be discarded is UNKNOWN, which is NOT \
-                     the same as zero. --accept-data-loss is required to proceed."
+                     the same as zero. ADR-0116 rev 4 / F2 — no flag gets an in-place restore \
+                     past this; `aberp recover` is the route that works (see the refusal \
+                     below)."
                 );
             }
             // EXACT — the caller holds the live DB exclusively (serve is
@@ -1773,13 +1815,24 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
     )
     .context("ADR-0116 D3.4 step 2 — mandatory pre-restore snapshot of the live database")?;
     if !pre_snapshot.meta.valid {
+        // ADR-0116 rev 4 / F2 — this abort is the second half of the dead-end
+        // the pre-flight used to send operators down, and it is the one they
+        // reach AFTER typing the flag the pre-flight recommended. The refusal
+        // stands; what it must not do is stop without naming the command that
+        // works. `aberp recover` rebuilds from the store without needing the
+        // damaged database to be snapshottable first.
         anyhow::bail!(
             "ABORTING the in-place restore: the mandatory pre-restore snapshot of the CURRENT \
              database failed validation ({}). The live database is untouched. A database that \
              cannot be snapshotted cannot be safely replaced — investigate first; the failed \
-             snapshot is retained at {} as forensic evidence (ADR-0116 G8).",
+             snapshot is retained at {} as forensic evidence (ADR-0116 G8).\n\n  \
+             No `restore --in-place` flag gets past this — `--accept-data-loss` clears the \
+             data-loss gate but not this one. `aberp recover` is the tool for a damaged live \
+             database: it rebuilds from the snapshot store without snapshotting the damaged \
+             one first:\n      {}",
             pre_snapshot.meta.validation_error.as_deref().unwrap_or("?"),
-            pre_snapshot.dir.display()
+            pre_snapshot.dir.display(),
+            recover_hint(&args.db, &args.tenant, &store_dir),
         );
     }
     println!(

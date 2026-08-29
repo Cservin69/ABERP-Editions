@@ -1516,3 +1516,332 @@ fn journey_a_failed_snapshot_is_retained_and_reported_as_forensic() {
         r.stdout
     );
 }
+
+/// **ADR-0116 rev 4 / F1 — an INTERRUPTED in-place restore must REFUSE to
+/// boot, never provision a fresh empty company over it.**
+///
+/// `restore_in_place` moves the live DB aside as step 2 and installs the
+/// replacement in step 3. Between them the live path holds nothing. rev 2 also
+/// moved the `.audit.log` mirror into the preserved unit — the fix that closed
+/// the boot-after-rollback blocker — and in the same stroke deleted the only
+/// thing that DETECTED an interruption:
+///
+/// | | mirror left at the live path (rev 2) | mirror moved into the unit (rev 3) |
+/// |---|---|---|
+/// | `^C` mid-restore, then boot | `ERROR audit_mirror_AHEAD_of_db` → **REFUSES** | `boot-check: PASSED` on an **EMPTY company** |
+///
+/// The adversarial reproduced it end to end with a real SIGINT: 40 005 invoices
+/// and 8 audit rows before, `0` and `0` after, and the only log lines were
+/// `INFO`. No data is lost — the `.PRE-RESTORE-` unit is intact — but an
+/// operator who Ctrl-Cs a slow restore, sees `PASSED`, and starts serve is
+/// looking at an empty company with no error anywhere. That is strictly worse
+/// than the loud refusal it replaced.
+///
+/// **On the fixture.** The SIGINT itself is a race; what it LEAVES is not. This
+/// drives a real `restore --in-place` through the shipped CLI so the preserved
+/// unit is named by the product rather than by the test, then removes the live
+/// path's files to reproduce exactly the disk state the adversarial's SIGINT
+/// produced. The assertion is on the boot, which is where the defect lives.
+#[test]
+fn journey_an_interrupted_in_place_restore_refuses_to_boot_empty() {
+    let t = Tmp::new("f1-interrupted");
+    let db = t.db();
+    let store = t.store();
+    let (db_s, store_s) = (db.to_str().unwrap(), store.to_str().unwrap());
+
+    seed(&db, 2, 3);
+    assert!(
+        aberp(
+            &t,
+            &["snapshot", "now", "--db", db_s, "--tenant", TENANT, "--store", store_s]
+        )
+        .ok,
+        "fixture: the snapshot must succeed"
+    );
+    seed(&db, 4, 7);
+
+    let r = aberp(
+        &t,
+        &[
+            "snapshot", "list", "--tenant", TENANT, "--store", store_s, "--json",
+        ],
+    );
+    let listed: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    let id = listed["snapshots"][0]["id"].as_str().unwrap().to_string();
+
+    let r = aberp(
+        &t,
+        &[
+            "restore",
+            "--in-place",
+            "--tenant",
+            TENANT,
+            "--snapshot",
+            &id,
+            "--db",
+            db_s,
+            "--store",
+            store_s,
+            "--confirm",
+            "--accept-data-loss",
+        ],
+    );
+    assert!(
+        r.ok,
+        "fixture: the in-place restore must succeed so the PRE-RESTORE unit is produced by the \
+         PRODUCT, not by the test.\nstdout: {}\nstderr: {}",
+        r.stdout, r.stderr
+    );
+
+    // ── the interrupt ───────────────────────────────────────────────────
+    //
+    // Reproduce the disk state a `^C` between step 2 (preserve) and the end of
+    // step 3 (install) leaves: the live DB, its WAL, its mirror and its
+    // checkpoint marker are all absent, and the `.PRE-RESTORE-` unit — intact
+    // and complete — is the only thing there.
+    for p in [
+        db.clone(),
+        wal_of(&db),
+        aberp_audit_ledger::mirror_path_for(&db),
+        aberp_snapshot::marker_path(&db),
+    ] {
+        let _ = std::fs::remove_file(&p);
+    }
+    let units = aberp_snapshot::find_pre_restore_units(&db);
+    assert_eq!(
+        units.len(),
+        1,
+        "fixture: exactly one PRE-RESTORE unit must be beside the missing DB, found {units:?}"
+    );
+    let unit_name = units[0].file_name().unwrap().to_string_lossy().into_owned();
+
+    // ══ THE GATE ══════════════════════════════════════════════════════════
+    let r = aberp(
+        &t,
+        &["serve", "--db", db_s, "--tenant", TENANT, "--boot-check"],
+    );
+    assert!(
+        !r.ok,
+        "ADR-0116 rev 4 / F1 — **boot came up on a half-done restore.** An interrupted \
+         in-place restore leaves the live path empty beside an intact `.PRE-RESTORE-` unit; \
+         provisioning a fresh tenant there serves a company with no invoices and no audit \
+         history while the real one sits on disk unread, and says nothing louder than \
+         INFO.\nstdout: {}\nstderr: {}",
+        r.stdout, r.stderr
+    );
+    let told = format!("{}{}", r.stdout, r.stderr);
+    assert!(
+        told.contains(&unit_name),
+        "ADR-0116 rev 4 / F1 — the refusal must NAME the preserved unit ({unit_name}); an \
+         operator at 02:00 needs the path, not the diagnosis: {told}"
+    );
+    assert!(
+        told.contains("INTERRUPTED"),
+        "the refusal must say WHAT this state is, so it is not read as a corrupt install: \
+         {told}"
+    );
+    assert!(
+        !told.contains("boot-check: PASSED"),
+        "ADR-0116 rev 4 / F1 — `--boot-check` reported PASSED over an interrupted restore: \
+         {told}"
+    );
+
+    // …and it refused BEFORE writing anything: no fresh empty company.
+    assert!(
+        !db.exists(),
+        "ADR-0116 rev 4 / F1 — the guard fired but a fresh tenant DB was provisioned anyway; \
+         the refusal must come BEFORE `provision_atomic`"
+    );
+    // …and the evidence is untouched, which is the whole reason a refusal is
+    // enough: everything needed to recover is still on disk.
+    assert!(
+        units[0].exists(),
+        "the preserved unit must survive the refused boot — it is the only copy of the \
+         operator's data"
+    );
+}
+
+/// **ADR-0116 rev 4 / F1, the other direction — a genuine first launch must
+/// still provision.**
+///
+/// A guard that refuses an interrupted restore is worthless if it also refuses
+/// the first boot of a new tenant: that is every Defense install's very first
+/// action. The discriminator is the `.PRE-RESTORE-` sibling and nothing else.
+#[test]
+fn journey_a_clean_first_boot_still_provisions() {
+    let t = Tmp::new("f1-first-boot");
+    let db = t.db();
+    let db_s = db.to_str().unwrap();
+    assert!(!db.exists(), "fixture: the tenant home must start empty");
+    assert!(
+        aberp_snapshot::find_pre_restore_units(&db).is_empty(),
+        "fixture: a first launch has no PRE-RESTORE sibling"
+    );
+
+    let r = aberp(
+        &t,
+        &["serve", "--db", db_s, "--tenant", TENANT, "--boot-check"],
+    );
+    assert!(
+        r.ok,
+        "ADR-0116 rev 4 / F1 — the interrupted-restore guard REFUSED a clean first launch. \
+         The guard must key on the `.PRE-RESTORE-` sibling, never on the absence of the \
+         DB.\nstdout: {}\nstderr: {}",
+        r.stdout, r.stderr
+    );
+    assert!(
+        db.exists(),
+        "a clean first boot must still provision the tenant DB atomically (ADR-0095 §2)"
+    );
+}
+
+/// **ADR-0116 rev 4 / F2 — the damaged-database refusal must name `aberp
+/// recover`, not a flag that provably cannot succeed.**
+///
+/// The D3.3 gate refused an unreadable live head with *"Pass
+/// `--accept-data-loss` to proceed anyway"*. Passing it clears THAT refusal and
+/// the command aborts one step later, because the mandatory pre-restore
+/// snapshot cannot validate a database whose `audit_ledger` is unreadable. No
+/// flag combination gets `restore --in-place` through the damaged-DB case —
+/// verified by the adversarial including `--accept-data-loss
+/// --accept-unanchored` — and neither refusal named the command that does work.
+///
+/// The guards are right and unchanged. What was wrong is the contract: at 02:00
+/// the product sent the operator to type a flag it knew would fail, on the one
+/// path this whole programme exists to make non-manual.
+#[test]
+fn journey_the_damaged_db_refusal_names_recover_not_an_impossible_flag() {
+    let t = Tmp::new("f2-recover-hint");
+    let db = t.db();
+    let store = t.store();
+    let (db_s, store_s) = (db.to_str().unwrap(), store.to_str().unwrap());
+
+    seed(&db, 3, 5);
+    assert!(
+        aberp(
+            &t,
+            &["snapshot", "now", "--db", db_s, "--tenant", TENANT, "--store", store_s]
+        )
+        .ok,
+        "fixture: the snapshot must succeed"
+    );
+    // The realistic damaged shape: the file opens, the audit table does not.
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .unwrap();
+        conn.execute_batch("DROP TABLE audit_ledger;").unwrap();
+    }
+
+    let r = aberp(
+        &t,
+        &[
+            "restore",
+            "--in-place",
+            "--tenant",
+            TENANT,
+            "--snapshot",
+            "1",
+            "--db",
+            db_s,
+            "--store",
+            store_s,
+            "--confirm",
+        ],
+    );
+    assert!(!r.ok, "fixture: the damaged DB must still be refused");
+    let told = format!("{}{}", r.stdout, r.stderr);
+    assert!(
+        told.contains("aberp recover"),
+        "ADR-0116 rev 4 / F2 — the damaged-DB refusal must name `aberp recover`, the only \
+         route that works on a database that cannot be snapshotted: {told}"
+    );
+    assert!(
+        told.contains(db_s) && told.contains(store_s),
+        "the hint must be a pasteable command carrying THIS tenant's --db and --store, not a \
+         bare command name that would rebuild from the default store: {told}"
+    );
+    assert!(
+        !told.contains("Pass --accept-data-loss to proceed anyway"),
+        "ADR-0116 rev 4 / F2 — the refusal still offers a flag that aborts one step later: \
+         {told}"
+    );
+    // The guard itself is NOT weakened: the refusal is still a refusal, still
+    // says UNKNOWN, and the live DB is still there.
+    assert!(
+        told.contains("UNKNOWN"),
+        "the F4 UNKNOWN language must survive the reword: {told}"
+    );
+    assert!(
+        db.exists(),
+        "the live database must be untouched by a refusal"
+    );
+}
+
+/// **ADR-0116 rev 4 / F2, the second refusal** — the step-2 abort an operator
+/// reaches AFTER typing the flag the pre-flight used to recommend must name
+/// `aberp recover` too.
+///
+/// A tampered chain is the shape that reaches this abort with the data-loss
+/// gate cleared: the counts read fine, so the restore proceeds to the mandatory
+/// pre-restore snapshot, which fails validation on the chain. This is the exact
+/// dead end the adversarial walked (`p18`).
+#[test]
+fn journey_the_pre_restore_snapshot_abort_names_recover() {
+    let t = Tmp::new("f2-abort-hint");
+    let db = t.db();
+    let store = t.store();
+    let (db_s, store_s) = (db.to_str().unwrap(), store.to_str().unwrap());
+
+    seed(&db, 3, 5);
+    assert!(
+        aberp(
+            &t,
+            &["snapshot", "now", "--db", db_s, "--tenant", TENANT, "--store", store_s]
+        )
+        .ok,
+        "fixture: the snapshot must succeed"
+    );
+    // Tamper with a committed payload: the row count is unchanged, so the
+    // data-loss gate is satisfied and the chain verification is not.
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .unwrap();
+        conn.execute(
+            "UPDATE audit_ledger SET payload = ? WHERE seq = 3",
+            duckdb::params![b"{\"i\":999}".to_vec()],
+        )
+        .unwrap();
+    }
+
+    let r = aberp(
+        &t,
+        &[
+            "restore",
+            "--in-place",
+            "--tenant",
+            TENANT,
+            "--snapshot",
+            "1",
+            "--db",
+            db_s,
+            "--store",
+            store_s,
+            "--confirm",
+            "--accept-data-loss",
+        ],
+    );
+    assert!(
+        !r.ok,
+        "fixture: a database whose chain does not verify must not be restorable in place.\n{}\n{}",
+        r.stdout, r.stderr
+    );
+    let told = format!("{}{}", r.stdout, r.stderr);
+    assert!(
+        told.contains("aberp recover"),
+        "ADR-0116 rev 4 / F2 — the refusal an operator reaches after typing --accept-data-loss \
+         must name the tool that works. Ending here without it is the dead end: two refusals, \
+         neither naming `aberp recover`: {told}"
+    );
+}

@@ -417,3 +417,53 @@ allowed to gate.**
 against a cap well under 75 minutes, and `timeout-minutes` is lowered again in
 the same change. Closing it by removing a probe, skipping a check, or
 narrowing a scan scope does not count and should be rejected in review.
+
+---
+
+## CHECK 11 — two removal spellings out of model, and one probe-harness asymmetry
+
+**Filed** 2026-08-29, from the ADR-0116 rev-3 adversarial review (§4). **Not a
+hole in the contract; a limit on what a green CHECK 11 means.** Deferred
+deliberately rather than half-closed, because the cheap versions of both fixes
+make the check worse.
+
+The rev-3 adversarial planted nine mutations against
+`tools/adr0116_evidence_removal_scan.awk`. Seven are RED at the gate or at the
+behavioural pin. Two walk past the scanner:
+
+- **MF — an aliased import.** `use std::fs::remove_file as rm;` … `rm(p)`.
+  The matcher is name-keyed, so the alias is invisible. Closing it needs a
+  per-file `use … as X;` alias table feeding the matcher — not a wider regex,
+  which would fire on every short call in the tree.
+- **MH — destruction by truncation.** `std::fs::write(p, b"")` or
+  `File::create(p)` over an existing artefact destroys it without unlinking it.
+  This is a different *verb*, not a different spelling of removal. Adding
+  `fs::write` / `File::create` to a REMOVAL matcher would classify every
+  legitimate write in every tenant-home helper and flood the frozen manifest —
+  the exact "the check gets switched off" failure the in-gate
+  `self.remove_file()` / `fn remove_file` probe already exists to prevent.
+
+**Why this is a note and not a fix-first.** Both mutations are killed by
+`f7_prune_refuses_a_protected_directory_and_does_not_report_it_removed`, and the
+same neutering inside the other guarded function is killed by
+`ac6_guarded_remove_refuses_evidence_and_permits_a_live_transient`. Those two
+tests cover both GUARDED functions in the tree, and the adversarial verified
+each pin is RED under four independent neuterings. The scanner is one layer of
+a two-layer design and the behavioural layer is the load-bearing one. The scope
+limit is now stated in the scanner's own header so a green is not read as more
+than it is.
+
+**Also filed here, same review, one line of work:**
+`tools/cut_gate_negative_probes.sh` calls `assert_planted` from `expect_fail`
+but not from `expect_pass`. A no-op plant on a non-trigger probe would silently
+degrade to a sanity check rather than failing as a HARNESS BUG. The one
+`expect_pass` CHECK-11 probe appends with `printf >>` so it cannot no-op today —
+but this is the BSD-sed class already on this repo's record (cut-gate CHECK 5),
+and the asymmetry should not survive the next probe someone adds.
+
+**Acceptance for closing:** the alias table lands with its own `expect_fail`
+probe planting `use std::fs::remove_file as rm;`; truncation either lands as a
+SEPARATE verdict class (never folded into the removal matcher) or the header
+note stands as the deliberate answer; `expect_pass` asserts its plant. Closing
+any of these by widening the removal regex until the manifest floods does not
+count.

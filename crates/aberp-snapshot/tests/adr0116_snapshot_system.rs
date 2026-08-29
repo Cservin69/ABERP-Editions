@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 
 use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
 use aberp_snapshot::{
-    guarded_remove, is_protected_evidence, list_evidence, list_snapshots, plan_evidence_release,
-    plan_retention, prune, restore_in_place, restore_into, snapshot_identity, take_snapshot,
-    validate_export, EvidencePolicy, RetainReason, RetentionPolicy, SnapshotMeta, SnapshotRecord,
+    find_pre_restore_units, guarded_remove, is_protected_evidence, list_evidence, list_snapshots,
+    plan_evidence_release, plan_retention, prune, restore_in_place, restore_into,
+    snapshot_identity, take_snapshot, validate_export, EvidencePolicy, RetainReason,
+    RetentionPolicy, SnapshotMeta, SnapshotRecord, PRE_RESTORE_INFIX,
 };
 use duckdb::Connection;
 use time::macros::datetime;
@@ -1609,5 +1610,106 @@ fn f7_prune_refuses_a_protected_directory_and_does_not_report_it_removed() {
         !plain.exists() && removed.contains(&1),
         "a refusal must NOT abort the whole pass; the remaining condemned snapshots are still \
          removed, or the store grows while the pass looks like it ran: {removed:?}"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ADR-0116 rev 4 / F1 — the interrupted-restore DETECTOR
+// ══════════════════════════════════════════════════════════════════════
+
+/// **The detector must be precise in BOTH directions.**
+///
+/// `serve.rs` refuses to provision a fresh tenant when this returns anything,
+/// so an over-match bricks a legitimate first launch and an under-match
+/// silently reopens F1 — a fresh, empty company provisioned over a half-done
+/// restore. The journey e2e pins the two headline directions end to end; this
+/// pins the discriminations it cannot reach.
+///
+/// The FOLD matters as much as the match: a preserved unit is four files
+/// (`<db>`, `.wal`, `.audit.log`, `.ckpt-ok`, all named off the preserved path),
+/// and a refusal that reported the same interruption four times would read as
+/// four incidents.
+#[test]
+fn f1_the_pre_restore_detector_folds_a_unit_and_ignores_everything_else() {
+    let t = ScopedTempDir::new("f1-detector");
+    let home = t.path();
+    let db = home.join("aberp.duckdb");
+
+    // (1) a genuine FIRST LAUNCH — nothing at all.
+    assert!(
+        find_pre_restore_units(&db).is_empty(),
+        "an empty tenant home must report no interrupted restore, or every first launch on          every Defense install refuses to boot"
+    );
+
+    // (2) live files, including evidence from OTHER incident families, are not
+    //     this. `PRE-DEDUP`/`PRE-RECONCILE` artefacts sit in real tenant homes
+    //     right now (see REAL_EVIDENCE_NAMES above) and none of them means an
+    //     in-place restore was interrupted.
+    for n in [
+        "aberp.duckdb.wal",
+        "aberp.duckdb.audit.log",
+        "aberp.duckdb.ckpt-ok",
+        "seller.toml",
+        "aberp.duckdb.PRE-DEDUP-20260705T085404Z",
+        "aberp.duckdb.audit.log.PRE-RECONCILE-20260708T235509Z",
+        "aberp.duckdb.CORRUPT-BACKUP-20260803T101500Z",
+    ] {
+        std::fs::write(home.join(n), b"x").unwrap();
+    }
+    assert!(
+        find_pre_restore_units(&db).is_empty(),
+        "the detector fired on live files or on evidence from another incident family — it          must key on `<db>.{PRE_RESTORE_INFIX}<tag>` and nothing else: {:?}",
+        find_pre_restore_units(&db)
+    );
+
+    // (3) a complete preserved unit — FOUR files, ONE finding.
+    let tag = "20260829T170712Z";
+    let unit = home.join(format!("aberp.duckdb.{PRE_RESTORE_INFIX}{tag}"));
+    for suffix in ["", ".wal", ".audit.log", ".ckpt-ok"] {
+        std::fs::write(
+            home.join(format!("aberp.duckdb.{PRE_RESTORE_INFIX}{tag}{suffix}")),
+            b"x",
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        find_pre_restore_units(&db),
+        vec![unit.clone()],
+        "a preserved unit is four files and ONE interruption; the detector must fold the          siblings onto the unit and name the DB path the operator has to move back"
+    );
+
+    // (4) a unit belonging to a DIFFERENT database in the same home is not
+    //     this database's interruption. Multi-tenant homes and side-path
+    //     restores both put one there.
+    std::fs::write(
+        home.join(format!("other.duckdb.{PRE_RESTORE_INFIX}20260829T180000Z")),
+        b"x",
+    )
+    .unwrap();
+    assert_eq!(
+        find_pre_restore_units(&db),
+        vec![unit.clone()],
+        "the detector matched a preserved unit belonging to a different database — booting          `aberp.duckdb` would refuse because `other.duckdb` was restored"
+    );
+
+    // (5) a SECOND interruption of this database reports both, sorted, so the
+    //     operator is told the newest tag exists rather than shown one at
+    //     random.
+    let tag2 = "20260830T090000Z";
+    let unit2 = home.join(format!("aberp.duckdb.{PRE_RESTORE_INFIX}{tag2}"));
+    std::fs::write(&unit2, b"x").unwrap();
+    assert_eq!(
+        find_pre_restore_units(&db),
+        vec![unit.clone(), unit2],
+        "two interruptions must both be reported, in name order"
+    );
+
+    // (6) and the moment the live DB is back, boot's branch is not reached at
+    //     all — recorded here because it is the reason a refusal is SAFE: the
+    //     recovery (move the unit back) clears the refusal by itself.
+    std::fs::write(&db, b"x").unwrap();
+    assert!(
+        db.exists(),
+        "the recovery this refusal names must be the thing that clears it"
     );
 }

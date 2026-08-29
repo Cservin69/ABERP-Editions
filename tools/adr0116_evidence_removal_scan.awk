@@ -34,6 +34,35 @@
 # it does not pretend to be. The gate carries a liveness floor so a scanner
 # that stops classifying cannot read as "no violations".
 #
+# ## What is OUT OF MODEL, stated so a green is not read as more than it is
+#
+# The rev-3 adversarial planted nine mutations against this scanner. Seven are
+# caught here or by the behavioural pins; **two walk past it, deliberately
+# left**:
+#
+#   MF  an ALIASED import — `use std::fs::remove_file as rm;` … `rm(p)`.
+#       Closing it needs a per-file alias table (capture the `use … as X;`
+#       binding, then add X to the matcher), not a wider regex. A regex wide
+#       enough to catch it without the binding would fire on every one-letter
+#       call in the tree.
+#   MH  destruction by TRUNCATION — `std::fs::write(p, b"")` or
+#       `File::create(p)` over an existing artefact. This is a different verb,
+#       not a different spelling of removal: adding `fs::write` / `File::create`
+#       to a REMOVAL matcher would classify every legitimate write in every
+#       tenant-home helper, flood the frozen manifest, and get the check
+#       switched off — the failure mode the `self.remove_file()` probe below
+#       exists to prevent.
+#
+# Neither is a hole in the CONTRACT, because the contract is carried in two
+# layers and this scanner is only one of them. Both mutations are killed by
+# `f7_prune_refuses_a_protected_directory_and_does_not_report_it_removed`, and
+# the same neutering inside `guarded_remove` is killed by
+# `ac6_guarded_remove_refuses_evidence_and_permits_a_live_transient`. Those two
+# tests cover BOTH guarded functions in the tree. What a green CHECK 11 means
+# is therefore precise: *no NEW removal site, spelled the way removals are
+# spelled in this tree, reaches a tenant home unguarded* — not *no code can
+# ever destroy evidence*. Filed in SAW-OFF.md rather than half-closed here.
+#
 # ## Why GUARDED is not token presence (the F7 / M1 finding)
 #
 # The first cut of CHECK 11d grepped `retention.rs` for the string

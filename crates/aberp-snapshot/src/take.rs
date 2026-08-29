@@ -704,6 +704,84 @@ pub fn restore_into(export_dir: &Path, target: &Path, tenant: &str) -> Result<()
     Ok(())
 }
 
+/// The infix every preserved-unit name carries: `<db>.PRE-RESTORE-<tag>`.
+///
+/// **ADR-0116 rev 4 / F1 — one constant, two readers.** `restore_in_place`
+/// WRITES this name and [`find_pre_restore_units`] READS it, and the boot path
+/// refuses to provision over a unit it finds. A rename that touched only the
+/// writer would leave the detector matching nothing and the refusal silently
+/// gone — the "a public rename blinded the name-keyed gate" class this tree has
+/// already paid for twice (ADR-0099 round 6, PR #41). Spelling it once makes
+/// that failure impossible rather than merely unlikely.
+pub const PRE_RESTORE_INFIX: &str = "PRE-RESTORE-";
+
+/// **ADR-0116 rev 4 / F1** — the `.PRE-RESTORE-<tag>` units sitting beside
+/// `db_path`, deduplicated to one path per unit and sorted by name.
+///
+/// # What this is for
+///
+/// [`restore_in_place`] moves the live DB aside as step 2 and only installs the
+/// replacement in step 3. Between the two the live path holds **nothing**, and
+/// that window is seconds on a fixture and minutes on a real tenant. A `^C`, an
+/// OOM kill or a power cut inside it leaves exactly this on disk:
+///
+/// ```text
+///   aberp.duckdb.PRE-RESTORE-20260829T170712Z            <- intact, complete
+///   aberp.duckdb.PRE-RESTORE-20260829T170712Z.wal
+///   aberp.duckdb.PRE-RESTORE-20260829T170712Z.audit.log
+///   (no aberp.duckdb, no aberp.duckdb.wal, no mirror)
+/// ```
+///
+/// Until rev 3 the mirror stayed at the live path, so the next boot met an
+/// AHEAD mirror and REFUSED — loudly, and correctly. Moving the mirror into the
+/// unit (the rev-2 blocker fix) closed the boot-after-rollback failure and, in
+/// the same stroke, **deleted the only detector of an interrupted restore**:
+/// boot now finds an absent DB and an absent mirror, which is byte-for-byte
+/// what a first launch looks like, and provisions a fresh EMPTY tenant over a
+/// half-done restore with nothing louder than an `INFO` line.
+///
+/// The preserved unit is the marker, and it is the right one: it cannot be lost
+/// independently of the thing it describes, which is the objection that sank
+/// the alternative (a separate rollback-marker file — a second source of truth
+/// that can be lost, forged, or left behind).
+///
+/// # Precision, in both directions
+///
+/// - after a **successful** restore the live DB exists, so no caller asks;
+/// - a genuine **first launch** has no `.PRE-RESTORE-` sibling, so this returns
+///   empty and provisioning proceeds untouched.
+///
+/// Siblings inside a unit carry a further suffix after the tag (`.wal`,
+/// `.audit.log`, `.ckpt-ok`), so they are folded onto their unit rather than
+/// reported as four findings. An unreadable directory returns empty: this is a
+/// guard that ADDS a refusal, and it must never be the reason a boot fails.
+pub fn find_pre_restore_units(db_path: &Path) -> Vec<PathBuf> {
+    let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Vec::new();
+    };
+    let Some(db_name) = db_path.file_name() else {
+        return Vec::new();
+    };
+    let prefix = format!("{}.{PRE_RESTORE_INFIX}", db_name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut units: Vec<PathBuf> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let tag = name.strip_prefix(&prefix)?.split('.').next()?.to_string();
+            if tag.is_empty() {
+                return None;
+            }
+            Some(parent.join(format!("{prefix}{tag}")))
+        })
+        .collect();
+    units.sort();
+    units.dedup();
+    units
+}
+
 /// What [`restore_in_place`] moved aside, so the caller can tell the operator
 /// exactly what to look at if anything went wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -841,7 +919,7 @@ pub fn restore_in_place(
         return Err(SnapshotError::SourceMissing(db_path.to_path_buf()));
     }
 
-    let suffix = format!("PRE-RESTORE-{tag}");
+    let suffix = format!("{PRE_RESTORE_INFIX}{tag}");
     let db_wal = wal_sibling(db_path);
     let db_ckpt = crate::crash_safe::marker_path(db_path);
     let db_mirror = mirror_path_for(db_path);

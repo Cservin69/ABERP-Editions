@@ -1478,6 +1478,63 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // path — the exact Defense first-launch failure (root cause #3). Inert
         // on the happy path: an existing DB skips this branch entirely.
         if !args.db.exists() {
+            // ── ADR-0116 rev 4 / F1 — an INTERRUPTED in-place restore is not
+            //    a first launch ──────────────────────────────────────────────
+            //
+            // `restore_in_place` moves the live DB (and since rev 2 its WAL and
+            // its `.audit.log` mirror) aside as ONE `.PRE-RESTORE-<tag>` unit
+            // before installing the replacement. A `^C`, an OOM kill or a power
+            // cut inside that window leaves the live path EMPTY — which is
+            // byte-for-byte what a first launch looks like from here.
+            //
+            // Before rev 2 the mirror stayed behind and boot met an AHEAD
+            // mirror, so this case REFUSED loudly. Moving the mirror into the
+            // unit closed the boot-after-rollback blocker and deleted that
+            // detector in the same stroke: boot would provision a fresh, EMPTY
+            // company over a half-done restore with nothing louder than the
+            // INFO line below, and `--boot-check` would print PASSED.
+            //
+            // No data is lost — the unit is intact and protected evidence — but
+            // silently serving an empty company is strictly worse than the
+            // refusal it replaced. The unit IS the marker, and the right one:
+            // it cannot be lost independently of the thing it describes.
+            //
+            // Precise in both directions: a SUCCESSFUL restore leaves the live
+            // DB in place so this branch is never reached, and a genuine first
+            // launch has no `.PRE-RESTORE-` sibling so the vector is empty.
+            let interrupted = aberp_snapshot::find_pre_restore_units(&args.db);
+            if let Some(unit) = interrupted.first() {
+                anyhow::bail!(
+                    "REFUSING to boot: the tenant database at {} is MISSING, but a \
+                     .PRE-RESTORE- unit sits beside it — that is an INTERRUPTED in-place \
+                     restore (ADR-0116 D3.4), not a first launch. Provisioning a fresh, empty \
+                     company here would serve a company with no invoices and no audit history \
+                     while the real one sat on disk unread.\n\n  \
+                     the previous database is INTACT at {}\n  \
+                     (with its .wal, .audit.log and .ckpt-ok siblings, all protected \
+                     evidence){}\n\n\
+                     To recover: move the unit and its siblings back onto {} (stripping the \
+                     .{}<tag> suffix), or re-run `aberp restore --in-place` to complete the \
+                     restore that was interrupted. `aberp recover --db {} --tenant {}` rebuilds \
+                     from the snapshot store if the unit itself will not open.",
+                    args.db.display(),
+                    unit.display(),
+                    if interrupted.len() > 1 {
+                        format!(
+                            "\n  NOTE: {} PRE-RESTORE units are present — the newest tag is \
+                             the most recent interruption; inspect all of them before moving \
+                             any",
+                            interrupted.len()
+                        )
+                    } else {
+                        String::new()
+                    },
+                    args.db.display(),
+                    aberp_snapshot::PRE_RESTORE_INFIX,
+                    args.db.display(),
+                    args.tenant,
+                );
+            }
             tracing::info!(
                 db = %args.db.display(),
                 "boot: tenant DB absent — provisioning atomically (ADR-0095 §2)"
