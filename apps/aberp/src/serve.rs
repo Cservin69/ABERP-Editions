@@ -820,6 +820,78 @@ enum BootMirrorRoute {
     RefuseFatal,
 }
 
+/// **ADR-0116 rev 5 / finding 1 (the latch) + finding 2 (the partial route)**
+/// — refuse to serve an interrupted restore that the live path EXISTING would
+/// otherwise hide.
+///
+/// The `!db.exists()` guard above catches the `^C` window itself. It cannot
+/// catch either of the two states in which the live path exists and the
+/// company behind it is still on the unit:
+///
+/// **The latch.** One boot with a spelling the detector could not resolve
+/// (rev 5 finding 1: `--db aberp.duckdb`, whose parent is `""`) provisioned a
+/// fresh empty database. `args.db.exists()` is now true, so the guard above is
+/// never consulted again — *for the life of that tenant home* — and every
+/// later boot reports `boot-check: PASSED` over an empty company. The spelling
+/// hole is fixed at its source in `find_pre_restore_units`; this is the arm
+/// that makes an ALREADY-latched home recoverable, and that would catch the
+/// next spelling hole too.
+///
+/// **The partial move-back.** The rev-4 refusal named only the unit's database
+/// path. An operator who moves that one file back gets a database whose every
+/// un-checkpointed commit is still in the orphaned `.wal` — the adversarial
+/// measured `counts=(0, 0)` where the full four-file move-back gave
+/// `(40005, 11)` — and boot printed PASSED over it. The message now spells all
+/// four `mv`s (finding 2), and this refuses the state anyway if the operator
+/// gets it wrong, because a refusal is cheap and an empty company is not.
+///
+/// # Why it reads counts, and why UNKNOWN is not zero
+///
+/// A `.PRE-RESTORE-` unit beside a live database is the NORMAL state after a
+/// SUCCESSFUL restore — the unit is retained evidence. The only thing that
+/// separates that from the latch is that the latched database is empty, so
+/// this has to look. It looks on the connection boot has **already opened** for
+/// the mirror reconcile: no second opener, so the ADR-0098 two-instance hazard
+/// and the frozen residual count are both untouched.
+///
+/// Following ADR-0116 F4, an unreadable table is UNKNOWN and never zero: both
+/// counts must read as an explicit `0` before this refuses. A guard that ADDS
+/// a refusal must never be the reason a boot fails, so every uncertainty here
+/// resolves to "carry on".
+fn refuse_a_latched_interrupted_restore(db: &Path, conn: &Connection) -> anyhow::Result<()> {
+    let units = aberp_snapshot::find_pre_restore_units(db);
+    let Some(unit) = units.first() else {
+        return Ok(());
+    };
+    // A unit whose DB is gone but whose siblings are still there is not a
+    // state any code in this tree produces — it is the partial move-back, and
+    // it needs no counts to be sure of.
+    if aberp_snapshot::pre_restore_unit_is_partly_moved_back(unit) {
+        anyhow::bail!(crate::snapshot::interrupted_restore_refusal(
+            db,
+            &units,
+            crate::snapshot::InterruptedRestore::PartlyMovedBack
+        ));
+    }
+    let audit: Option<i64> = conn
+        .query_row("SELECT count(*) FROM audit_ledger", [], |r| r.get(0))
+        .ok();
+    let invoices: Option<i64> = conn
+        .query_row("SELECT count(*) FROM invoice", [], |r| r.get(0))
+        .ok();
+    if let (Some(0), Some(0)) = (audit, invoices) {
+        anyhow::bail!(crate::snapshot::interrupted_restore_refusal(
+            db,
+            &units,
+            crate::snapshot::InterruptedRestore::LatchedEmptyDb {
+                invoices: 0,
+                audit: 0
+            }
+        ));
+    }
+    Ok(())
+}
+
 /// Classify a boot mirror-reconcile failure into its [`BootMirrorRoute`].
 ///
 /// **Only a clean mirror-AHEAD may auto-recover.** Recovery rebuilds from a
@@ -1502,38 +1574,31 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             // Precise in both directions: a SUCCESSFUL restore leaves the live
             // DB in place so this branch is never reached, and a genuine first
             // launch has no `.PRE-RESTORE-` sibling so the vector is empty.
+            //
+            // **ADR-0116 rev 5 / finding 1.** `find_pre_restore_units` now
+            // resolves `--db` before it looks for siblings. A bare relative
+            // spelling (`--db aberp.duckdb`, typed by an operator standing in
+            // the tenant home) has an EMPTY parent, and the first cut dropped
+            // it and reported "no unit" — provisioning right here, over the
+            // unit, and latching the blindness for the life of the tenant
+            // home. The companion latched/partial guard is in the mirror
+            // reconcile block below, on the arm this one cannot reach.
             let interrupted = aberp_snapshot::find_pre_restore_units(&args.db);
             if let Some(unit) = interrupted.first() {
-                anyhow::bail!(
-                    "REFUSING to boot: the tenant database at {} is MISSING, but a \
-                     .PRE-RESTORE- unit sits beside it — that is an INTERRUPTED in-place \
-                     restore (ADR-0116 D3.4), not a first launch. Provisioning a fresh, empty \
-                     company here would serve a company with no invoices and no audit history \
-                     while the real one sat on disk unread.\n\n  \
-                     the previous database is INTACT at {}\n  \
-                     (with its .wal, .audit.log and .ckpt-ok siblings, all protected \
-                     evidence){}\n\n\
-                     To recover: move the unit and its siblings back onto {} (stripping the \
-                     .{}<tag> suffix), or re-run `aberp restore --in-place` to complete the \
-                     restore that was interrupted. `aberp recover --db {} --tenant {}` rebuilds \
-                     from the snapshot store if the unit itself will not open.",
-                    args.db.display(),
-                    unit.display(),
-                    if interrupted.len() > 1 {
-                        format!(
-                            "\n  NOTE: {} PRE-RESTORE units are present — the newest tag is \
-                             the most recent interruption; inspect all of them before moving \
-                             any",
-                            interrupted.len()
-                        )
-                    } else {
-                        String::new()
-                    },
-                    args.db.display(),
-                    aberp_snapshot::PRE_RESTORE_INFIX,
-                    args.db.display(),
-                    args.tenant,
-                );
+                // ADR-0116 rev 5 — the refusal must not claim the unit is
+                // INTACT when its database file is not there. A partial unit
+                // still refuses (fail-safe, and correct), but it refuses
+                // truthfully.
+                let state = if aberp_snapshot::pre_restore_unit_is_partly_moved_back(unit) {
+                    crate::snapshot::InterruptedRestore::PartlyMovedBack
+                } else {
+                    crate::snapshot::InterruptedRestore::LivePathMissing
+                };
+                anyhow::bail!(crate::snapshot::interrupted_restore_refusal(
+                    &args.db,
+                    &interrupted,
+                    state
+                ));
             }
             tracing::info!(
                 db = %args.db.display(),
@@ -1867,6 +1932,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         })?;
         aberp_audit_ledger::ensure_schema(&conn)
             .context("ensure audit-ledger schema at serve boot")?;
+        refuse_a_latched_interrupted_restore(&args.db, &conn)?;
         let mirror_path = aberp_audit_ledger::mirror_path_for(&args.db);
         match aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror_path) {
             Ok(action) => tracing::info!(?action, "audit-ledger mirror reconciled at boot"),

@@ -1213,6 +1213,147 @@ fn recover_hint(db: &Path, tenant: &str, store_dir: &Path) -> String {
     )
 }
 
+/// Which shape of interrupted in-place restore boot is looking at.
+///
+/// **ADR-0116 rev 5 / finding 2.** All three end in the same refusal text, so
+/// they are one enum feeding one builder rather than three hand-rolled
+/// `bail!`s. The rev-4 refusal was hand-rolled at its single call site and
+/// promptly drifted: it offered `aberp restore --in-place` and a store-less
+/// `aberp recover`, neither of which can run in the state it fires in, which
+/// is F2's defect class reappearing in F2's own commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterruptedRestore {
+    /// A `^C`, OOM kill or power cut inside `restore_in_place`'s
+    /// preserve→install window: the live path is EMPTY and the unit is intact.
+    LivePathMissing,
+    /// The unit's DATABASE was moved back on its own and its `.wal` — holding
+    /// every un-checkpointed commit — was left behind in the unit. Boot would
+    /// come up CLEAN and EMPTY over it.
+    PartlyMovedBack,
+    /// A fresh, EMPTY database was provisioned beside an intact unit, and the
+    /// live path existing is what stops the `!db.exists()` guard being
+    /// consulted again. Counts read from the live DB, not assumed.
+    LatchedEmptyDb { invoices: i64, audit: i64 },
+}
+
+/// **ADR-0116 rev 5 / finding 2** — the recovery that actually WORKS when a
+/// restore was interrupted, spelled once.
+///
+/// `recover_hint` (above) is the same discipline for the damaged-database
+/// path. This is its twin for the interrupted-restore path, and it exists for
+/// the same reason: the rev-4 refusal named two routes by hand, and the
+/// adversarial ran all three on a genuine `SIGINT` state carrying 40 005
+/// invoices —
+///
+/// | route as the message spelled it | result |
+/// |---|---|
+/// | `aberp recover --db … --tenant …` | REFUSED — no `--store`, resolves the wrong store |
+/// | the same **with** `--store` | REFUSED — the `.audit.log` mirror is inside the unit |
+/// | `aberp restore --in-place …` | ABORTS — no live DB to take the mandatory pre-restore snapshot of |
+/// | move the unit's DB back **alone** | boots `ok=true`, `counts=(0, 0)` — an EMPTY company |
+/// | move **all four** files back | boots, `counts=(40005, 11)` ✅ |
+///
+/// Only the last one recovers anything, and it is the one the message did not
+/// spell out. The `mv` pairs come from `aberp_snapshot::pre_restore_move_back`,
+/// derived from the same sibling helpers `restore_in_place` wrote the unit
+/// with, so the instructions cannot drift from the unit's shape.
+pub(crate) fn interrupted_restore_refusal(
+    db: &Path,
+    units: &[PathBuf],
+    state: InterruptedRestore,
+) -> String {
+    let db = aberp_snapshot::resolve_db_path(db);
+    let unit = units
+        .first()
+        .cloned()
+        .unwrap_or_else(|| db.with_extension("PRE-RESTORE-<tag>"));
+
+    let headline = match state {
+        InterruptedRestore::LivePathMissing => format!(
+            "REFUSING to boot: the tenant database at {} is MISSING, but a .PRE-RESTORE- unit \
+             sits beside it — that is an INTERRUPTED in-place restore (ADR-0116 D3.4), not a \
+             first launch. Provisioning a fresh, empty company here would serve a company with \
+             no invoices and no audit history while the real one sat on disk unread.\n\n  \
+             the previous database is INTACT at {}",
+            db.display(),
+            unit.display(),
+        ),
+        InterruptedRestore::PartlyMovedBack => format!(
+            "REFUSING to boot: an INTERRUPTED in-place restore (ADR-0116 D3.4) was only PARTLY \
+             moved back. The .PRE-RESTORE- unit's database is gone from {} but its siblings are \
+             still there — so every un-checkpointed commit is stranded in the orphaned .wal and \
+             this database would open CLEAN and EMPTY. Every `Handle` commit is WAL-only until \
+             a checkpoint (ADR-0098 R5): a database without its WAL is not a partial recovery, \
+             it is a silent one.\n\n  \
+             the unit is INCOMPLETE at {} — its database file is not there",
+            db.display(),
+            unit.display(),
+        ),
+        InterruptedRestore::LatchedEmptyDb { invoices, audit } => format!(
+            "REFUSING to boot: the tenant database at {} is EMPTY ({invoices} invoices, {audit} \
+             audit entries) and an intact .PRE-RESTORE- unit is sitting beside it. That is an \
+             INTERRUPTED in-place restore (ADR-0116 D3.4) that a previous boot provisioned a \
+             fresh company over — serving it would show an empty company while the real one sat \
+             on disk unread.\n\n  \
+             the previous database is INTACT at {}",
+            db.display(),
+            unit.display(),
+        ),
+    };
+
+    let mut out = headline;
+    if units.len() > 1 {
+        out.push_str(&format!(
+            "\n  NOTE: {} PRE-RESTORE units are present — the newest tag is the most recent \
+             interruption; inspect all of them before moving any",
+            units.len()
+        ));
+    }
+
+    let moves = aberp_snapshot::pre_restore_move_back(&unit, &db);
+    out.push_str(
+        "\n\nTo recover, move the WHOLE unit back — the database AND its siblings. Moving only \
+         the database leaves its un-checkpointed commits behind in the orphaned .wal and the \
+         next boot comes up as an EMPTY company:\n",
+    );
+    // ADR-0116 rev 5 — the live-side files the move-back does NOT overwrite
+    // would otherwise be left pairing with the restored database: a stale
+    // empty `.wal` beside a full DB is the F4 hazard wearing the other mask.
+    // Only ever emitted for a database this boot has just PROVEN is empty.
+    if let InterruptedRestore::LatchedEmptyDb { .. } = state {
+        let leftovers: Vec<PathBuf> = [
+            db.clone(),
+            aberp_snapshot::wal_path_for(&db),
+            aberp_audit_ledger::mirror_path_for(&db),
+            aberp_snapshot::marker_path(&db),
+        ]
+        .into_iter()
+        .filter(|p| p.exists() && !moves.iter().any(|(_, to)| to == p))
+        .collect();
+        if !leftovers.is_empty() {
+            out.push_str(
+                "\n    # this database holds no invoices and no audit entries — verified by \
+                 the boot that printed this\n",
+            );
+            for p in leftovers {
+                out.push_str(&format!("    rm {}\n", p.display()));
+            }
+            out.push('\n');
+        }
+    }
+    for (from, to) in &moves {
+        out.push_str(&format!("    mv {} {}\n", from.display(), to.display()));
+    }
+    out.push_str(
+        "\nthen run `aberp serve` again.\n\n\
+         Neither `aberp restore --in-place` nor `aberp recover` can run before that move: the \
+         first needs a live database to take its mandatory pre-restore snapshot of, and the \
+         second needs the live .audit.log mirror — and both of those are inside the unit until \
+         you move it back.",
+    );
+    out
+}
+
 /// Build the pre-flight for `selector` against `store_dir`.
 ///
 /// The live side is read from the audit-ledger **mirror file**, never by

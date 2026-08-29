@@ -74,8 +74,9 @@ pub use store::{
     resolve_selector_in, snapshot_identity, SnapshotRecord, SnapshotSelector,
 };
 pub use take::{
-    ensure_not_prod_path, ensure_restore_allowed, find_pre_restore_units, restore_in_place,
-    restore_into, take_snapshot, take_snapshot_with, validate_export, validate_installed_db,
+    ensure_not_prod_path, ensure_restore_allowed, find_pre_restore_units, pre_restore_move_back,
+    pre_restore_unit_is_partly_moved_back, resolve_db_path, restore_in_place, restore_into,
+    take_snapshot, take_snapshot_with, validate_export, validate_installed_db, wal_path_for,
     InPlaceRestoreReport, MirrorReconcile, PreservedUnit, ValidationReport, PRE_RESTORE_INFIX,
 };
 

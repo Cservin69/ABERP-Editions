@@ -756,14 +756,30 @@ pub const PRE_RESTORE_INFIX: &str = "PRE-RESTORE-";
 /// reported as four findings. An unreadable directory returns empty: this is a
 /// guard that ADDS a refusal, and it must never be the reason a boot fails.
 pub fn find_pre_restore_units(db_path: &Path) -> Vec<PathBuf> {
-    let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
-        return Vec::new();
-    };
+    // **ADR-0116 rev 5 / finding 1 — a `--db` with no directory component.**
+    //
+    // `Path::new("aberp.duckdb").parent()` is `Some("")`, not `None`. The
+    // first cut filtered that empty parent out and returned empty — so
+    // `aberp serve --db aberp.duckdb`, typed by an operator standing in the
+    // tenant home, saw NO unit, provisioned a fresh empty company and printed
+    // `boot-check: PASSED`. That is F1's harm, arriving through F1's own fix.
+    //
+    // Worse, it LATCHED: once the empty DB existed, `!args.db.exists()` was
+    // false forever after, so a later boot on the correct absolute path never
+    // consulted the detector again. One mistyped `--db` disarmed the guard for
+    // the life of that tenant home.
+    //
+    // Resolving the path here (rather than at the call site) puts the fix
+    // where every caller gets it, and returning ABSOLUTE unit paths means the
+    // refusal names something the operator can paste regardless of what they
+    // typed or which directory they are standing in.
+    let db_path = &resolve_db_path(db_path);
+    let parent = db_parent_dir(db_path);
     let Some(db_name) = db_path.file_name() else {
         return Vec::new();
     };
     let prefix = format!("{}.{PRE_RESTORE_INFIX}", db_name.to_string_lossy());
-    let Ok(entries) = std::fs::read_dir(parent) else {
+    let Ok(entries) = std::fs::read_dir(&parent) else {
         return Vec::new();
     };
     let mut units: Vec<PathBuf> = entries
@@ -1007,10 +1023,17 @@ pub fn restore_in_place(
         mirror: preserved_mirror,
         tag: suffix.clone(),
     };
-    if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+    {
         // The preserved unit must be durable before the install overwrites the
         // live path: same ordering invariant as everywhere else in the tree.
-        if let Ok(f) = std::fs::File::open(parent) {
+        //
+        // **ADR-0116 rev 5 / finding 1, second site.** This was behind the same
+        // `.filter(|p| !p.as_os_str().is_empty())` as the detector, so a
+        // bare-relative `--db` silently skipped the fsync that makes the
+        // preserved unit durable before the install overwrites the live path —
+        // the one ordering this whole step exists to establish.
+        let parent = db_parent_dir(db_path);
+        if let Ok(f) = std::fs::File::open(&parent) {
             let _ = f.sync_all();
         }
     }
@@ -1278,6 +1301,99 @@ fn move_aside_to(path: &Path, dest: &Path) -> Result<Option<PathBuf>> {
     }
     std::fs::rename(path, dest).map_err(|e| SnapshotError::io(dest, e))?;
     Ok(Some(dest.to_path_buf()))
+}
+
+/// **ADR-0116 rev 5 / finding 1** — `db_path` made absolute, so a bare
+/// relative `--db` ("aberp.duckdb") resolves against the current directory
+/// instead of against nothing.
+///
+/// `std::path::absolute` is deliberate over `canonicalize`: the file this is
+/// asked about is very often ABSENT (that is the whole interrupted-restore
+/// case), and `canonicalize` fails on a path that does not exist. It also
+/// never touches the filesystem, so it cannot fail on a permission error at
+/// 02:00. On the error path the original is returned unchanged — a guard that
+/// ADDS a refusal must never be the reason a boot fails.
+pub fn resolve_db_path(db_path: &Path) -> PathBuf {
+    std::path::absolute(db_path).unwrap_or_else(|_| db_path.to_path_buf())
+}
+
+/// The directory `db_path` lives in, with the empty parent of a bare filename
+/// resolved to the current directory. See [`resolve_db_path`].
+fn db_parent_dir(db_path: &Path) -> PathBuf {
+    match resolve_db_path(db_path).parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// **ADR-0116 rev 5 / finding 2 — the ONE spelling of "put the unit back".**
+///
+/// The `(from, to)` renames that move a preserved `.PRE-RESTORE-<tag>` unit
+/// back onto the live path, for the files that are actually there.
+///
+/// # Why this is a function and not four lines in a message
+///
+/// The refusal that fires on an interrupted restore is the only instruction an
+/// operator has at 02:00, and moving **only the database** is not a partial
+/// recovery — it is a silent one. Every `Handle` commit is WAL-only until a
+/// checkpoint (ADR-0098 R5), so a DB moved back without its `.wal` opens
+/// CLEAN and EMPTY, and `--boot-check` prints PASSED over it. The adversarial
+/// walked exactly that: unit-only move-back → `counts=(0, 0)`; all four files
+/// → `counts=(40005, 11)`.
+///
+/// Derived from the same three sibling helpers [`restore_in_place`] WROTE the
+/// unit with (`wal_sibling`, `mirror_path_for`, `crash_safe::marker_path`), so
+/// a change to the unit's shape cannot leave the recovery instructions behind
+/// — the `recover_hint` discipline (ADR-0116 rev 4 / F2), applied to the route
+/// that actually works in this state.
+///
+/// Only EXISTING sources are returned: a unit whose WAL was never created has
+/// no `.wal` to move, and printing an `mv` that fails is how an operator
+/// learns to distrust the instructions.
+pub fn pre_restore_move_back(unit: &Path, db_path: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let db = resolve_db_path(db_path);
+    let unit = resolve_db_path(unit);
+    [
+        (unit.clone(), db.clone()),
+        (wal_sibling(&unit), wal_sibling(&db)),
+        (mirror_path_for(&unit), mirror_path_for(&db)),
+        (
+            crate::crash_safe::marker_path(&unit),
+            crate::crash_safe::marker_path(&db),
+        ),
+    ]
+    .into_iter()
+    .filter(|(from, _)| from.exists())
+    .collect()
+}
+
+/// **ADR-0116 rev 5 / finding 2** — is this unit only PARTLY moved back?
+///
+/// True when the unit's database file is gone but at least one of its siblings
+/// is still sitting there. That state has exactly one cause: someone followed
+/// a refusal that named only the database, moved that one file, and left the
+/// `.wal` holding every un-checkpointed commit behind. It is not a state any
+/// code in this tree produces.
+pub fn pre_restore_unit_is_partly_moved_back(unit: &Path) -> bool {
+    let unit = resolve_db_path(unit);
+    !unit.exists()
+        && [
+            wal_sibling(&unit),
+            mirror_path_for(&unit),
+            crate::crash_safe::marker_path(&unit),
+        ]
+        .iter()
+        .any(|p| p.exists())
+}
+
+/// DuckDB's WAL path for `db`, for callers outside this crate.
+///
+/// A thin public face on [`wal_sibling`] rather than a rename of it: this tree
+/// has twice paid for a public rename blinding a name-keyed gate (ADR-0099
+/// round 6, PR #41), and the internal name is the one the preserve step and
+/// its frozen notes talk about.
+pub fn wal_path_for(db: &Path) -> PathBuf {
+    wal_sibling(db)
 }
 
 /// DuckDB names the WAL by appending `.wal` to the FULL filename (so

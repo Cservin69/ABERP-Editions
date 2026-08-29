@@ -124,12 +124,26 @@ struct Run {
 /// dir so nothing can reach the operator's actual tenant homes, snapshot
 /// stores, or recovery evidence — the whole point of the sandbox.
 fn aberp(tmp: &Tmp, args: &[&str]) -> Run {
-    let out = Command::new(env!("CARGO_BIN_EXE_aberp"))
-        .args(args)
+    aberp_in(tmp, None, args)
+}
+
+/// The same, with an explicit working directory.
+///
+/// **ADR-0116 rev 5 / finding 1.** A bare-relative `--db` ("aberp.duckdb")
+/// only means anything relative to where the operator is STANDING, so the pin
+/// for that spelling cannot be expressed without setting `cwd`. The crate-
+/// level test cannot express it at all (a `std::env::set_current_dir` in one
+/// test races every other test in the binary), which is exactly why the
+/// blind spot survived to the CLI.
+fn aberp_in(tmp: &Tmp, cwd: Option<&Path>, args: &[&str]) -> Run {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aberp"));
+    cmd.args(args)
         .env("HOME", tmp.path())
-        .env("ABERP_SNAPSHOT_DISABLE", "")
-        .output()
-        .expect("spawn aberp binary");
+        .env("ABERP_SNAPSHOT_DISABLE", "");
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let out = cmd.output().expect("spawn aberp binary");
     Run {
         ok: out.status.success(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1659,6 +1673,353 @@ fn journey_an_interrupted_in_place_restore_refuses_to_boot_empty() {
         "the preserved unit must survive the refused boot — it is the only copy of the \
          operator's data"
     );
+
+    // ══ ADR-0116 rev 5 / finding 2 — the refusal must name the recovery
+    //    that WORKS, and stop naming two that cannot run here ═══════════
+    //
+    // The adversarial ran all three routes the rev-4 message offered, on a
+    // genuine SIGINT state carrying 40 005 invoices. `aberp recover` refuses
+    // (its `.audit.log` mirror is inside the unit, by rev 2's own fix);
+    // `restore --in-place` aborts (no live DB to take its mandatory
+    // pre-restore snapshot of); and moving the unit's DB back ALONE boots
+    // `ok=true` with `counts=(0, 0)`. Only the four-file move-back recovers.
+    assert_pins_the_move_back(&told, &units[0], &db);
+    assert_offers_no_dead_end_route(&told);
+}
+
+/// Every `mv` the recovery needs, spelled in the refusal, one runnable line
+/// per file — and at least three of them, so a `pre_restore_move_back` that
+/// stopped returning anything could not make this pass by being empty.
+fn assert_pins_the_move_back(told: &str, unit: &Path, db: &Path) {
+    let moves = aberp_snapshot::pre_restore_move_back(unit, db);
+    assert!(
+        moves.len() >= 3,
+        "ADR-0116 rev 5 — the unit must carry at least the DB, its .wal and its .audit.log, \
+         or this pin asserts nothing: {moves:?}"
+    );
+    for (from, to) in moves {
+        let line = format!("mv {} {}", from.display(), to.display());
+        assert!(
+            told.contains(&line),
+            "ADR-0116 rev 5 / finding 2 — the refusal must spell the WHOLE move-back, one \
+             runnable line per file. Missing `{line}`. Moving only the database strands every \
+             un-checkpointed commit in the orphaned .wal and the next boot comes up EMPTY \
+             (measured: (0, 0) vs (40005, 11) for the full move): {told}"
+        );
+    }
+}
+
+/// **ADR-0116 rev 5 / finding 2.** The rev-4 refusal offered three routes and
+/// the adversarial ran all three on a genuine SIGINT state: `aberp recover`
+/// REFUSED (rev 2 moved the `.audit.log` mirror INTO the unit, and
+/// `recover_or_refuse_with_audit` requires a readable one at the live path —
+/// and the hand-rolled hint dropped `--store`, so it resolved the DEFAULT
+/// store as well); `restore --in-place` ABORTED (no live database for its
+/// mandatory pre-restore snapshot).
+///
+/// Naming them as things that CANNOT run is the fix; naming them as things to
+/// try is the defect. So the pin is not "the string is absent" — it is "the
+/// only place the string appears is the sentence that rules it out".
+fn assert_offers_no_dead_end_route(told: &str) {
+    const CANNOT_RUN: &str = "Neither `aberp restore --in-place` nor `aberp recover` can run \
+                              before that move";
+    assert!(
+        told.contains(CANNOT_RUN),
+        "the refusal must say plainly that neither route can run in this state, and why: \
+         {told}"
+    );
+    let elsewhere = told.replace(CANNOT_RUN, "");
+    assert!(
+        !elsewhere.contains("restore --in-place"),
+        "ADR-0116 rev 5 / finding 2 — the refusal offers `restore --in-place` somewhere other \
+         than the sentence ruling it out. It ABORTS here: there is no live database for its \
+         mandatory pre-restore snapshot: {told}"
+    );
+    assert!(
+        !elsewhere.contains("aberp recover"),
+        "ADR-0116 rev 5 / finding 2 — the refusal offers `aberp recover` somewhere other than \
+         the sentence ruling it out. Probed on a real interrupted state: `REFUSED (unsafe): \
+         audit-ledger mirror at <db>.audit.log is missing or unreadable`: {told}"
+    );
+}
+
+/// Drive a real `restore --in-place` through the shipped CLI, then reproduce
+/// the disk state a `^C` inside its preserve→install window leaves. Returns
+/// the live DB path and the preserved unit.
+///
+/// Shared by the rev-5 pins so every one of them starts from a unit the
+/// PRODUCT named, not one the test spelled.
+fn interrupted_restore_state(t: &Tmp) -> (PathBuf, PathBuf) {
+    let db = t.db();
+    let store = t.store();
+    let (db_s, store_s) = (db.to_str().unwrap(), store.to_str().unwrap());
+
+    seed(&db, 2, 3);
+    assert!(
+        aberp(
+            t,
+            &["snapshot", "now", "--db", db_s, "--tenant", TENANT, "--store", store_s]
+        )
+        .ok,
+        "fixture: the snapshot must succeed"
+    );
+    seed(&db, 4, 7);
+
+    let r = aberp(
+        t,
+        &[
+            "snapshot", "list", "--tenant", TENANT, "--store", store_s, "--json",
+        ],
+    );
+    let listed: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    let id = listed["snapshots"][0]["id"].as_str().unwrap().to_string();
+
+    let r = aberp(
+        t,
+        &[
+            "restore",
+            "--in-place",
+            "--tenant",
+            TENANT,
+            "--snapshot",
+            &id,
+            "--db",
+            db_s,
+            "--store",
+            store_s,
+            "--confirm",
+            "--accept-data-loss",
+        ],
+    );
+    assert!(
+        r.ok,
+        "fixture: the in-place restore must succeed so the PRE-RESTORE unit is produced by the \
+         PRODUCT, not by the test.\nstdout: {}\nstderr: {}",
+        r.stdout, r.stderr
+    );
+    for p in [
+        db.clone(),
+        wal_of(&db),
+        aberp_audit_ledger::mirror_path_for(&db),
+        aberp_snapshot::marker_path(&db),
+    ] {
+        let _ = std::fs::remove_file(&p);
+    }
+    let units = aberp_snapshot::find_pre_restore_units(&db);
+    assert_eq!(
+        units.len(),
+        1,
+        "fixture: exactly one PRE-RESTORE unit must be beside the missing DB, found {units:?}"
+    );
+    (db, units.into_iter().next().unwrap())
+}
+
+/// **ADR-0116 rev 5 / finding 1 — a `--db` with no directory component must
+/// not blind the interrupted-restore detector.**
+///
+/// `Path::new("aberp.duckdb").parent()` is `Some("")`, not `None`. The rev-4
+/// detector filtered that empty parent out and returned "no units", so
+/// `aberp serve --db aberp.duckdb` — typed by an operator standing in the
+/// tenant home at 02:00, which is precisely who the guard is for — provisioned
+/// a fresh empty company over an intact `.PRE-RESTORE-` unit and printed
+/// `boot-check: PASSED`. F1's harm, arriving through F1's own fix.
+///
+/// This is a CLI pin and cannot be anything else: the spelling only means
+/// something relative to the process's working directory.
+#[test]
+fn journey_a_bare_relative_db_still_sees_the_interrupted_restore() {
+    let t = Tmp::new("r5-bare-relative-db");
+    let (db, unit) = interrupted_restore_state(&t);
+    let home = db.parent().unwrap().to_path_buf();
+    let unit_name = unit.file_name().unwrap().to_string_lossy().into_owned();
+
+    // ══ THE GATE ══════════════════════════════════════════════════════════
+    let r = aberp_in(
+        &t,
+        Some(&home),
+        &[
+            "serve",
+            "--db",
+            "aberp.duckdb",
+            "--tenant",
+            TENANT,
+            "--boot-check",
+        ],
+    );
+    let told = format!("{}{}", r.stdout, r.stderr);
+    assert!(
+        !r.ok,
+        "ADR-0116 rev 5 / finding 1 — `--db aberp.duckdb` from inside the tenant home booted \
+         GREEN over an interrupted restore. The detector's parent was `\"\"`, the filter \
+         dropped it, and the empty vector read as \"no interrupted restore\".\ntold: {told}"
+    );
+    assert!(
+        !db.exists(),
+        "ADR-0116 rev 5 / finding 1 — a fresh empty tenant DB was provisioned. That is the \
+         LATCH: `db.exists()` is now true, so the `!db.exists()` guard is never consulted \
+         again and every later boot — even on the correct absolute path — reports PASSED over \
+         an empty company."
+    );
+    assert!(
+        told.contains(&unit_name) && told.contains("INTERRUPTED"),
+        "the refusal must name the unit ({unit_name}) and say what this state is: {told}"
+    );
+    assert!(
+        !told.contains("boot-check: PASSED"),
+        "`--boot-check` reported PASSED over an interrupted restore: {told}"
+    );
+    assert!(unit.exists(), "the preserved unit must survive the refusal");
+}
+
+/// **ADR-0116 rev 5 / finding 1, the latch — an EMPTY database beside an
+/// intact unit is an interrupted restore, not a legitimate tenant.**
+///
+/// The blind spot above was serious because of what it left behind. Once a
+/// fresh empty DB has been provisioned over a unit, `args.db.exists()` is true
+/// forever after, the `!db.exists()` guard is never reached again, and a boot
+/// on the CORRECT absolute path reports `boot-check: PASSED` over an empty
+/// company — measured by the adversarial. One mistyped `--db` disarmed the
+/// guard for the life of that tenant home.
+///
+/// Fixing the spelling closes the way IN. This closes the way OUT, so a home
+/// that is already latched — or one latched by the next spelling hole — is
+/// recoverable rather than permanently green.
+#[test]
+fn journey_a_latched_empty_db_beside_an_intact_unit_refuses() {
+    let t = Tmp::new("r5-latched-empty");
+    let (db, unit) = interrupted_restore_state(&t);
+
+    // The latch, planted directly: a fresh EMPTY tenant database at the live
+    // path, exactly what `provision_atomic` leaves, beside the intact unit.
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS invoice (id BIGINT, amount DOUBLE, note VARCHAR);",
+        )
+        .unwrap();
+    }
+    assert!(db.exists(), "fixture: the latched empty DB must be there");
+
+    // ══ THE GATE — the CORRECT absolute path, which is the point ══════════
+    let r = aberp(
+        &t,
+        &[
+            "serve",
+            "--db",
+            db.to_str().unwrap(),
+            "--tenant",
+            TENANT,
+            "--boot-check",
+        ],
+    );
+    let told = format!("{}{}", r.stdout, r.stderr);
+    assert!(
+        !r.ok,
+        "ADR-0116 rev 5 / finding 1 — boot came up GREEN on a latched empty tenant. The \
+         company's 4 invoices and 10 audit entries are sitting in the unit beside it, \
+         unread.\ntold: {told}"
+    );
+    assert!(
+        !told.contains("boot-check: PASSED"),
+        "`--boot-check` reported PASSED over a latched empty tenant: {told}"
+    );
+    assert!(
+        told.contains("EMPTY") && told.contains("INTERRUPTED"),
+        "the refusal must say the live DB is EMPTY and that this is an INTERRUPTED restore, \
+         so it is not read as corruption: {told}"
+    );
+    assert!(
+        unit.exists(),
+        "the preserved unit must survive the refused boot"
+    );
+    // …and the recovery it prints must be runnable AGAINST THIS STATE: the
+    // move-back overwrites the empty DB, so anything the move does NOT
+    // overwrite has to be removed or it pairs with the restored database —
+    // a stale empty `.wal` beside a full DB is the F4 hazard the other way up.
+    assert_pins_the_move_back(&told, &unit, &db);
+    assert_offers_no_dead_end_route(&told);
+    assert!(
+        told.contains(&format!(
+            "rm {}",
+            aberp_snapshot::marker_path(&db).display()
+        )) || !aberp_snapshot::marker_path(&db).exists(),
+        "the latched refusal must clear the empty database's leftover siblings, or they pair \
+         with the restored one: {told}"
+    );
+}
+
+/// **ADR-0116 rev 5 / finding 2 — moving only the unit's DATABASE back must
+/// not boot an EMPTY company green.**
+///
+/// The rev-4 refusal printed exactly one path, the unit's; the siblings were
+/// named generically ("with its .wal, .audit.log and .ckpt-ok siblings"). An
+/// operator who moves the file that was NAMED gets a database whose every
+/// un-checkpointed commit is still in the orphaned `.wal` — every `Handle`
+/// commit is WAL-only until a checkpoint (ADR-0098 R5) — and boot printed
+/// `PASSED` over `counts=(0, 0)`. The adversarial verified it twice, on two
+/// independent SIGINT-produced states.
+///
+/// The message now spells all four `mv`s (pinned above). This is the belt: the
+/// state refuses even when the operator gets the instruction wrong.
+#[test]
+fn journey_a_partly_moved_back_unit_refuses_instead_of_booting_empty() {
+    let t = Tmp::new("r5-partial-move-back");
+    let (db, unit) = interrupted_restore_state(&t);
+
+    // The partial recovery, exactly as an operator would perform it: move the
+    // one file the old message named, and nothing else.
+    std::fs::rename(&unit, &db).unwrap();
+    assert!(db.exists() && !unit.exists());
+    assert!(
+        wal_of(&unit).exists(),
+        "fixture: the unit's WAL — holding the un-checkpointed commits — must still be behind"
+    );
+
+    // ══ THE GATE ══════════════════════════════════════════════════════════
+    let r = aberp(
+        &t,
+        &[
+            "serve",
+            "--db",
+            db.to_str().unwrap(),
+            "--tenant",
+            TENANT,
+            "--boot-check",
+        ],
+    );
+    let told = format!("{}{}", r.stdout, r.stderr);
+    assert!(
+        !r.ok,
+        "ADR-0116 rev 5 / finding 2 — a half-moved-back unit booted GREEN. The database is \
+         there without its WAL, so it opens CLEAN and EMPTY while the commits sit in the \
+         orphaned .wal beside it.\ntold: {told}"
+    );
+    assert!(
+        !told.contains("boot-check: PASSED"),
+        "`--boot-check` reported PASSED over a half-moved-back unit: {told}"
+    );
+    assert!(
+        told.contains("PARTLY") || told.contains("INCOMPLETE"),
+        "the refusal must say the unit is only partly moved back — the operator has already \
+         acted once and needs to know what is still missing: {told}"
+    );
+    // ADR-0116 rev 5, the adversarial's unranked note: a refusal that claims
+    // the unit is INTACT while naming a file that is not there teaches an
+    // operator to distrust the message.
+    assert!(
+        !told.contains("is INTACT at"),
+        "the refusal claims the previous database is INTACT at a path that does not exist: \
+         {told}"
+    );
+    for (from, to) in aberp_snapshot::pre_restore_move_back(&unit, &db) {
+        assert!(
+            told.contains(&format!("mv {} {}", from.display(), to.display())),
+            "the partial-move refusal must spell the moves that are STILL outstanding: {told}"
+        );
+    }
+    assert_offers_no_dead_end_route(&told);
 }
 
 /// **ADR-0116 rev 4 / F1, the other direction — a genuine first launch must
