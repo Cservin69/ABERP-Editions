@@ -110,6 +110,14 @@ pub const LIVE_TRANSIENT_INFIXES: &[&str] = &[
     ".restoring", // take.rs restore_into staging file
     ".partial",   // store.rs PARTIAL_SUFFIX — an unfinished EXPORT dir
     ".tmp.",      // tenant_registry.rs atomic-write staging
+    // seller_toml_backup.rs writes `.{filename}.backup-{unix-secs}` beside
+    // seller.toml and rotates the oldest away. Code-owned, enumerable, stable
+    // — the same criterion the other transients meet. The LEADING DOT is what
+    // makes it discriminating: real evidence spells it `-BACKUP-`
+    // (`aberp.duckdb.CORRUPT-BACKUP-…`, `INDEXDESYNC-BACKUP-…`), which does not
+    // contain `.backup-`, and both of those carry a family token that is
+    // matched FIRST regardless.
+    ".backup-",
 ];
 
 /// Evidence name families — the belt-and-braces SECOND predicate, applied
@@ -139,8 +147,19 @@ pub const EVIDENCE_FRAGMENTS: &[&str] = &[
     "pre-mirror-rebuild",
     "pre-upgrade",
     "keychain",
-    ".bak",
 ];
+
+/// Evidence families matched as a **SUFFIX**, not a substring.
+///
+/// `.bak` used to live in [`EVIDENCE_FRAGMENTS`] as a plain substring, and
+/// that was a real collision: `.seller.toml.backup-<ts>` CONTAINS `.bak`, so
+/// the seller-config backup rotation was frozen by the evidence guard and
+/// would have accumulated in the tenant home forever. Every real `.bak`
+/// artefact on disk uses it as a suffix
+/// (`…corrupt-<nanos>.bak`, `healed-*.bak`,
+/// `…PRE-DEFORK-<ts>.bak`), and each also carries a substring family token
+/// anyway — so anchoring costs nothing and removes the collision.
+pub const EVIDENCE_SUFFIXES: &[&str] = &[".bak"];
 
 /// Component naming the FROZEN prod line's out-of-tree physical backup store
 /// `~/aberp-snapshots/` — **not** `~/Documents/ABERP-snapshots/`. It holds
@@ -213,6 +232,7 @@ pub fn path_is_under_evidence_root(path: &Path) -> bool {
 pub fn name_is_evidence_shaped(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     EVIDENCE_FRAGMENTS.iter().any(|f| lower.contains(f))
+        || EVIDENCE_SUFFIXES.iter().any(|f| lower.ends_with(f))
 }
 
 /// `true` if the file NAME is a known-live tenant artefact — either an exact

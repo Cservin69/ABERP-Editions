@@ -105,9 +105,25 @@ pub fn snapshot_and_rotate(path: &Path) -> Result<()> {
 }
 
 /// Walk `parent` for files whose name starts with `prefix`, sort by
-/// name (the unix-seconds suffix orders chronologically), and
-/// `remove_file` the oldest entries beyond `keep`. Silently tolerates
-/// missing-dir / unreadable-entry failures.
+/// name (the unix-seconds suffix orders chronologically), and remove the
+/// oldest entries beyond `keep`. Silently tolerates missing-dir /
+/// unreadable-entry failures.
+///
+/// # ADR-0116 D2 — this enumerates a TENANT HOME and unlinks by prefix
+///
+/// `parent` is `seller.toml`'s directory, i.e.
+/// `~/.aberp-<edition>/<tenant>/` — the same directory the live DB and every
+/// recovery-evidence artefact sit in. That makes this the SECOND instance in
+/// the tree of the exact shape ADR-0116 D2 names: *"any future 'clean up the
+/// tenant home' helper would meet no guard at all."* It is safe today only
+/// because the prefix its one call site passes happens not to collide with an
+/// evidence family — a property of the call site, not of this function.
+///
+/// So every unlink goes through [`aberp_snapshot::guarded_remove`], which
+/// refuses (loudly) anything the shared predicate protects. The rotation keeps
+/// working because `.backup-` is on that guard's live allow-list; a future
+/// caller that passes a prefix reaching real evidence gets a refusal and an
+/// ERROR line instead of permanent, unrecoverable data loss.
 fn prune_old_backups(parent: &Path, prefix: &str, keep: usize) {
     let entries = match fs::read_dir(parent) {
         Ok(e) => e,
@@ -129,7 +145,10 @@ fn prune_old_backups(parent: &Path, prefix: &str, keep: usize) {
     if backups.len() > keep {
         let to_drop = backups.len() - keep;
         for p in &backups[..to_drop] {
-            if let Err(e) = fs::remove_file(p) {
+            // ADR-0116 D2 — guarded, never a bare remove_file. The guard logs
+            // its own refusal LOUD; an ordinary IO failure stays best-effort,
+            // exactly as before.
+            if let Err(e) = aberp_snapshot::guarded_remove(p) {
                 tracing::warn!(
                     backup = %p.display(),
                     error = %e,

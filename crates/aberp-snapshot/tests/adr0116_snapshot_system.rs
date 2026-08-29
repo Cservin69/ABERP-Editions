@@ -410,6 +410,45 @@ fn ac6_named_families_are_protected_everywhere_not_only_under_a_tenant_home() {
     }
 }
 
+/// **The `.backup-` allow-list entry must not become an evidence escape.**
+///
+/// `seller_toml_backup::prune_old_backups` enumerates a tenant home and
+/// unlinks by prefix — the ADR's exact hazard shape, and the SECOND instance
+/// of it in this tree. Routing it through `guarded_remove` required putting
+/// `.backup-` on the live allow-list, or the rotation would refuse forever and
+/// backups would accumulate in the tenant home.
+///
+/// That entry is the risky half, so it is pinned from both sides: the seller
+/// backup must be removable, and the real `-BACKUP-` evidence families must
+/// still be protected. The LEADING DOT is what separates them, and the family
+/// predicate runs first regardless.
+#[test]
+fn seller_toml_backup_is_removable_but_backup_shaped_evidence_is_not() {
+    let home = Path::new("/Users/someone/.aberp-defense/defense");
+    assert!(
+        !is_protected_evidence(&home.join(".seller.toml.backup-1787209326")),
+        "ADR-0116 D2 — the seller.toml backup rotation must keep working. A guard that freezes \
+         it is a guard an operator switches off, and backups would grow without bound in the \
+         tenant home."
+    );
+    for evidence in [
+        "aberp.duckdb.CORRUPT-BACKUP-20260629T140040Z",
+        "aberp.duckdb.CORRUPT-BACKUP-20260704T043734Z",
+        "aberp.duckdb.INDEXDESYNC-BACKUP-20260803",
+        "aberp.duckdb.INDEXDESYNC-BACKUP-20260803.wal",
+    ] {
+        assert!(
+            is_protected_evidence(&home.join(evidence)),
+            "ADR-0116 D2 — {evidence} is real recovery evidence and the `.backup-` allow-list \
+             entry must not reach it. These spell it `-BACKUP-`, not `.backup-`, AND carry a \
+             family token that is matched FIRST — both separations must hold."
+        );
+        // Case-insensitively too, which is where the first-draft guard failed.
+        assert!(is_protected_evidence(&home.join(evidence.to_lowercase())));
+        assert!(is_protected_evidence(&home.join(evidence.to_uppercase())));
+    }
+}
+
 #[test]
 fn ac6_guarded_remove_refuses_evidence_and_permits_a_live_transient() {
     let tmp = ScopedTempDir::new("ac6-guarded-remove");

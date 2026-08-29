@@ -9,7 +9,9 @@
 #                 guard (`is_protected_evidence` / `guarded_remove` appear in
 #                 the same fn body).
 #   TENANT_HOME   the fn removes a path AND reaches a tenant-home path (it
-#                 mentions a tenant-home token), with NO guard. **This is the
+#                 mentions a tenant-home token — `read_dir` included, because
+#                 ENUMERATE-AND-UNLINK is the dangerous shape whatever the
+#                 directory), with NO guard. **This is the
 #                 class the gate freezes.** An unguarded unlink beside the live
 #                 DB is permanent loss of the only record of a durability
 #                 incident, and the ADR's own example — a "clean up the tenant
@@ -77,7 +79,7 @@ function strip(line,   out, i, c, instr, inchar, prev) {
 BEGIN {
   # Tokens that mean "this fn can reach a path inside a tenant home". Drawn
   # from the shapes that actually occur at removal sites in this tree.
-  nth = split("db_path|mirror_path|tenant_home|tenant_dir|wal_sibling|marker_path|install_intent_path|.aberp|audit.log|CORRUPT|preserve_|evidence|sibling|live_db|.wal", TH, "|")
+  nth = split("db_path|mirror_path|tenant_home|tenant_dir|wal_sibling|marker_path|install_intent_path|.aberp|audit.log|CORRUPT|preserve_|evidence|sibling|live_db|.wal|read_dir", TH, "|")
   ng  = split("is_protected_evidence|guarded_remove", GUARD, "|")
 }
 

@@ -155,27 +155,37 @@ Said here rather than papered over.
 
 1. **CHECK 11's classification model is fn-scoped**, not a taint closure. A helper that
    takes a tenant-home path as a parameter and unlinks it, with no tenant-home token in
-   its own body, classifies `OTHER` and passes. Is the token set (`db_path`,
-   `mirror_path`, `.aberp`, `audit.log`, `CORRUPT`, `evidence`, `sibling`, `.wal`, …)
-   wide enough for the shapes that actually occur?
-2. **`LIVE_TENANT_NAMES` is a maintained list.** A new legitimate live filename nobody
+   its own body, classifies `OTHER` and passes. The token set has already been widened
+   once for exactly this: self-review found `seller_toml_backup::prune_old_backups`
+   enumerating the tenant home and unlinking by prefix — the ADR's own hazard shape, a
+   SECOND instance of it in the tree — and the scanner did not see it, because that fn
+   mentions none of the DB-shaped path names. `read_dir` is now a token, on the
+   principle that ENUMERATE-AND-UNLINK is the dangerous shape whatever the directory,
+   and the site now routes through `guarded_remove`. **Assume there is a third.**
+2. **`.bak` was a substring fragment and matched `.backup-`**, so the guard silently
+   froze the seller-config backup rotation — a guard that breaks a working rotation is
+   a guard someone switches off. It is now suffix-anchored, and the `.backup-`
+   allow-list entry is pinned from both sides (the seller backup must be removable;
+   `CORRUPT-BACKUP` / `INDEXDESYNC-BACKUP` must not be). **The allow-list entries are
+   the risky half of an allow-list design — audit each one for what it un-protects.**
+3. **`LIVE_TENANT_NAMES` is a maintained list.** A new legitimate live filename nobody
    adds becomes "protected evidence" — the safe direction, but it accumulates, and a
    cleanup helper that starts refusing is a guard people switch off.
-3. **`LIVE_TRANSIENT_INFIXES` is the un-protecting half** and deserves the harder look:
+4. **`LIVE_TRANSIENT_INFIXES` is the un-protecting half** and deserves the harder look:
    the family predicate runs first, so an evidence-shaped name cannot be un-protected by
    a transient infix — but verify that ordering has not been inverted by a later edit.
-4. **The pre-restore snapshot extends the mirror**, and the e2e now asserts only
+5. **The pre-restore snapshot extends the mirror**, and the e2e now asserts only
    append-only + not-moved. Is there a mirror mutation the restore could make that this
    would not catch?
-5. **Drift #2 (the anchor sanction)** is the most consequential deviation and is the one
+6. **Drift #2 (the anchor sanction)** is the most consequential deviation and is the one
    to argue with directly if you disagree.
-6. **The D1.2 skip and the ADR-0095 §3 live checkpoint share a loop but must not
+7. **The D1.2 skip and the ADR-0095 §3 live checkpoint share a loop but must not
    share a condition.** The first cut of the skip `continue`d past
    `live_checkpoint_logged`, silently un-wiring the live-file durable checkpoint on
    every skipped tick — and precisely in the configuration this ADR sets up, where a
    scheduled floor satisfies the staleness window most ticks. Fixed, and called out
    here because it is the kind of coupling that reads as correct.
-7. **`store_is_stale` uses the newest snapshot valid-or-not.** A DB that fails validation
+8. **`store_is_stale` uses the newest snapshot valid-or-not.** A DB that fails validation
    every cycle therefore suppresses retries for a full interval. Deliberate (avoids a
    snapshot storm on a broken DB), but it means a broken tenant produces one failed
    forensic snapshot per interval rather than a burst — check that is what you want.
