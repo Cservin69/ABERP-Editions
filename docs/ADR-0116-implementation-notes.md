@@ -69,6 +69,17 @@ The ADR says "(compressed)". Compression would be a new supply-chain dependency
 convenience — and verbatim bytes plus a re-checkable SHA-256 are strictly stronger for
 forensic evidence than a re-encoded copy whose integrity depends on a decoder.
 
+### 4a. Order WITHIN the preserved unit (found by self-review, not by a test)
+
+The first cut moved the WAL and marker aside first and the DB second. A failed DB
+rename would then have left the **live** database in place **without its WAL** — stripped
+of every un-checkpointed commit, which is F4's failure caused by the preserve step
+itself. Every `Handle` commit is WAL-only until a checkpoint (ADR-0098 R5), so that is
+the most recent rows, not a narrow window. The DB now moves first (the point of no
+return) and a failed WAL move rolls it back; the marker is best-effort because step 5
+regenerates it. Pinned by `preserve_moves_the_db_first_and_rolls_back_if_the_wal_move_fails`,
+which is mutation-checked: restoring the old order turns it red.
+
 ### 4. The preserved WAL is named `<db>.PRE-RESTORE-<tag>.wal`, not `<db>.wal.PRE-RESTORE-<tag>`
 
 The ADR does not specify the naming, and the on-disk `.CORRUPT-` convention would

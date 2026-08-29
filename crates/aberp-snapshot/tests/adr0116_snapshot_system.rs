@@ -739,6 +739,103 @@ fn ac9_in_place_restore_refuses_an_invalid_snapshot_without_touching_the_live_db
     );
 }
 
+/// **The preserve step must not be able to strip the LIVE database of its WAL.**
+///
+/// Ordering within the `.PRE-RESTORE-` unit is load-bearing and the obvious
+/// order is wrong. Moving the WAL first and the DB second means a failed DB
+/// rename leaves the live database in place **without its WAL** — stripped of
+/// every un-checkpointed commit, which is exactly the F4 failure the unit
+/// exists to prevent, caused by the preserve step itself. Every `Handle`
+/// commit is WAL-only until a checkpoint (ADR-0098 R5), so that is not a
+/// narrow window; it is the most recent rows.
+///
+/// Asserted two ways, because neither alone is enough: the source order is
+/// pinned (a refactor cannot silently swap them back), and a real injected
+/// failure of the WAL move is shown to roll the DB back to the original state.
+#[test]
+fn preserve_moves_the_db_first_and_rolls_back_if_the_wal_move_fails() {
+    // ── source ordering ──
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/take.rs"))
+        .expect("read take.rs");
+    let body_start = src
+        .find("pub fn restore_in_place(")
+        .expect("restore_in_place must exist");
+    let body = &src[body_start..];
+    let db_rename = body
+        .find("std::fs::rename(db_path, &preserved_db)")
+        .expect("the DB rename must exist");
+    let wal_move = body
+        .find("move_aside_to(&db_wal,")
+        .expect("the WAL move must exist");
+    assert!(
+        db_rename < wal_move,
+        "the DB must be moved aside BEFORE its WAL. With the WAL first, a failed DB rename \
+         leaves the LIVE database without its un-checkpointed commits — F4's failure, caused \
+         by the preserve step itself."
+    );
+    assert!(
+        body[db_rename..wal_move + 2000].contains("rename(&preserved_db, db_path)"),
+        "a failed WAL move must ROLL THE DB BACK; otherwise the live path is left with a WAL \
+         and no database — the torn preserve in the other direction"
+    );
+
+    // ── injected failure: the WAL destination cannot be created ──
+    let tmp = ScopedTempDir::new("preserve-order");
+    let home = tmp.path().join(".aberp-defense").join("defense");
+    std::fs::create_dir_all(&home).expect("mkdir");
+    let db = home.join("aberp.duckdb");
+    seed_db(&db, "t", 2, 3);
+    let store = tmp.path().join("store");
+    let rec = take_snapshot(&db, &store, "t", OffsetDateTime::now_utc()).expect("snapshot");
+
+    // Give the live DB a WAL, and make its destination un-creatable by
+    // planting a DIRECTORY where the preserved WAL file must go.
+    {
+        let conn = Connection::open(&db).expect("open");
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .expect("pragma");
+        conn.execute(
+            "INSERT INTO invoice VALUES (?, ?, ?)",
+            duckdb::params![42i64, 1.0f64, "wal-only"],
+        )
+        .expect("insert");
+    }
+    if !wal_of(&db).exists() {
+        // No WAL on this build/platform — the injected failure cannot be
+        // staged, and asserting anything here would be vacuous. The source
+        // ordering assertion above still stands.
+        return;
+    }
+    let tag = "20260829T130000Z";
+    let blocker = home.join(format!("aberp.duckdb.PRE-RESTORE-{tag}.wal"));
+    std::fs::create_dir_all(&blocker).expect("plant a directory in the WAL's place");
+    // rename(file -> existing non-empty dir) fails on macOS and Linux alike.
+    std::fs::write(blocker.join("occupied"), b"x").expect("make the dir non-empty");
+
+    let before_db = std::fs::read(&db).expect("read live db");
+    let before_wal = std::fs::read(wal_of(&db)).expect("read live wal");
+
+    let err = restore_in_place(&rec.dir, &db, "t", tag)
+        .expect_err("the blocked WAL move must fail the restore");
+    let _ = err;
+
+    assert!(
+        db.exists(),
+        "the live database must be ROLLED BACK to its original path when the WAL move fails; \
+         leaving it moved strands the live path with a WAL and no database"
+    );
+    assert_eq!(
+        std::fs::read(&db).expect("read db after"),
+        before_db,
+        "the rolled-back database must be byte-identical to the original"
+    );
+    assert!(
+        wal_of(&db).exists() && std::fs::read(wal_of(&db)).unwrap() == before_wal,
+        "the live WAL must still be beside the live DB — the whole point of the rollback is \
+         that the pair is intact"
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // AC-11 (D4 / F7) — anchors recorded, never gating, never 0-for-unknown
 // ══════════════════════════════════════════════════════════════════════

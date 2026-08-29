@@ -767,13 +767,65 @@ pub fn restore_in_place(
     // `marker_path`, so `checkpoint_is_current` can be asked about the
     // preserved file directly.
     let preserved_db = suffixed(db_path, &suffix);
+
+    // **Order within the unit matters, and the obvious order is wrong.**
+    //
+    // The first cut moved the WAL and the marker first, then the DB. If the
+    // DB rename then failed, the LIVE database had lost its WAL while
+    // remaining live — stripped of every un-checkpointed commit, which is
+    // precisely the F4 failure this unit exists to prevent, caused by the
+    // preserve step itself. Every `Handle` commit is WAL-only until a
+    // checkpoint (proven on duckdb 1.5.3 by ADR-0098 R5), so that is not a
+    // narrow window; it is the most recent rows.
+    //
+    // So the DB moves FIRST — it is the point of no return — and the WAL
+    // follows. A failure before the DB rename has moved nothing at all; a
+    // failure of the WAL move ROLLS THE DB BACK, restoring the original state
+    // exactly, because the reverse rename is the same operation that just
+    // succeeded in the forward direction.
+    std::fs::rename(db_path, &preserved_db).map_err(|e| SnapshotError::io(&preserved_db, e))?;
+    let preserved_wal = match move_aside_to(&db_wal, &wal_sibling(&preserved_db)) {
+        Ok(w) => w,
+        Err(e) => {
+            // Put the DB back. Leaving it moved would strand the live path
+            // with a WAL and no database — the torn preserve in the other
+            // direction.
+            if let Err(rollback) = std::fs::rename(&preserved_db, db_path) {
+                tracing::error!(
+                    error = %rollback,
+                    preserved = %preserved_db.display(),
+                    db = %db_path.display(),
+                    "ADR-0116 D3.4 — the pre-restore WAL move FAILED and the database could \
+                     not be rolled back. The live path now has a WAL and no database; the \
+                     database is at the preserved path. Move it back BY HAND before doing \
+                     anything else — the two belong together."
+                );
+            }
+            return Err(e);
+        }
+    };
+    // The marker is regenerable (step 5 writes a fresh one for the installed
+    // file regardless), so a failure to move it must not abort a restore that
+    // has already passed its point of no return. A stale marker left at the
+    // live path is harmless: `checkpoint_is_current` simply returns false.
+    let preserved_ckpt =
+        match move_aside_to(&db_ckpt, &crate::crash_safe::marker_path(&preserved_db)) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "ADR-0116 D3.4 — could not move the checkpoint marker into the PRE-RESTORE \
+                     unit; continuing. The marker is regenerable and a stale one is inert."
+                );
+                None
+            }
+        };
     let preserved = PreservedUnit {
-        wal: move_aside_to(&db_wal, &wal_sibling(&preserved_db))?,
-        ckpt_ok: move_aside_to(&db_ckpt, &crate::crash_safe::marker_path(&preserved_db))?,
         db: preserved_db.clone(),
+        wal: preserved_wal,
+        ckpt_ok: preserved_ckpt,
         tag: suffix.clone(),
     };
-    std::fs::rename(db_path, &preserved_db).map_err(|e| SnapshotError::io(&preserved_db, e))?;
     if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         // The preserved unit must be durable before the install overwrites the
         // live path: same ordering invariant as everywhere else in the tree.
