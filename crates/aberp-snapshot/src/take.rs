@@ -324,13 +324,30 @@ pub fn take_snapshot_with(
     // Post-Session-C this is the ONE remaining live-tenant-DB opener outside
     // the shared `aberp_db::Handle`. It is retained deliberately, NOT migrated,
     // for three reasons:
-    //   1. It is a LOGICAL, READ-ONLY operation — `EXPORT DATABASE ... PARQUET`
-    //      is a table scan, and the only preceding step (`ensure_consistent_
-    //      with_db`) reconciles the audit MIRROR FILE, reading (never writing)
-    //      the live DB. It never writes the live file and never touches the
-    //      ART/checkpoint metadata path that is the `duckdb#23046` corruption
-    //      locus (the 17:02 re-tear came from concurrent CHECKPOINT actors,
-    //      not logical read scans).
+    //   1. It is a LOGICAL operation that never writes the LIVE DB FILE —
+    //      `EXPORT DATABASE ... PARQUET` is a table scan, and it never touches
+    //      the ART/checkpoint metadata path that is the `duckdb#23046`
+    //      corruption locus (the 17:02 re-tear came from concurrent CHECKPOINT
+    //      actors, not logical read scans).
+    //
+    //      ADR-0116 D1 — THIS CLAIM USED TO SAY "READ-ONLY", FULL STOP. It is
+    //      read-only with respect to the live DB and that is all it ever was.
+    //      The preceding `ensure_consistent_with_db` step is NOT read-only: it
+    //      can TRIM THE LIVE AUDIT MIRROR IN PLACE (the torn-tail branch
+    //      preserves the original and truncates the file) and MINT EVIDENCE
+    //      ARTEFACTS (`preserve_ahead_mirror` -> the `.ahead-<nanos>.bak` /
+    //      `AHEAD-*` files found on disk). So on the CLI arm this performs
+    //      **audit-mirror recovery surgery**, outside the boot recovery path
+    //      that is supposed to own it, on a best-effort/log-and-continue basis.
+    //
+    //      That is not a write to `audit_ledger` and it is NOT the seq-515 fork
+    //      shape — every branch of `ensure_consistent_with_db` was traced and
+    //      it never tops the DB up from the mirror — but it is not "read-only"
+    //      either, and the comment that said so has been corrected rather than
+    //      left to mislead the next reader. In `aberp serve` the reconcile is
+    //      hoisted onto the shared Handle (ADR-0099 R2, `MirrorReconcile`), so
+    //      the surgery-on-a-timer shape survives only on the separate-process
+    //      CLI arm, where it is the sole opener.
     //   2. It runs at the snapshot daemon's LOW cadence (default 4 h) — the
     //      lowest-frequency opener in the process, versus the ~2 s email-relay
     //      drain that drove the incident.

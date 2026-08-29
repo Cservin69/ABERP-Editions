@@ -134,6 +134,17 @@ fi
 # window means: take a snapshot unless something already did today.
 CMD_ARGS=(snapshot now --tenant "$TENANT" --db "$DB" --if-stale-secs 86400)
 
+# ADR-0116, "One operational addition": `snapshot list --verify` belongs on the
+# floor's schedule, not only in an operator's hands.
+#
+# `restore_into` re-runs `validate_export` and refuses a snapshot that fails —
+# correct, but it means a store whose snapshots have BIT-ROTTED is
+# **unrestorable with no warning until the incident**. `--dry-run` and
+# `list --verify` fix the visibility half; running the verify on this schedule
+# is what fixes the proactive half. It is read-only and cannot write to the
+# store, so it is safe to run unattended beside the snapshot itself.
+VERIFY_ARGS=(snapshot list --tenant "$TENANT" --verify)
+
 if [[ "$VERIFY_RUN" == "1" ]]; then
   echo "Running the EXACT command launchd will run, unattended:"
   echo "  $BIN ${CMD_ARGS[*]}"
@@ -164,19 +175,30 @@ PLIST_BODY=$(cat <<PL
 <plist version="1.0">
 <dict>
   <key>Label</key><string>${LABEL}</string>
+  <!-- Snapshot first, then verify the whole store. The two are joined with a
+       semicolon and NOT with a boolean AND: a snapshot that no-ops under
+       - -if-stale-secs, or one that fails outright, must not suppress the
+       verify. The verify is how a bit-rotted store becomes visible BEFORE the
+       incident rather than during it, and it matters most on exactly the days
+       the snapshot did not run. -->
   <key>ProgramArguments</key>
   <array>
-    <string>${BIN}</string>
-$(printf '    <string>%s</string>\n' "${CMD_ARGS[@]}")
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>${BIN} $(printf '%s ' "${CMD_ARGS[@]}"); ${BIN} $(printf '%s ' "${VERIFY_ARGS[@]}")</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key><integer>${HOUR}</integer>
     <key>Minute</key><integer>${MINUTE}</integer>
   </dict>
-  <!-- Run the missed occurrence when the machine was asleep at 03:00. A
-       laptop that is closed overnight is the common case, and a floor that
-       skips it is a floor that runs on the days it was least needed. -->
+  <!-- RunAtLoad false: installing the agent must not itself take a snapshot.
+       Note what launchd DOES give us for free here, because it is the reason a
+       daily calendar interval is viable on a laptop at all: a
+       StartCalendarInterval occurrence missed because the machine was asleep
+       or powered off is run once when it next wakes. A closed-overnight laptop
+       is the common case, and a floor that simply skipped those days would
+       skip exactly the days it was least able to rely on serve being up. -->
   <key>RunAtLoad</key><false/>
   <key>StandardOutPath</key><string>${LOGDIR}/snapshot-floor.log</string>
   <key>StandardErrorPath</key><string>${LOGDIR}/snapshot-floor.log</string>
@@ -194,6 +216,8 @@ launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "✓ Snapshot floor installed: $LABEL (daily at $(printf '%02d:%02d' "$HOUR" "$MINUTE") local)"
 echo "  command: $BIN ${CMD_ARGS[*]}"
+echo "  then:    $BIN ${VERIFY_ARGS[*]}   (ADR-0116 — a bit-rotted store is otherwise"
+echo "                                     unrestorable with NO warning until the incident)"
 echo "  log:     $LOGDIR/snapshot-floor.log"
 echo
 echo "NEXT: run with --verify-run to confirm it actually works unattended on"
