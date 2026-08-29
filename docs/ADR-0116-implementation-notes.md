@@ -666,6 +666,121 @@ note below — pre-existing, out of scope).
 CHECK 11 classifies **29 removal sites / 3 guarded / 9 frozen**, identical to rev 3:
 rev 4's scanner change is header comment only and moves no verdict.
 
+## Rev 5 — the bare-relative `--db` blind spot and the dead-end refusal
+
+The rev-5 adversarial (`docs/_adversarial-adr-0116-snapshot-rev5.md`, branch @ `c1e5770`)
+returned **FIX-FIRST** on two findings. Both were small, both sat on the 02:00 recovery
+path, and both were introduced by the rev-4 fix round itself.
+
+### Finding 1 — a `--db` with no directory component blinds the detector, and it latches
+
+`Path::new("aberp.duckdb").parent()` is `Some("")`, not `None`. The rev-4 detector filtered
+that empty parent out and returned an empty vector, which `serve.rs` read as *"no interrupted
+restore"*. So `aberp serve --db aberp.duckdb`, typed by an operator standing in the tenant
+home, provisioned a fresh empty company over an intact `.PRE-RESTORE-` unit and printed
+`boot-check: PASSED` — F1's own harm, arriving through F1's fix. `ensure_db_path_isolated`
+does not stop it: it is a deny-list for foreign edition roots, not an allow-list.
+
+**The latch was the serious half.** Once the empty DB existed, `args.db.exists()` was true,
+so the `if !args.db.exists()` branch — the only thing that consults the detector — was never
+entered again. A later boot on the *correct absolute path* was green too, for the life of
+that tenant home. One mistyped `--db` disarmed the guard permanently.
+
+| what changed | where |
+|---|---|
+| `find_pre_restore_units` resolves `--db` before it looks for siblings | `take.rs` `resolve_db_path` / `db_parent_dir` |
+| the preserve step's parent-directory `sync_all`, same idiom, same blind spot | `take.rs` step 2 |
+| an already-latched home is caught on the arm the `!db.exists()` guard cannot reach | `serve.rs` `refuse_a_latched_interrupted_restore` |
+
+`std::path::absolute`, not `canonicalize`: the file this is asked about is **absent** in
+exactly the case that matters, and `canonicalize` fails on a path that does not exist. It
+also never touches the filesystem, so it cannot fail on a permission error at 02:00. On its
+error path the original is returned unchanged — a guard that ADDS a refusal must never be
+the reason a boot fails. Unit paths now come back absolute, so the refusal names something
+pasteable however `--db` was spelt.
+
+**The latch guard reads its counts on the connection boot has already opened** for the
+mirror reconcile. That was deliberate and it is the reason the guard could be added at all:
+`tools/adr0098_c2_frozen_residuals.txt` pins `serve.rs` at **27** sanctioned openers, and a
+new `Connection::open` here would have cost a frozen-manifest bump on a guard whose whole
+job is to be inert. It follows ADR-0116 F4 — an unreadable table is UNKNOWN, never zero, so
+**both** counts must read an explicit `0` before it refuses.
+
+*Stated, not hidden:* the latch arm keys on "the live database is provably empty". A latched
+home that has since been SERVED and has accumulated real rows is no longer empty, and this
+will not refuse it — correctly, because by then a refusal would strand data the operator
+actually created. The way IN is closed at the source; this closes the way OUT for a home that
+has not yet been written to, and for whatever the next spelling hole turns out to be.
+
+### Finding 2 — the F1 refusal named three routes; two cannot run, and the third's partial form boots EMPTY
+
+The adversarial ran all three routes the rev-4 message offered, against a genuine `SIGINT`
+state carrying 40 005 invoices:
+
+| route, as the message spelled it | result |
+|---|---|
+| `aberp recover --db … --tenant …` | **REFUSED** — no `--store`, so it resolved the DEFAULT store |
+| the same, with the correct `--store` | **REFUSED (unsafe)** — the `.audit.log` mirror is inside the unit (rev 2's own fix) |
+| `aberp restore --in-place … --confirm --accept-data-loss` | **ABORTS** — no live database for its mandatory pre-restore snapshot |
+| move the unit's DB back **alone** | boots `ok=true`, **`counts=(0, 0)`** — an EMPTY company, `boot-check: PASSED` |
+| move **all four** files back | boots, **`counts=(40005, 11)`** ✅ |
+
+Only the last recovers anything, and it was the one route the message did not spell out. The
+unit's DB path was the only path printed; the siblings were named generically. An operator
+who moves the file that was *named* gets a database whose every un-checkpointed commit is
+still in the orphaned `.wal` — every `Handle` commit is WAL-only until a checkpoint
+(ADR-0098 R5) — and boot prints PASSED over it.
+
+`crate::snapshot::interrupted_restore_refusal` is now the single source, `recover_hint`'s
+twin for this path. The `mv` pairs come from `aberp_snapshot::pre_restore_move_back`, derived
+from the same three sibling helpers `restore_in_place` WROTE the unit with (`wal_sibling`,
+`mirror_path_for`, `crash_safe::marker_path`), so the recovery instructions cannot drift from
+the unit's shape. Only files that exist are listed: printing an `mv` that fails is how an
+operator learns to distrust the instructions. The two dead-end routes are named **only** to
+rule them out, with the reason. And on the latched arm the message first clears the empty
+database's leftover siblings, because a stale empty `.wal` beside a restored DB is the F4
+hazard the other way up.
+
+Two smaller things fall out of the same change: a **partial** unit no longer claims the
+previous database is *"INTACT at"* a path that is not there (the adversarial's unranked
+note), and the partial move-back **refuses** instead of booting empty — the belt for an
+operator who gets the instruction wrong anyway.
+
+### Rev 5 mutations — each pin RED before its own fix, with controls
+
+Planted one at a time against the fixed tree, each diff-verified and reverted; 5 tests per
+run. `journey_a_clean_first_boot_still_provisions` is the standing control (a guard that
+refuses a genuine first launch is worthless).
+
+| mutation | bare-relative | latched | partial | interrupted (rev 4) | clean first boot |
+|---|---|---|---|---|---|
+| **MU-A** restore the `.filter(\|p\| !p.as_os_str().is_empty())` in `find_pre_restore_units` | **RED** | green | green | green | green |
+| **MU-B** `refuse_a_latched_interrupted_restore` returns `Ok(())` immediately | green | **RED** | **RED** | green | green |
+| **MU-C** revert `interrupted_restore_refusal` to the rev-4 wording | green | **RED** | **RED** | **RED** | green |
+
+The three columns are independent: MU-A reddens only the spelling pin, MU-B only the two
+states the `!db.exists()` guard cannot reach, MU-C only the message pins. The control stays
+green under all three.
+
+**Not pinned, and said so:** the second `sync_all` site has no behavioural pin. An fsync that
+does not happen is not observable from a test on a live filesystem — the same limit the tree
+already records for the D3 durable-ack sites — so it is carried by the shared helper and by
+MU-A on the detector that uses it.
+
+The dead-end pin is *"the only place the string appears is the sentence that rules it out"*,
+not *"the string is absent"*: naming `aberp restore --in-place` and `aberp recover` as things
+that CANNOT run is the fix, so a pin on absence would have forbidden the fix itself.
+
+### Rev 5 — `788ee85` reworded, not squashed
+
+`788ee85` was docs-only (one file, one hunk: the "Rev 4 measured results" table above) but
+carried `08dcc9c`'s subject **verbatim** — the commit that actually contains that fix. The
+adversarial independently reproduced its numbers and confirmed nothing depends on it; the
+subject line was the whole problem. Reworded to `docs(adr): ADR-0116 rev 4 — record the
+measured rev-4 gate run`. Reword rather than squash: the two docs commits record two
+different pieces of evidence (the gate run, and what the mutation runs found), and the
+rewrite is message-only — `git diff` between the old and new tips is empty.
+
 ### Rev 3 note — a test-isolation flake that is NOT ours
 
 `apps/aberp/tests/serve_numbering_route.rs::put_preserves_identity_and_bank_sections`
