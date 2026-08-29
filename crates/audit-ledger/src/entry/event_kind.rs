@@ -4211,7 +4211,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            196,
+            197,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
