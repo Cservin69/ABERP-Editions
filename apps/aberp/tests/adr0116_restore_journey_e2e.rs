@@ -1756,10 +1756,13 @@ fn journey_the_damaged_db_refusal_names_recover_not_an_impossible_flag() {
         "ADR-0116 rev 4 / F2 — the damaged-DB refusal must name `aberp recover`, the only \
          route that works on a database that cannot be snapshotted: {told}"
     );
+    let pasteable = format!("aberp recover --db {db_s} --tenant {TENANT} --store {store_s}");
     assert!(
-        told.contains(db_s) && told.contains(store_s),
-        "the hint must be a pasteable command carrying THIS tenant's --db and --store, not a \
-         bare command name that would rebuild from the default store: {told}"
+        told.contains(&pasteable),
+        "ADR-0116 rev 4 / F2 — the refusal must carry the WHOLE pasteable command \
+         ({pasteable}), not a bare name that would rebuild from the DEFAULT store. Pinning \
+         the paths separately is too loose to survive mutation — other lines of the same \
+         output already print them: {told}"
     );
     assert!(
         !told.contains("Pass --accept-data-loss to proceed anyway"),
@@ -1843,5 +1846,19 @@ fn journey_the_pre_restore_snapshot_abort_names_recover() {
         "ADR-0116 rev 4 / F2 — the refusal an operator reaches after typing --accept-data-loss \
          must name the tool that works. Ending here without it is the dead end: two refusals, \
          neither naming `aberp recover`: {told}"
+    );
+    // …and it must be the PASTEABLE hint, not the prose around it. Asserting
+    // only on the phrase "aberp recover" is satisfied by the sentence that
+    // introduces it, so this pin would stay green with `recover_hint` gutted —
+    // verified by mutating the helper to return a bare string. The whole point
+    // of F2 is that an operator at 02:00 gets a command carrying THIS tenant's
+    // paths, so that is what the test pins.
+    let pasteable = format!("aberp recover --db {db_s} --tenant {TENANT} --store {store_s}");
+    assert!(
+        told.contains(&pasteable),
+        "ADR-0116 rev 4 / F2 — the abort must carry the WHOLE pasteable command \
+         ({pasteable}). Asserting on the paths separately is not enough: the retained \
+         forensic snapshot's own path already contains the store, and the pre-flight already \
+         printed the db — both would satisfy a looser pin with `recover_hint` gutted: {told}"
     );
 }
