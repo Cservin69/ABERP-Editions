@@ -48,6 +48,7 @@ fn serve_args_constructable_with_defaults() {
         db: temp_path("aberp.duckdb"),
         tenant: "default".to_string(),
         port: 0,
+        boot_check: false,
     };
     // Smoke: every field is reachable and the defaults round-trip.
     assert_eq!(args.tenant, "default");

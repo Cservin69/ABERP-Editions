@@ -43,8 +43,16 @@ impl Tmp {
     }
     /// A tenant-home-SHAPED directory, so the ADR-0116 D2 evidence guard's
     /// allow-list inversion applies exactly as it does in production.
+    ///
+    /// The edition segment is taken from the BUILD, not hardcoded: `aberp
+    /// serve`'s ADR-0093 guard (`guard_db_matches_edition`) refuses a `--db`
+    /// outside this edition's own root, so the boot journey below would
+    /// `exit(1)` on a Portable build if this said `.aberp-defense` always.
     fn home(&self) -> PathBuf {
-        let h = self.0.join(".aberp-defense").join("defense");
+        let h = self
+            .0
+            .join(aberp::build_profile::edition_data_dirname())
+            .join(TENANT);
         std::fs::create_dir_all(&h).unwrap();
         h
     }
@@ -550,9 +558,9 @@ fn journey_in_place_restore_replaces_the_hand_swap() {
         r.stdout, r.stderr
     );
     assert!(
-        r.stdout.contains("PRE-RESTORE") && r.stdout.contains(".audit.log mirror would NOT move"),
-        "ADR-0116 D3.4 — the dry-run must state that the DB+WAL+marker move as a unit and that \
-         the mirror does not: {}",
+        r.stdout.contains("PRE-RESTORE") && r.stdout.contains(".audit.log mirror"),
+        "ADR-0116 D3.4 — the dry-run must state that the DB+WAL+marker+mirror move as a unit: \
+         {}",
         r.stdout
     );
     assert_eq!(invoice_count(&db), 5, "the dry-run modified the live DB");
@@ -618,7 +626,12 @@ fn journey_in_place_restore_replaces_the_hand_swap() {
     let preserved_db = t.home().join(
         preserved
             .iter()
-            .find(|n| n.contains("PRE-RESTORE-") && !n.ends_with(".wal") && !n.contains("ckpt-ok"))
+            .find(|n| {
+                n.contains("PRE-RESTORE-")
+                    && !n.ends_with(".wal")
+                    && !n.contains("ckpt-ok")
+                    && !n.ends_with(".audit.log")
+            })
             .expect("the preserved DB itself must exist"),
     );
     assert_eq!(
@@ -627,32 +640,75 @@ fn journey_in_place_restore_replaces_the_hand_swap() {
         "ADR-0116 AC-9 — the preserved unit must open and hold the state that was replaced"
     );
 
-    // ── the mirror stayed, and was only ever APPENDED to ──
+    // ── the mirror moved INTO the unit, and a fresh one replaced it ──────
     //
-    // Byte-identity would be the WRONG assertion here, and getting it wrong is
+    // **This assertion was inverted before rev 2, and the inversion is the
+    // blocker it hid.** The old contract was "the mirror does NOT move — it is
+    // the durable record and stays at the live path". After a backwards
+    // rollback that leaves the discarded audit tail beside the restored
+    // database, the step-7 `SnapshotRestored` row lands at a seq the mirror
+    // already holds with a different entry, and the NEXT `aberp serve` boot
+    // refuses with `MirrorDivergedFromDb`. Nothing in this file walked that
+    // boot, so a green suite meant a product that could not start.
+    //
+    // The discarded tail is not lost: it is preserved inside the
+    // `.PRE-RESTORE-` unit, where the ADR-0116 D2 evidence guard protects it.
+    let preserved_mirror_name = preserved
+        .iter()
+        .find(|n| n.contains("PRE-RESTORE-") && n.ends_with(".audit.log"))
+        .unwrap_or_else(|| {
+            panic!(
+                "ADR-0116 D3.4 rev 2 — the pre-rollback .audit.log mirror must move INTO the \
+                 PRE-RESTORE unit, named so `mirror_path_for(preserved_db)` finds it. Leaving \
+                 it at the live path is what made `aberp serve` refuse to boot after a \
+                 backwards restore. Found: {preserved:?}"
+            )
+        });
+    let preserved_mirror = t.home().join(preserved_mirror_name);
+    assert_eq!(
+        aberp_audit_ledger::mirror_path_for(&preserved_db),
+        preserved_mirror,
+        "the preserved mirror must PAIR with the preserved DB by name — the same rule the \
+         preserved WAL follows"
+    );
+    // Byte-identity would be the WRONG assertion, and getting it wrong is
     // instructive: the mandatory pre-restore snapshot (step 2) legitimately
-    // appends its own `snapshot.created` row and reconciles the mirror. F5
-    // resolves exactly this — D3.5's "do not reconcile the mirror" rule is
-    // scoped to AFTER the install; the pre-restore snapshot runs before
-    // anything is overwritten, on the DB that is about to be replaced.
-    //
-    // So the invariants are: the mirror did not MOVE, and it was only extended
-    // — never truncated, never rewritten.
+    // appends its own `snapshot.created` row and reconciles the mirror BEFORE
+    // the preserve moves it. So the invariant is APPEND-ONLY — the preserved
+    // mirror EXTENDS what was there, it was never truncated or rewritten. The
+    // mirror is half the audit ledger; a rewritten mirror is a forked chain.
+    let preserved_mirror_bytes = std::fs::read(&preserved_mirror).unwrap();
     assert!(
-        mirror.exists(),
-        "ADR-0116 D3.4 step 4 — the .audit.log mirror must NOT move. It is the durable record \
-         and stays at the live path; an implementer moving 'the tenant's DB artefacts' would \
-         naturally take it too."
+        preserved_mirror_bytes.starts_with(&mirror_before),
+        "the preserved mirror must EXTEND the pre-rollback bytes — it is the only surviving \
+         record of the audit tail this rollback discarded, and the preserve MOVES it, never \
+         rewrites it"
     );
     assert!(
-        !preserved.iter().any(|n| n.contains("audit.log")),
-        "ADR-0116 D3.4 step 4 — the mirror was moved into the .PRE-RESTORE- unit: {preserved:?}"
+        preserved_mirror_bytes.len() >= mirror_before.len(),
+        "the preserved mirror was truncated by the restore"
+    );
+    assert!(
+        aberp_snapshot::is_protected_evidence(&preserved_mirror),
+        "ADR-0116 D2 — the preserved mirror is recovery evidence and must be protected from \
+         every future cleanup helper"
+    );
+
+    // …and a FRESH mirror now describes the RESTORED chain.
+    assert!(
+        mirror.exists(),
+        "ADR-0116 D3.4 rev 2 — a fresh .audit.log must be written for the restored chain \
+         inside the same operation. Leaving the live path with no mirror would boot (the boot \
+         path creates one), but it would leave a window with a database and no durable record \
+         of its chain."
     );
     let mirror_after = std::fs::read(&mirror).unwrap();
     assert!(
-        mirror_after.starts_with(&mirror_before),
-        "ADR-0116 — the audit mirror is APPEND-ONLY and was rewritten or truncated by the \
-         restore. The mirror is half the audit ledger; a rewritten mirror is a forked chain."
+        mirror_after.len() < preserved_mirror_bytes.len(),
+        "the fresh mirror must describe the RESTORED (shorter) chain, not carry the discarded \
+         tail: fresh={} bytes, preserved={} bytes",
+        mirror_after.len(),
+        preserved_mirror_bytes.len()
     );
 
     // ── D3.5/F8 — the restore event landed on the RESTORED chain ────────
@@ -686,13 +742,18 @@ fn journey_in_place_restore_replaces_the_hand_swap() {
             .verify_chain()
             .expect("ADR-0116 D3.5 — the restored chain must still verify with the restore row");
     }
-    // The mirror must NOT have received that row: no reconcile happens after
-    // the install, by design. If the mirror disagrees with the restored DB,
-    // that is recover_or_refuse's decision at the next boot.
+    // The fresh mirror was written BEFORE the step-7 `SnapshotRestored`
+    // append, so it does not carry that row — the DB is one entry ahead of the
+    // mirror, which is the `RecoveryAction::Extended` case the boot path
+    // resolves without a murmur. (`Ledger::append` commits without syncing the
+    // mirror; that is the pre-existing D-22 shape, not something this restore
+    // introduces.) What matters is that the mirror AGREES with the restored
+    // chain over their shared prefix, which the boot journey below proves.
     assert!(
         !String::from_utf8_lossy(&mirror_after).contains("snapshot.restored"),
-        "ADR-0116 D3.5 — the mirror was reconciled AFTER the install. The restore must leave \
-         any mirror/DB disagreement for the next boot's recover_or_refuse to own."
+        "ADR-0116 D3.5 — the fresh mirror is written from the restored chain BEFORE the \
+         restore row is appended; a mirror carrying it would mean a reconcile ran after the \
+         install."
     );
 
     // ── the evidence guard protects what was just created ──
@@ -703,6 +764,602 @@ fn journey_in_place_restore_replaces_the_hand_swap() {
              from every future cleanup helper: {n}"
         );
     }
+}
+
+/// **THE BLOCKER GATE — ADR-0116 D3.4 rev 2.**
+///
+/// A backwards in-place restore must produce a database `aberp serve` can
+/// BOOT. This is the step the rest of this file stopped short of, and the step
+/// an operator cannot skip: they roll back at 02:00 and then start the
+/// product.
+///
+/// Before rev 2 the journey below failed at the last assertion. `restore
+/// --in-place --accept-data-loss` rolled the live database back exactly as
+/// designed and left the `.audit.log` mirror at the live path holding the
+/// discarded tail; the step-7 `SnapshotRestored` row then landed at a seq the
+/// mirror already held with a different entry;
+/// `ensure_consistent_with_db` reported `MirrorDivergedFromDb`;
+/// `serve.rs::boot_mirror_route` classified that `RefuseFatal`; and **`aberp
+/// serve` did not start**. The only way out was the hand-reconciliation D3.4
+/// exists to eliminate — and nothing in the command's output said so.
+///
+/// The journey is walked twice over, deliberately:
+///
+///   1. through the shipped binary (`aberp serve --boot-check`), which runs
+///      the real `serve::run` boot up to and including the mirror reconcile
+///      and its routing decision, and
+///   2. directly against `ensure_consistent_with_db` — the exact call
+///      `serve.rs` makes at every boot — so the assertion does not rest on one
+///      flag's wiring being right.
+#[test]
+fn journey_backwards_in_place_restore_leaves_a_database_serve_can_boot() {
+    let t = Tmp::new("boot-after-rollback");
+    let db = t.db();
+    let store = t.store();
+    let (db_s, store_s) = (db.to_str().unwrap(), store.to_str().unwrap());
+
+    // ── the rollback point ──────────────────────────────────────────────
+    seed(&db, 2, 3);
+    assert!(
+        aberp(
+            &t,
+            &["snapshot", "now", "--db", db_s, "--tenant", TENANT, "--store", store_s]
+        )
+        .ok,
+        "fixture: the snapshot must succeed"
+    );
+
+    // ── the live DB moves AHEAD of it — this is what makes the restore
+    //    BACKWARDS, and it is the only case --accept-data-loss exists for ──
+    seed(&db, 4, 7);
+    let audit_before = audit_count(&db);
+    assert!(
+        audit_before > 3,
+        "fixture: the live chain must be ahead of the snapshot ({audit_before} rows)"
+    );
+
+    // A boot BEFORE the restore must be clean, so a failure after it cannot be
+    // blamed on the fixture.
+    let r = aberp(
+        &t,
+        &["serve", "--db", db_s, "--tenant", TENANT, "--boot-check"],
+    );
+    assert!(
+        r.ok,
+        "fixture: `aberp serve --boot-check` must pass BEFORE the restore.\nstdout: {}\nstderr: {}",
+        r.stdout, r.stderr
+    );
+
+    let r = aberp(
+        &t,
+        &[
+            "snapshot", "list", "--tenant", TENANT, "--store", store_s, "--json",
+        ],
+    );
+    let listed: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    let id = listed["snapshots"][0]["id"].as_str().unwrap().to_string();
+
+    // ── the acknowledged backwards rollback ─────────────────────────────
+    let r = aberp(
+        &t,
+        &[
+            "restore",
+            "--in-place",
+            "--tenant",
+            TENANT,
+            "--snapshot",
+            &id,
+            "--db",
+            db_s,
+            "--store",
+            store_s,
+            "--confirm",
+            "--accept-data-loss",
+        ],
+    );
+    assert!(
+        r.ok,
+        "the backwards in-place restore failed.\nstdout: {}\nstderr: {}",
+        r.stdout, r.stderr
+    );
+    assert_eq!(
+        invoice_count(&db),
+        2,
+        "the rollback must actually roll back — otherwise the boot below proves nothing"
+    );
+
+    // ADR-0116 D3.3 — the discarded count is on STDOUT, not only in a log
+    // line. The durable record of "I threw away N committed audit entries"
+    // must not be shell history.
+    assert!(
+        r.stdout.contains("discarded") && r.stdout.contains("committed audit entries DISCARDED"),
+        "ADR-0116 D3.3 — the completion message must name how many committed audit entries \
+         this restore threw away: {}",
+        r.stdout
+    );
+    // …and the D3.3 acknowledgement WARN still fires. It is what makes
+    // `--accept-data-loss` a decision rather than a switch, and it is the
+    // condition Ervin attached to keeping the flag.
+    assert!(
+        r.stderr.contains("--accept-data-loss was passed")
+            && r.stderr.contains("DISCARD committed audit entries"),
+        "ADR-0116 D3.3 — passing --accept-data-loss must emit the loud acknowledgement \
+         warning naming the live head, the snapshot's count and the difference: {}",
+        r.stderr
+    );
+
+    // ══ THE GATE ══════════════════════════════════════════════════════════
+    //
+    // (1) through the shipped binary.
+    let r = aberp(
+        &t,
+        &["serve", "--db", db_s, "--tenant", TENANT, "--boot-check"],
+    );
+    assert!(
+        r.ok,
+        "ADR-0116 D3.4 — **`aberp serve` cannot boot after a backwards in-place restore.** A \
+         restore that produces a database the server refuses to start on is a total failure of \
+         the feature: the operator is left with the product down and the hand-reconciliation \
+         this command exists to eliminate.\nstdout: {}\nstderr: {}",
+        r.stdout, r.stderr
+    );
+    assert!(
+        r.stdout.contains("boot-check: PASSED"),
+        "the boot-check must state its verdict plainly: {}",
+        r.stdout
+    );
+
+    // (2) directly against the call `serve.rs` makes at boot, so the gate does
+    //     not rest on one flag's wiring.
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .unwrap();
+        aberp_audit_ledger::ensure_schema(&conn).unwrap();
+        let action = aberp_audit_ledger::ensure_consistent_with_db(
+            &conn,
+            &aberp_audit_ledger::mirror_path_for(&db),
+        )
+        .expect(
+            "ADR-0116 D3.4 — the boot mirror reconcile must SUCCEED after a backwards restore. \
+             A MirrorDivergedFromDb here is routed to RefuseFatal and boot stops.",
+        );
+        // Extended (the mirror was written before the restore row) or
+        // Unchanged are both healthy; a divergence is an `Err` and would have
+        // panicked above.
+        assert!(
+            matches!(
+                action,
+                aberp_audit_ledger::RecoveryAction::Extended { .. }
+                    | aberp_audit_ledger::RecoveryAction::Unchanged
+                    | aberp_audit_ledger::RecoveryAction::Created { .. }
+            ),
+            "unexpected boot reconcile action after a backwards restore: {action:?}"
+        );
+    }
+
+    // ── and the restored chain still verifies FROM GENESIS ──────────────
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .unwrap();
+        let ledger = aberp_audit_ledger::Ledger::from_connection(
+            conn,
+            TenantId::new(TENANT.to_string()).unwrap(),
+            BinaryHash::from_bytes([0u8; 32]),
+        );
+        let len = ledger
+            .verify_chain()
+            .expect("the restored chain must verify from genesis after the rollback");
+        assert!(len >= 4, "the restored chain is implausibly short: {len}");
+    }
+
+    // ── the rollback SURVIVED the boot ──────────────────────────────────
+    //
+    // The other half of the fork the review found: if the restored chain is a
+    // clean PREFIX of a mirror left at the live path, boot routes to
+    // AutoRecover instead, rebuilds from the mandatory pre-restore snapshot —
+    // which is by construction the state the operator rolled back FROM — and
+    // silently UNDOES the rollback while filing the restored database away as
+    // `.CORRUPT-`. Refusing to boot and silently reverting were the only two
+    // outcomes available; neither is the contract.
+    assert_eq!(
+        invoice_count(&db),
+        2,
+        "ADR-0116 D3.4 — the boot UNDID the rollback. A restore the next boot reverts is not a \
+         restore."
+    );
+    assert!(
+        !std::fs::read_dir(t.home())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains("CORRUPT")),
+        "ADR-0116 D3.4 — the boot filed the deliberately-restored database away as CORRUPT \
+         evidence and rebuilt over it"
+    );
+
+    // ── D4 / the drift condition — the restored chain carries the anchor
+    //    verdict it was restored UNDER ─────────────────────────────────────
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .unwrap();
+        let raw: Vec<u8> = conn
+            .query_row(
+                "SELECT payload FROM audit_ledger WHERE kind = 'snapshot.restored' ORDER BY \
+                 seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the restore row must be on the restored chain");
+        let payload = String::from_utf8_lossy(&raw).into_owned();
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(
+            v["anchor_verdict"].is_string(),
+            "ADR-0116 D4 — the SnapshotRestored payload must record the anchor verdict, so the \
+             restored database itself carries what coverage it was restored under. Today that \
+             fact lives only in a stderr warning nobody keeps, and it is the fact a court \
+             would ask about. Payload: {payload}"
+        );
+        assert_eq!(
+            v["anchor_verdict"], "no-anchors-at-all",
+            "this fixture has no anchors at all; the verdict must say so, and must never say \
+             'not-recorded' (checked-and-none is not the same statement as never-checked)"
+        );
+        assert!(
+            v["discarded_audit_rows"].as_u64().unwrap_or(0) > 0,
+            "ADR-0116 D3.3 — the restored chain must record how much committed audit history \
+             this restore discarded: {payload}"
+        );
+    }
+}
+
+/// **F4 — an unreadable live audit table must report UNKNOWN and REFUSE, never
+/// print `EXACT … 0`.**
+///
+/// `ensure_serve_is_stopped` recorded `-1` for "could not read"
+/// (`unwrap_or(-1)`) and `build_preflight` coerced it with `.max(0) as u64`, so
+/// `-1` became a confident **zero** in the refusal arithmetic:
+///
+/// ```text
+///   live delta  EXACT (serve is stopped): the live DB holds 0 audit entries
+///               and -1 invoices; this snapshot carries 5 / 3
+///               → nothing newer than the snapshot would be lost
+///   VERDICT: would PROCEED.
+/// ```
+///
+/// The `-1` leaked visibly for invoices while being silently swallowed for the
+/// audit count — the one number the gate keys on. That is the same sentinel
+/// mistake the ADR is careful to avoid for `anchor_count` (*"`-1` means not
+/// recorded, NEVER zero"*), made in the place where it DISARMS the safety, and
+/// in exactly the scenario a restore exists for: a database whose tables
+/// cannot be read.
+///
+/// The mirror must not paper over it either. The mirror is a LOWER bound, so
+/// falling back to it here would report "nothing newer" about a database whose
+/// rows cannot be counted at all.
+#[test]
+fn journey_an_unreadable_live_audit_table_is_unknown_and_refuses() {
+    let t = Tmp::new("f4-unknown");
+    let db = t.db();
+    let store = t.store();
+    let (db_s, store_s) = (db.to_str().unwrap(), store.to_str().unwrap());
+
+    seed(&db, 3, 5);
+    assert!(
+        aberp(
+            &t,
+            &["snapshot", "now", "--db", db_s, "--tenant", TENANT, "--store", store_s]
+        )
+        .ok,
+        "fixture: the snapshot must succeed"
+    );
+    // The mirror is left in place holding 6 entries, deliberately: its LOWER
+    // bound must not be used to answer a question it cannot answer.
+    assert!(aberp_audit_ledger::mirror_path_for(&db).exists());
+
+    // Now make the live audit table unreadable while the file still opens
+    // exclusively — the shape a partially-corrupt database takes.
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .unwrap();
+        conn.execute_batch("DROP TABLE audit_ledger;").unwrap();
+    }
+
+    let r = aberp(
+        &t,
+        &[
+            "restore",
+            "--in-place",
+            "--tenant",
+            TENANT,
+            "--snapshot",
+            "1",
+            "--db",
+            db_s,
+            "--store",
+            store_s,
+            "--dry-run",
+        ],
+    );
+    assert!(
+        r.stdout.contains("live delta       UNKNOWN"),
+        "ADR-0116 F4 — the pre-flight must report UNKNOWN when the live audit table cannot be \
+         read. Printing `EXACT … 0` is how the data-loss gate disarmed itself in the one \
+         scenario a restore is for.\nstdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(
+        !r.stdout
+            .contains("nothing newer than the snapshot would be lost"),
+        "ADR-0116 F4 — the pre-flight claimed nothing would be lost about a database whose \
+         rows it could not count: {}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("VERDICT: would REFUSE"),
+        "ADR-0116 F4/D3.3 — an UNKNOWN delta must REFUSE without --accept-data-loss: {}",
+        r.stdout
+    );
+
+    // …and the real command refuses too, not just the dry-run.
+    let r = aberp(
+        &t,
+        &[
+            "restore",
+            "--in-place",
+            "--tenant",
+            TENANT,
+            "--snapshot",
+            "1",
+            "--db",
+            db_s,
+            "--store",
+            store_s,
+            "--confirm",
+        ],
+    );
+    assert!(
+        !r.ok,
+        "ADR-0116 F4 — the restore PROCEEDED with an unmeasurable data loss.\nstdout: {}",
+        r.stdout
+    );
+    assert!(
+        r.stderr.contains("UNKNOWN") || r.stdout.contains("UNKNOWN"),
+        "the refusal must say WHY: {}\n{}",
+        r.stdout,
+        r.stderr
+    );
+}
+
+/// **F5 — the data-loss gate must compare against the LIVE re-validation, not
+/// the recorded `meta.audit_count`.**
+///
+/// `build_preflight` re-runs validation live and says why: *"never trust the
+/// recorded verdict for a decision this destructive."* Two lines later the
+/// comparison used `record.meta.audit_count` — the recorded number — while
+/// `pf.live.audit_count` was sitting right there.
+///
+/// `meta.json` is a plain file beside the export with no integrity binding to
+/// it. Inflating its `audit_count` (export bytes untouched, so the live
+/// re-validation still reports the true count) let an UNACKNOWLEDGED rollback
+/// proceed and discard committed audit rows.
+#[test]
+fn journey_a_tampered_meta_json_cannot_disarm_the_data_loss_gate() {
+    let t = Tmp::new("f5-tampered");
+    let db = t.db();
+    let store = t.store();
+    let (db_s, store_s) = (db.to_str().unwrap(), store.to_str().unwrap());
+
+    seed(&db, 2, 3);
+    assert!(
+        aberp(
+            &t,
+            &["snapshot", "now", "--db", db_s, "--tenant", TENANT, "--store", store_s]
+        )
+        .ok,
+        "fixture: the snapshot must succeed"
+    );
+    // Move the live DB AHEAD of the snapshot, so a restore is backwards and the
+    // D3.3 gate is the only thing standing between the operator and the loss.
+    seed(&db, 0, 7);
+    let live_audit = audit_count(&db);
+    assert!(live_audit > 4, "fixture: the live chain must be ahead");
+
+    // Baseline: the gate refuses, naming the flag.
+    let r = aberp(
+        &t,
+        &[
+            "restore",
+            "--in-place",
+            "--tenant",
+            TENANT,
+            "--snapshot",
+            "1",
+            "--db",
+            db_s,
+            "--store",
+            store_s,
+            "--confirm",
+        ],
+    );
+    assert!(!r.ok, "fixture: the unacknowledged rollback must refuse");
+    assert!(
+        r.stderr.contains("--accept-data-loss"),
+        "fixture: the refusal must name the flag: {}",
+        r.stderr
+    );
+
+    // Inflate the RECORDED count. The export bytes are untouched, so the live
+    // re-validation still sees the true 3 — the two numbers now disagree, and
+    // which one the gate reads is the whole finding.
+    let snap_dir = std::fs::read_dir(&store)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("the snapshot directory must exist");
+    let meta_path = snap_dir.join("meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    meta["audit_count"] = serde_json::json!(999_999i64);
+    std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+    let r = aberp(
+        &t,
+        &[
+            "restore",
+            "--in-place",
+            "--tenant",
+            TENANT,
+            "--snapshot",
+            "1",
+            "--db",
+            db_s,
+            "--store",
+            store_s,
+            "--confirm",
+        ],
+    );
+    assert!(
+        !r.ok,
+        "ADR-0116 F5 — a tampered/stale `meta.json` disarmed the data-loss gate and an \
+         UNACKNOWLEDGED rollback discarded {} committed audit rows. `meta.json` is evidence, \
+         not authority: the gate must key on the LIVE re-validation it already runs.\nstdout: \
+         {}\nstderr: {}",
+        live_audit - 3,
+        r.stdout,
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("--accept-data-loss"),
+        "the refusal must still name the acknowledgement flag: {}",
+        r.stderr
+    );
+    assert_eq!(
+        audit_count(&db),
+        live_audit,
+        "ADR-0116 F5 — the live database was rolled back by a restore that should have refused"
+    );
+}
+
+/// **F5's class, in the ADR-0116 D4 anchor sanction** — found while applying
+/// Ervin's KEEP ruling on drift (b), not named by the review.
+///
+/// The Defense sanction read `meta.anchor_count` / `meta.anchored_through_seq`
+/// off `meta.json`, which is a plain file beside the export with no integrity
+/// binding to it. That is F5's exact shape one function over: the recorded
+/// number is EVIDENCE, not authority.
+///
+/// The verdict now comes from the LIVE re-validation, and the pre-flight prints
+/// BOTH when they disagree — because a disagreement between what a snapshot
+/// records about itself and what its bytes actually say is a finding in its own
+/// right, not a detail to reconcile silently.
+#[test]
+fn journey_the_anchor_verdict_comes_from_the_live_revalidation_not_meta_json() {
+    let t = Tmp::new("d4-live-anchors");
+    let db = t.db();
+    let store = t.store();
+    let (db_s, store_s) = (db.to_str().unwrap(), store.to_str().unwrap());
+
+    seed(&db, 2, 3);
+    assert!(
+        aberp(
+            &t,
+            &["snapshot", "now", "--db", db_s, "--tenant", TENANT, "--store", store_s]
+        )
+        .ok,
+        "fixture: the snapshot must succeed"
+    );
+
+    // Claim, in `meta.json` only, that this snapshot is fully anchored. The
+    // export bytes are untouched, so the live re-validation still finds the
+    // true zero anchors.
+    let snap_dir = std::fs::read_dir(&store)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("the snapshot directory must exist");
+    let meta_path = snap_dir.join("meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    meta["anchor_count"] = serde_json::json!(42i64);
+    meta["anchored_through_seq"] = serde_json::json!(9_999u64);
+    std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+    let r = aberp(
+        &t,
+        &[
+            "restore",
+            "--in-place",
+            "--tenant",
+            TENANT,
+            "--snapshot",
+            "1",
+            "--db",
+            db_s,
+            "--store",
+            store_s,
+            "--dry-run",
+        ],
+    );
+    assert!(
+        r.stdout.contains("they DISAGREE"),
+        "ADR-0116 D4 — the pre-flight must show the LIVE coverage and say so when `meta.json` \
+         records something else. A snapshot that misdescribes itself is a finding, not a \
+         detail to reconcile silently.\nstdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(
+        r.stdout.contains("0 rows, NONE verified"),
+        "the LIVE coverage (zero anchors) must be what is shown and what gates: {}",
+        r.stdout
+    );
+
+    // …and the row on the restored chain records the LIVE verdict, so the
+    // database cannot end up claiming a coverage its own bytes never had.
+    let r = aberp(
+        &t,
+        &[
+            "restore",
+            "--in-place",
+            "--tenant",
+            TENANT,
+            "--snapshot",
+            "1",
+            "--db",
+            db_s,
+            "--store",
+            store_s,
+            "--confirm",
+            // The `snapshot now` above appended its own `snapshot.created`
+            // row, so the live chain is one entry ahead of the snapshot and
+            // the D3.3 gate correctly demands the acknowledgement.
+            "--accept-data-loss",
+        ],
+    );
+    assert!(r.ok, "the restore must proceed: {}\n{}", r.stdout, r.stderr);
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .unwrap();
+    let raw: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM audit_ledger WHERE kind = 'snapshot.restored' ORDER BY seq \
+             DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(
+        v["anchor_verdict"], "no-anchors-at-all",
+        "ADR-0116 D4 — the restored chain recorded a coverage claim taken from `meta.json`. \
+         That is the fact a court would read, and it must come from the bytes: {v}"
+    );
 }
 
 /// **ADR-0116 D2** — `aberp evidence list` makes the previously-invisible

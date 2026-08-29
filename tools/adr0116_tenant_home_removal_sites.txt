@@ -29,10 +29,11 @@
 #
 # ## Every site below is legitimate, and here is the specific reason
 #
-# All seven remove artefacts that are on the guard's own LIVE allow-list, so
-# routing them through `guarded_remove` would change nothing but noise. They
-# are frozen rather than migrated because they are the durability primitives
-# themselves, and each is pinned by its own tests.
+# Seven of the nine remove artefacts that are on the guard's own LIVE
+# allow-list, so routing them through `guarded_remove` would change nothing but
+# noise. They are frozen rather than migrated because they are the durability
+# primitives themselves, and each is pinned by its own tests. The two added by
+# the F8 fix are named separately below.
 #
 #   crash_safe.rs:atomic_install          — drops the staged file's WAL and the
 #                                           target's stale WAL around the
@@ -51,10 +52,44 @@
 #   take.rs:take_snapshot_with            — clears a crashed `*.partial` export
 #                                           directory in the snapshot store.
 #
+# ## The two sites the F8 fix made VISIBLE (they were never absent, only
+# ## unclassified)
+#
+# The scanner used to decide "does this fn reach a tenant home?" purely from
+# tokens in the fn body. `evidence.rs::archive_then_remove` — the sanctioned
+# release path, the ONE function in the tree whose job is unlinking recovery
+# evidence from a live tenant home — carries none of them: it works through
+# `artefact.path` and `dest`. So it was classified OTHER, sat OUTSIDE this
+# may-only-shrink freeze, and a later change that weakened it (or a new removal
+# added inside it) would have kept CHECK 11 green. `crash_safe::cleanup_stale`
+# was invisible for the same reason.
+#
+# Three files are now tenant-home-reaching BY FILE (evidence.rs, recover.rs,
+# crash_safe.rs) rather than by hoping a fn names the right local, which is
+# what surfaced both.
+#
+#   evidence.rs:archive_then_remove       — ADR-0116 D2's sanctioned release
+#                                           path. It unlinks evidence from a
+#                                           live tenant home DELIBERATELY, and
+#                                           only after copying it, re-reading
+#                                           the copy from disk, SHA-comparing
+#                                           it and fsync-ing it; credential
+#                                           material and directories are
+#                                           refused outright. Routing it
+#                                           through `guarded_remove` would make
+#                                           it refuse its own charter. Frozen
+#                                           here so a WEAKENING is visible.
+#   crash_safe.rs:cleanup_stale           — removes its own `.creating-*`
+#                                           staging file/WAL and export dir on
+#                                           an aborted durable checkpoint. Live
+#                                           transients, allow-listed by name.
+#
 crates/aberp-snapshot/src/crash_safe.rs:atomic_install
+crates/aberp-snapshot/src/crash_safe.rs:cleanup_stale
 crates/aberp-snapshot/src/crash_safe.rs:clear_install_intent
 crates/aberp-snapshot/src/crash_safe.rs:durable_checkpoint
 crates/aberp-snapshot/src/crash_safe.rs:resume_pending_install
+crates/aberp-snapshot/src/evidence.rs:archive_then_remove
 crates/aberp-snapshot/src/recover.rs:cleanup_temp
 crates/aberp-snapshot/src/take.rs:restore_into
 crates/aberp-snapshot/src/take.rs:take_snapshot_with

@@ -723,6 +723,46 @@ c="$(fresh)"
 perl -0pi -e 's/crate::evidence::is_protected_evidence\(&rec\.dir\)/false/' "$c/crates/aberp-snapshot/src/retention.rs"
 expect_fail "$c" "retention::prune does not CONSULT is_protected_evidence" "CHECK 11 — a pruner that no longer consults the guard is RED (its blindness must be a deliberate refusal, not an accident). NOTE the signature is the SCANNER-verdict wording: the first cut of CHECK 11 asserted this with a bare grep, which its own DOC COMMENT satisfied, and this probe ESCAPED"
 
+echo "[CHECK 11] F7/M1 — the guard left in place but SHORT-CIRCUITED DEAD. This mutation passed the WHOLE gate before rev 2"
+c="$(fresh)"
+perl -0pi -e 's/if crate::evidence::is_protected_evidence\(&rec\.dir\)/if false && crate::evidence::is_protected_evidence(&rec.dir)/' "$c/crates/aberp-snapshot/src/retention.rs"
+expect_fail "$c" "guard is PRESENT but DEAD" "CHECK 11 — a guard neutered with \`false &&\` is RED. The previous cut asserted the SCANNER's verdict rather than a bare grep, which closed the flip-by-editing-a-COMMENT escape — but the verdict was still token PRESENCE in the fn body, so the guard could still be flipped by editing an OPERATOR. That is the ADR-0098 opener-scan char-literal class one level in"
+
+echo "[CHECK 11] F7/M1 variant — the same mutation as rustfmt would split it across lines"
+c="$(fresh)"
+perl -0pi -e 's/if crate::evidence::is_protected_evidence\(&rec\.dir\) \{/if false\n            && crate::evidence::is_protected_evidence(&rec.dir)\n        {/' "$c/crates/aberp-snapshot/src/retention.rs"
+expect_fail "$c" "guard is PRESENT but DEAD" "CHECK 11 — a short-circuited guard is caught whether or not it fits on one line (the scanner evaluates a STATEMENT, not a line)"
+
+echo "[CHECK 11] F7 — the guard called for its side effects only: \`let _ = is_protected_evidence(..)\`"
+c="$(fresh)"
+perl -0pi -e 's/if crate::evidence::is_protected_evidence\(&rec\.dir\) \{/let _ = crate::evidence::is_protected_evidence(&rec.dir);\n        if false {/' "$c/crates/aberp-snapshot/src/retention.rs"
+expect_fail "$c" "guard is PRESENT but DEAD" "CHECK 11 — a guard whose ANSWER is discarded is RED"
+
+echo "[CHECK 11] F8/M5 — an unguarded tenant-home sweeper spelled through a DIRECT IMPORT (\`use std::fs::remove_file;\`). Nothing in-tree uses this spelling, which is exactly why it must be pinned"
+c="$(fresh)"
+printf 'use std::fs::remove_file;\n\npub fn _adr0116_probe_bare_spelling(tenant_home: &std::path::Path) {\n    for entry in std::fs::read_dir(tenant_home).unwrap().flatten() {\n        let _ = remove_file(entry.path());\n    }\n}\n' > "$c/crates/aberp-snapshot/src/zz_adr0116_probe_bare.rs"
+expect_fail "$c" "NEW UNGUARDED tenant-home removal appeared" "CHECK 11 — the removal matcher is not keyed to ONE spelling. A gate that bans a single spelling is the class already on record here from PR #41"
+
+echo "[CHECK 11] F8 — dropping \`archive_then_remove\` out of the frozen set must be RED (it is the one fn whose JOB is unlinking evidence, and the token-based classifier called it OTHER)"
+c="$(fresh)"
+perl -0pi -e 's{^crates/aberp-snapshot/src/evidence\.rs:archive_then_remove\n}{}m' "$c/tools/adr0116_tenant_home_removal_sites.txt"
+expect_fail "$c" "NEW UNGUARDED tenant-home removal appeared" "CHECK 11 — the sanctioned evidence-release path is INSIDE the may-only-shrink freeze, so a change that weakens it is visible"
+
+echo "[CHECK 11] HARNESS — DEAD_GUARD must not fire on the PREDICATE rule applied to the guarded ACTION (a gate that reddens correct code gets switched off)"
+c="$(fresh)"
+perl -0pi -e 's/npd = split\("is_protected_evidence", PRED, "\|"\)/npd = split("is_protected_evidence|guarded_remove", PRED, "|")/' "$c/tools/adr0116_evidence_removal_scan.awk"
+expect_fail "$c" "must apply to the PREDICATE" "CHECK 11 — widening the discarded-result rule to \`guarded_remove\` is RED. \`let _ = guarded_remove(..)\` is idiomatic and safe (recover::cleanup_siblings_with_infix spells it that way); only the PREDICATE's discarded answer neuters a guard"
+
+echo "[CHECK 11] HARNESS — a scanner that stops detecting a DEAD guard must be RED, not a silent green"
+c="$(fresh)"
+perl -0pi -e 's/if \(st ~ \/\(\^\|\[\^A-Za-z_0-9\]\)false\[ \\t\]\*&&\/\) return 1/return 0/' "$c/tools/adr0116_evidence_removal_scan.awk"
+expect_fail "$c" "no longer detects a SHORT-CIRCUITED guard" "CHECK 11 — the DEAD_GUARD matcher has its own liveness fixture, so it cannot quietly stop matching (the 10P-0 pattern)"
+
+echo "[CHECK 11] HARNESS — a scanner that stops seeing the bare removal spelling must be RED"
+c="$(fresh)"
+perl -0pi -e 's/\[\^A-Za-z_0-9\.\]\)remove_/])fs_NEVER_MATCHES_remove_/' "$c/tools/adr0116_evidence_removal_scan.awk"
+expect_fail "$c" "no longer sees a removal spelled through a direct import" "CHECK 11 — the widened removal matcher has its own liveness fixture"
+
 echo "[CHECK 11] HARNESS — a scanner that stops recognising the guard must be RED (liveness), not a silent green"
 c="$(fresh)"
 perl -0pi -e 's/ng  = split\("is_protected_evidence\|guarded_remove", GUARD, "\|"\)/ng = 0/' "$c/tools/adr0116_evidence_removal_scan.awk"

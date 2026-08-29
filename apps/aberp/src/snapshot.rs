@@ -775,11 +775,24 @@ pub fn restore_and_emit(
     restore_into(&rec.dir, target, tenant.as_str())
         .map_err(|e| anyhow::anyhow!("restore snapshot '{selector}': {e}"))?;
 
+    // ADR-0116 D4 — the anchor coverage recorded on the row comes from a LIVE
+    // re-validation of the export, never from `meta.json`. One extra in-memory
+    // IMPORT on a rare, operator-paced command, for a number that goes into an
+    // audit row a court may read. See `anchor_verdict_of`.
+    let live = validate_export(&rec.dir, tenant.as_str());
     let payload = SnapshotRestoredPayload {
         seq: rec.meta.seq,
         snapshot_dir: rec.dir.display().to_string(),
         target: target.display().to_string(),
         restored_at: rfc3339(OffsetDateTime::now_utc()),
+        // ADR-0116 D4 — recorded on the SIDE-PATH restore too. The legal
+        // claim is made wherever a restored database is produced, and this
+        // command produces one; the difference is only which ledger the row
+        // lands on (here, the live one — the restored file is a side path).
+        anchor_verdict: anchor_verdict_slug(anchor_verdict_live(&live)).to_string(),
+        anchor_coverage: describe_anchors_live(&live),
+        // The side path never touches the live DB, so nothing is discarded.
+        discarded_audit_rows: Some(0),
     };
     // The audit row records the restore against the live DB's ledger (NOT
     // the freshly-restored side-DB), so the operator's main timeline shows
@@ -937,14 +950,45 @@ enum AnchorVerdict {
     FullCoverage,
 }
 
-fn anchor_verdict_for(meta: &aberp_snapshot::SnapshotMeta) -> AnchorVerdict {
-    match (meta.anchor_count, meta.anchored_through_seq) {
+/// ADR-0116 D4 — the stable slug recorded in the `SnapshotRestored` payload,
+/// so the restored chain itself carries the coverage it was restored under.
+fn anchor_verdict_slug(v: AnchorVerdict) -> &'static str {
+    match v {
+        AnchorVerdict::NotRecorded => "not-recorded",
+        AnchorVerdict::NoAnchorsAtAll => "no-anchors-at-all",
+        AnchorVerdict::ShortCoverage => "short-coverage",
+        AnchorVerdict::FullCoverage => "full-coverage",
+    }
+}
+
+/// The verdict, over whichever set of coverage numbers the caller trusts.
+///
+/// **ADR-0116 F5, same class, adjacent code.** F5 was "the data-loss gate keys
+/// on the RECORDED `meta.audit_count` two lines after saying never to trust the
+/// recorded verdict". The anchor sanction had the identical shape: it read
+/// `meta.anchor_count`, and `meta.json` is a plain file beside the export with
+/// no integrity binding to it. Editing `anchor_count` to `0` there downgrades a
+/// Defense `ShortCoverage` REFUSAL to a warning — a one-line bypass of the
+/// sanction, in a file an operator can write. The callers below therefore pass
+/// the LIVE re-validation's numbers, which are derived from the export bytes.
+fn anchor_verdict_of(
+    anchor_count: i64,
+    anchored_through: Option<u64>,
+    chain_len: u64,
+) -> AnchorVerdict {
+    match (anchor_count, anchored_through) {
         (c, _) if c < 0 => AnchorVerdict::NotRecorded,
         (_, None) => AnchorVerdict::NotRecorded,
         (0, _) => AnchorVerdict::NoAnchorsAtAll,
-        (_, Some(through)) if through < meta.chain_len => AnchorVerdict::ShortCoverage,
+        (_, Some(through)) if through < chain_len => AnchorVerdict::ShortCoverage,
         _ => AnchorVerdict::FullCoverage,
     }
+}
+
+/// The verdict from a LIVE [`validate_export`] re-run — the form every gating
+/// and recording caller uses.
+fn anchor_verdict_live(live: &aberp_snapshot::ValidationReport) -> AnchorVerdict {
+    anchor_verdict_of(live.anchor_count, live.anchored_through_seq, live.chain_len)
 }
 
 /// ADR-0116 D4 — render anchor coverage without ever printing `0` for
@@ -952,15 +996,28 @@ fn anchor_verdict_for(meta: &aberp_snapshot::SnapshotMeta) -> AnchorVerdict {
 /// operator deciding whether a restored DB can be relied on in court must be
 /// able to tell "checked, none" from "never checked".
 fn describe_anchors(meta: &aberp_snapshot::SnapshotMeta) -> String {
-    match (meta.anchor_count, meta.anchored_through_seq) {
+    describe_anchor_numbers(meta.anchor_count, meta.anchored_through_seq, meta.chain_len)
+}
+
+/// [`describe_anchors`] over a LIVE [`validate_export`] re-run.
+fn describe_anchors_live(live: &aberp_snapshot::ValidationReport) -> String {
+    describe_anchor_numbers(live.anchor_count, live.anchored_through_seq, live.chain_len)
+}
+
+fn describe_anchor_numbers(
+    anchor_count: i64,
+    anchored_through: Option<u64>,
+    chain_len: u64,
+) -> String {
+    match (anchor_count, anchored_through) {
         (c, _) if c < 0 => "not-recorded".to_string(),
         (c, None) => format!("{c} rows, coverage not-recorded"),
         (c, Some(0)) => format!("{c} rows, NONE verified"),
         (c, Some(through)) => {
-            let short = through < meta.chain_len;
+            let short = through < chain_len;
             format!(
                 "{c} rows, verified through seq {through}/{}{}",
-                meta.chain_len,
+                chain_len,
                 if short { " (SHORT)" } else { "" }
             )
         }
@@ -1094,16 +1151,50 @@ struct RestorePreflight {
     /// stopped). `None` on the side-path command, where opening the live DB
     /// beside a possibly-running serve is the ADR-0098 two-instance hazard.
     live_exact: Option<LiveCounts>,
+    /// **ADR-0116 F4** — the live audit head the D3.3 comparison actually
+    /// used: the exact count when serve was stopped and the table readable,
+    /// otherwise the mirror's lower bound, otherwise `None`.
+    live_head: Option<u64>,
+    /// **ADR-0116 F4** — serve was stopped (so the count SHOULD be exact) but
+    /// `audit_ledger` could not be read. Distinct from `live_head == None`,
+    /// which merely means no source was available.
+    live_head_unknown: bool,
+    /// The snapshot's audit-row count as re-derived by the LIVE re-validation
+    /// (ADR-0116 F5) — never the recorded `meta.audit_count`.
+    snapshot_audit: u64,
     /// Reasons the restore would REFUSE. Empty ⇒ it would proceed.
     refusals: Vec<String>,
 }
 
+impl RestorePreflight {
+    /// **ADR-0116 D3.3** — how many committed audit entries this restore would
+    /// throw away. `Some(0)` = none; `None` = the live head is UNKNOWN, which
+    /// is never the same statement as "none".
+    fn discarded(&self) -> Option<u64> {
+        if self.live_head_unknown {
+            return None;
+        }
+        self.live_head
+            .map(|h| h.saturating_sub(self.snapshot_audit))
+    }
+}
+
 /// Exact row counts read from the live DB on a connection the caller already
 /// holds exclusively. See [`RestorePreflight::live_exact`].
+///
+/// **ADR-0116 F4 — `None` means "could not read", NEVER zero.** These used to
+/// be plain `i64`s carrying `-1` for an unreadable table (`unwrap_or(-1)`), and
+/// `build_preflight` coerced that with `.max(0) as u64` — so a database whose
+/// `audit_ledger` could not be read reported a confident **0** into the
+/// data-loss arithmetic, `head > snap_audit` was false, and the D3.3
+/// acknowledgement gate silently disarmed. In the one scenario a restore exists
+/// for. This is the same sentinel discipline the ADR is careful about for
+/// `anchor_count` (*"`-1` means not recorded, NEVER zero"*), applied in the
+/// place where getting it wrong disarms the safety.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveCounts {
-    pub invoice_count: i64,
-    pub audit_count: i64,
+    pub invoice_count: Option<i64>,
+    pub audit_count: Option<i64>,
 }
 
 /// Build the pre-flight for `selector` against `store_dir`.
@@ -1164,10 +1255,47 @@ fn build_preflight(
     // otherwise from the mirror's lower bound. Both directions matter: an
     // exact read can also prove the live DB is NOT ahead, which the mirror
     // never can.
-    let snap_audit = record.meta.audit_count.max(0) as u64;
-    let live_head: Option<u64> = live_exact
-        .map(|c| c.audit_count.max(0) as u64)
-        .or(live_mirror_head);
+    //
+    // ADR-0116 F5 — the snapshot side is `live.audit_count`, the number the
+    // LIVE re-validation just produced, NOT `record.meta.audit_count`. Two
+    // lines above, this function says why it re-validates: *"never trust the
+    // recorded verdict for a decision this destructive."* It then keyed the
+    // most destructive comparison it makes on the recorded number anyway.
+    // Inflating `meta.json`'s `audit_count` to 999999 — export bytes
+    // untouched, so the live re-validation still reported the true 3 — let an
+    // UNACKNOWLEDGED rollback proceed and discard 7 committed audit rows.
+    // `meta.json` is a plain file beside the export with no integrity binding
+    // to it; it is evidence, not authority.
+    let snap_audit = live.audit_count.max(0) as u64;
+    // ADR-0116 F4 / D3.3 — three states, not two. `Some` = a number we can
+    // reason about; `None` = we could NOT read the live head and must say so.
+    // `live_exact` being present but carrying `None` (serve was stopped and
+    // the table was unreadable) is the dangerous case: it must not silently
+    // degrade to the mirror's bound either, because the mirror is a LOWER
+    // bound and would report "nothing newer" about a database whose rows
+    // cannot be counted at all.
+    let live_head: Option<u64> = match live_exact {
+        Some(c) => c.audit_count.map(|n| n.max(0) as u64),
+        None => live_mirror_head,
+    };
+    let live_head_unknown = matches!(live_exact, Some(c) if c.audit_count.is_none());
+    if live_head_unknown && !accept_data_loss {
+        refusals.push(format!(
+            "the LIVE database's audit_ledger could NOT be read, so how much this restore \
+             would discard is UNKNOWN — not zero. The snapshot carries {snap_audit} audit \
+             entries. A database whose tables cannot be read is exactly the case a restore \
+             exists for, and it is also the case in which nothing can prove the rollback is \
+             safe. Pass --accept-data-loss to proceed anyway, having accepted that the amount \
+             of committed audit history discarded is unmeasurable."
+        ));
+    } else if live_head_unknown {
+        tracing::warn!(
+            snapshot_audit = snap_audit,
+            "ADR-0116 D3.3 — --accept-data-loss was passed: this restore will DISCARD \
+             committed audit entries  live_head=UNKNOWN (the live audit_ledger could not be \
+             read) snapshot_audit={snap_audit} discarded=UNKNOWN"
+        );
+    }
     if let Some(head) = live_head {
         if head > snap_audit && !accept_data_loss {
             // ADR-0116 D3.3 — "refuse when the live DB is AHEAD of the snapshot
@@ -1201,6 +1329,9 @@ fn build_preflight(
         live_mirror_head,
         live_mirror_newest,
         live_exact,
+        live_head,
+        live_head_unknown,
+        snapshot_audit: snap_audit,
         refusals,
     })
 }
@@ -1232,7 +1363,20 @@ fn print_preflight(pf: &RestorePreflight, target: &Path, with_delta: bool) {
         "  contents         invoices={}  audit_rows={}  chain_len={}",
         m.invoice_count, m.audit_count, m.chain_len
     );
-    println!("  anchors          {}", describe_anchors(m));
+    // ADR-0116 F5, same class — the LIVE re-validation is the authority.
+    // `meta.json` is a plain file beside the export with no integrity binding
+    // to it, and it is what the Defense anchor sanction used to read. Both are
+    // printed when they disagree, because a disagreement is itself the signal.
+    let anchors_live = describe_anchors_live(&pf.live);
+    let anchors_recorded = describe_anchors(m);
+    if anchors_live == anchors_recorded {
+        println!("  anchors          {anchors_live}");
+    } else {
+        println!(
+            "  anchors          {anchors_live}  (LIVE re-validation; meta.json RECORDS \
+             {anchors_recorded} — they DISAGREE, and the live number is the one that gates)"
+        );
+    }
     println!(
         "  target           {}  ({})",
         target.display(),
@@ -1243,16 +1387,38 @@ fn print_preflight(pf: &RestorePreflight, target: &Path, with_delta: bool) {
         }
     );
     if with_delta {
-        let snap = m.audit_count.max(0) as u64;
+        // ADR-0116 F5 — the snapshot's side of the comparison is the LIVE
+        // re-validation's number, matching what `build_preflight` decided on.
+        let snap = pf.snapshot_audit;
         match pf.live_exact {
+            // ADR-0116 F4 — serve is stopped, but the audit table could not be
+            // read. The one thing this must NOT print is `EXACT … 0`: the gate
+            // used to coerce the `-1` sentinel with `.max(0)` and report a
+            // confident zero, which is how it disarmed itself in exactly the
+            // scenario a restore is for.
+            Some(c) if c.audit_count.is_none() => {
+                println!(
+                    "  live delta       UNKNOWN (serve is stopped, but the live DB's \
+                     audit_ledger could NOT be read); this snapshot carries {snap} audit \
+                     entries and {} invoices",
+                    m.invoice_count
+                );
+                println!(
+                    "                   → how much would be discarded is UNKNOWN, which is NOT \
+                     the same as zero. --accept-data-loss is required to proceed."
+                );
+            }
             // EXACT — the caller holds the live DB exclusively (serve is
             // stopped), so this is the true delta in both directions.
             Some(c) => {
-                let head = c.audit_count.max(0) as u64;
+                let head = c.audit_count.unwrap_or(0).max(0) as u64;
                 println!(
                     "  live delta       EXACT (serve is stopped): the live DB holds {head} audit \
                      entries and {} invoices; this snapshot carries {snap} / {}",
-                    c.invoice_count, m.invoice_count
+                    c.invoice_count
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "UNKNOWN".to_string()),
+                    m.invoice_count
                 );
                 if head > snap {
                     println!(
@@ -1485,7 +1651,7 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
     //     prove. That is a fact about the system, not about this snapshot.
     //   * coverage NOT RECORDED (a pre-D4 snapshot) -> proceed with a warning;
     //     refusing would make every pre-D4 snapshot unrestorable.
-    let anchor_verdict = anchor_verdict_for(&pf.record.meta);
+    let anchor_verdict = anchor_verdict_live(&pf.live);
     let is_defense = matches!(
         crate::build_profile::EDITION,
         crate::build_profile::Edition::Defense
@@ -1499,11 +1665,11 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
              the chain head, not from the hash chain. Pass --accept-unanchored to proceed with \
              a database that cannot prove when those entries were made. \
              Magyarul: a visszaállított lánc időbélyeg-fedezete hiányos.",
-            describe_anchors(&pf.record.meta)
+            describe_anchors_live(&pf.live)
         )),
         AnchorVerdict::NoAnchorsAtAll => {
             tracing::warn!(
-                anchors = %describe_anchors(&pf.record.meta),
+                anchors = %describe_anchors_live(&pf.live),
                 "ADR-0116 D4 — this snapshot carries NO timestamp anchors at all. The restored \
                  database will hold a verifiable hash chain but will NOT carry the eIDAS \
                  Art. 41(2) presumption: nothing proves WHEN its entries were made. This is \
@@ -1527,7 +1693,9 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
         print_preflight(&pf, &args.db, true);
         println!(
             "\n  This is an IN-PLACE restore: {} would be moved aside as a .PRE-RESTORE-<tag> \
-             unit (DB + .wal + .ckpt-ok) and replaced. The .audit.log mirror would NOT move.",
+             unit (DB + .wal + .ckpt-ok + .audit.log mirror) and replaced. The mirror moves \
+             WITH the database it belongs to, and a FRESH mirror is written for the restored \
+             chain, so the next `aberp serve` boot has nothing to reconcile.",
             args.db.display()
         );
         if let Some(r) = &anchor_refusal {
@@ -1636,11 +1804,18 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
     // file (the 2026-08-03 heal-path lesson), and no mirror reconcile AFTER
     // the install — if the mirror disagrees with the restored DB, that is
     // `recover_or_refuse`'s decision at next boot.
+    // ADR-0116 D4 / D3.3 — the restored chain records what it was restored
+    // UNDER: the anchor verdict (so the database itself says "this chain had
+    // no timestamp coverage at restore time") and how much committed audit
+    // history the operator acknowledged discarding.
     let payload = crate::audit_payloads::SnapshotRestoredPayload {
         seq: pf.record.meta.seq,
         snapshot_dir: pf.record.dir.display().to_string(),
         target: args.db.display().to_string(),
         restored_at: rfc3339(OffsetDateTime::now_utc()),
+        anchor_verdict: anchor_verdict_slug(anchor_verdict).to_string(),
+        anchor_coverage: describe_anchors_live(&pf.live),
+        discarded_audit_rows: pf.discarded(),
     };
     emit_snapshot_event(
         &SnapshotAudit::Reopen,
@@ -1654,9 +1829,11 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
     .context("append SnapshotRestored to the RESTORED chain (ADR-0116 D3.5)")?;
 
     println!(
-        "\nIn-place restore complete.\n  restored from  {}\n  into           {}\n  preserved      {}\n                 {}\n                 {}\n  re-verified    invoices={} audit_rows={} chain={}\n\nThe .audit.log mirror was NOT moved (it is the durable record and stays at the live \
-         path). If the restored database and the mirror disagree, the next boot's guarded \
-         recovery path owns that decision.",
+        "\nIn-place restore complete.\n  restored from  {}\n  into           {}\n  preserved      {}\n                 {}\n                 {}\n                 {}\n  re-verified    invoices={} audit_rows={} chain={}  (read back from the INSTALLED \
+database, ADR-0116 F2)\n  fresh mirror   {}\n  anchors        {}\n  discarded      {}\n\nThe .audit.log mirror moved INTO the .PRE-RESTORE- unit and a fresh one was written \
+from the restored chain, so the next `aberp serve` boot has nothing to reconcile. The \
+preserved mirror is protected recovery evidence (ADR-0116 D2) and holds the audit tail \
+this rollback discarded.",
         snapshot_identity(&pf.record.meta),
         args.db.display(),
         report.preserved.db.display(),
@@ -1672,9 +1849,36 @@ pub fn run_restore_in_place(args: &RestoreInPlaceArgs) -> Result<()> {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(no checkpoint marker to preserve)".into()),
+        report
+            .preserved
+            .mirror
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(no audit mirror to preserve)".into()),
         report.installed.invoice_count,
         report.installed.audit_count,
         report.installed.chain_len,
+        report
+            .mirror_entries_written
+            .map(|n| format!("{n} entries written for the restored chain"))
+            .unwrap_or_else(|| {
+                "NOT written — the live path has no mirror; the next boot creates one from the \
+                 DB (RecoveryAction::Created)"
+                    .to_string()
+            }),
+        describe_anchors_live(&pf.live),
+        // ADR-0116 D3.3 — the discarded count lands on stdout, not only in a
+        // `tracing::warn!`. "I threw away 7 committed audit entries" must be
+        // readable in the operator's own terminal transcript, and it is now
+        // also on the restored chain (see the payload above).
+        match pf.discarded() {
+            Some(0) => "0 audit entries (the snapshot was not behind the live DB)".to_string(),
+            Some(n) => format!(
+                "{n} committed audit entries DISCARDED — acknowledged with --accept-data-loss"
+            ),
+            None => "UNKNOWN — the live audit_ledger could not be read before the restore"
+                .to_string(),
+        },
     );
     Ok(())
 }
@@ -1714,12 +1918,16 @@ fn ensure_serve_is_stopped(db_path: &Path) -> Result<Option<LiveCounts>> {
             // it, so the 15 CLI money-submission sites (D-22) can leave the
             // mirror lagging the DB in exactly the serve-down windows where an
             // operator reaches for a restore.
-            let audit_count: i64 = conn
+            // ADR-0116 F4 — `.ok()`, not `unwrap_or(-1)`. An unreadable table
+            // is UNKNOWN and must stay unknown all the way to the refusal
+            // arithmetic; a sentinel that looks like a number gets treated
+            // like one two functions away.
+            let audit_count: Option<i64> = conn
                 .query_row("SELECT count(*) FROM audit_ledger", [], |r| r.get(0))
-                .unwrap_or(-1);
-            let invoice_count: i64 = conn
+                .ok();
+            let invoice_count: Option<i64> = conn
                 .query_row("SELECT count(*) FROM invoice", [], |r| r.get(0))
-                .unwrap_or(-1);
+                .ok();
             drop(conn);
             Ok(Some(LiveCounts {
                 invoice_count,

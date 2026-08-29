@@ -7,7 +7,12 @@
 # VERDICTs:
 #   GUARDED       the enclosing fn routes its removals through the ADR-0116 D2
 #                 guard (`is_protected_evidence` / `guarded_remove` appear in
-#                 the same fn body).
+#                 the same fn body) AND no guard site is short-circuited dead.
+#   DEAD_GUARD    the guard token is PRESENT but neutered — short-circuited by
+#                 a boolean literal (`if false && is_protected_evidence(..)`,
+#                 `if guard(..) || true`, …) or its result discarded
+#                 (`let _ = is_protected_evidence(..)`). **Always a failure.**
+#                 See "Why GUARDED is not token presence" below.
 #   TENANT_HOME   the fn removes a path AND reaches a tenant-home path (it
 #                 mentions a tenant-home token — `read_dir` included, because
 #                 ENUMERATE-AND-UNLINK is the dangerous shape whatever the
@@ -28,6 +33,32 @@
 # whole-program taint closure (CHECK 10N is that, for a different class), and
 # it does not pretend to be. The gate carries a liveness floor so a scanner
 # that stops classifying cannot read as "no violations".
+#
+# ## Why GUARDED is not token presence (the F7 / M1 finding)
+#
+# The first cut of CHECK 11d grepped `retention.rs` for the string
+# `is_protected_evidence` — and the function's own DOC COMMENT names it, so
+# neutering the real call left the gate green. That was closed by keying the
+# check on THIS scanner's verdict instead, since the scanner strips comments
+# and string literals.
+#
+# It was closed one level, not all the way. The verdict was still "the token
+# appears somewhere in the fn body", which is presence, not reachability, and
+# the adversarial mutation
+#
+#     if false && crate::evidence::is_protected_evidence(&rec.dir) {
+#
+# passed the whole gate with the guard dead. That is the ADR-0098 opener-scan
+# char-literal class one level in: the first cut could be flipped by editing a
+# COMMENT, this one by editing an OPERATOR.
+#
+# A scanner cannot decide reachability in general, and this one does not
+# pretend to. What it CAN decide is whether a guard has been written in a form
+# that is dead BY CONSTRUCTION — a constant-false short-circuit, a constant-true
+# disjunction, or a discarded result — which is the shape a neutering edit
+# actually takes. Those are now `DEAD_GUARD` and fail the build. The general
+# question is answered where it belongs, by a behavioural test:
+# `f7_prune_refuses_a_protected_directory_and_does_not_report_it_removed`.
 #
 # ## Structure detection is INDENT-based, not brace-counting
 #
@@ -79,8 +110,55 @@ function strip(line,   out, i, c, instr, inchar, prev) {
 BEGIN {
   # Tokens that mean "this fn can reach a path inside a tenant home". Drawn
   # from the shapes that actually occur at removal sites in this tree.
-  nth = split("db_path|mirror_path|tenant_home|tenant_dir|wal_sibling|marker_path|install_intent_path|.aberp|audit.log|CORRUPT|preserve_|evidence|sibling|live_db|.wal|read_dir", TH, "|")
+  nth = split("db_path|mirror_path|tenant_home|tenant_dir|wal_sibling|marker_path|install_intent_path|.aberp|audit.log|CORRUPT|preserve_|evidence|sibling|live_db|.wal|read_dir|artefact", TH, "|")
   ng  = split("is_protected_evidence|guarded_remove", GUARD, "|")
+  # The PREDICATE half of the guard set. `is_protected_evidence` RETURNS the
+  # decision, so discarding its value neuters it; `guarded_remove` PERFORMS the
+  # guarded action and returns a Result, so `let _ = guarded_remove(..)` is
+  # idiomatic and completely safe — the removal still went through the guard.
+  # `recover::cleanup_siblings_with_infix` spells it exactly that way today.
+  # Conflating the two would fire on correct code, and a gate that reddens the
+  # correct fix is a gate that gets switched off.
+  npd = split("is_protected_evidence", PRED, "|")
+  # F8 — files whose EVERY removal reaches a tenant home BY CONSTRUCTION,
+  # whatever tokens the individual fn happens to mention.
+  #
+  # `evidence.rs::archive_then_remove` is the sanctioned release path: it
+  # unlinks recovery evidence from a live tenant home by design, and the
+  # token-based classifier called it OTHER — "a removal in a fn with no
+  # tenant-home reach" — because it works through `artefact.path` and `dest`
+  # and mentions none of the TH tokens. So the ONE function whose job is
+  # unlinking evidence sat OUTSIDE the frozen may-only-shrink set, and a later
+  # change that weakened it, or a new removal added inside it, would have kept
+  # CHECK 11 green. These three files ARE the tenant-home surface; classifying
+  # them by file removes the dependence on a fn happening to name the right
+  # local.
+  nfh = split("crates/aberp-snapshot/src/evidence.rs|crates/aberp-snapshot/src/recover.rs|crates/aberp-snapshot/src/crash_safe.rs", FH, "|")
+}
+
+function file_reaches_tenant_home(f,   i) {
+  for (i = 1; i <= nfh; i++) if (index(f, FH[i]) > 0) return 1
+  return 0
+}
+
+# Is this statement a guard call written in a form that is DEAD by
+# construction? Evaluated over a whole statement, so a rustfmt line split
+# inside an `if` condition cannot hide the operator.
+function guard_is_dead(st,   i, has) {
+  has = 0
+  for (i = 1; i <= ng; i++) if (index(st, GUARD[i]) > 0) has = 1
+  if (!has) return 0
+  # `false &&` / `&& false` — a conjunction that can never be true.
+  if (st ~ /(^|[^A-Za-z_0-9])false[ \t]*&&/) return 1
+  if (st ~ /&&[ \t]*false([^A-Za-z_0-9]|$)/) return 1
+  # `true ||` / `|| true` — a disjunction that is always true, so the guard's
+  # answer never changes the branch.
+  if (st ~ /(^|[^A-Za-z_0-9])true[ \t]*\|\|/) return 1
+  if (st ~ /\|\|[ \t]*true([^A-Za-z_0-9]|$)/) return 1
+  # The PREDICATE's answer thrown away: `let _ = is_protected_evidence(..)`.
+  for (i = 1; i <= npd; i++)
+    if (index(st, PRED[i]) > 0 && st ~ /let[ \t]+_[ \t]*=/) return 1
+  return 0
 }
 
 FNR == 1 {
@@ -88,6 +166,7 @@ FNR == 1 {
   fn_name = ""; fn_indent = -1; body = ""; hits = ""; in_test_fn = 0
   test_indent = -1; pending_test = 0
   inblock = 0
+  stmt = ""; dead_guard = 0
 }
 
 {
@@ -137,13 +216,30 @@ FNR == 1 {
     sub(/[ \t]*[(<].*$/, "", m)
     fn_name = m
     fn_indent = ind
-    body = ""; hits = ""
+    body = ""; hits = ""; stmt = ""; dead_guard = 0
     in_test_fn = (test_indent >= 0)
   }
 
   if (fn_name != "") {
     body = body " " line
-    if (line ~ /fs::remove_(file|dir_all|dir)[ \t]*\(/) {
+    # Statement buffer for the DEAD_GUARD test. Reset at a statement/block
+    # boundary, so a guard call split across lines by rustfmt is still
+    # evaluated together with the operator that neuters it.
+    stmt = stmt " " line
+    if (line ~ /[;{}]/) {
+      if (guard_is_dead(stmt)) dead_guard = 1
+      stmt = ""
+    }
+    # F8 (mutation M5) — the removal must be recognised in EVERY spelling, not
+    # only `fs::remove_*`. A direct import (`use std::fs::remove_file;` then a
+    # bare `remove_file(p)`) escaped the old `fs::remove_(` regex entirely, so
+    # a tenant-home sweeper written that way passed the whole gate. Nothing
+    # in-tree spells it that way today — which is exactly when to close it;
+    # this is the "gate bans ONE spelling" class already on record here from
+    # PR #41. `[^A-Za-z_0-9.]` keeps `self.remove_file(` and
+    # `guarded_remove_file(` out, and the `fn` guard keeps DEFINITIONS out.
+    if (line ~ /(^|[^A-Za-z_0-9.])remove_(file|dir_all|dir)[ \t]*\(/ \
+        && line !~ /(^|[^A-Za-z_0-9])fn[ \t]+remove_/) {
       tok = "remove_file"
       if (line ~ /remove_dir_all/) tok = "remove_dir_all"
       else if (line ~ /remove_dir[ \t]*\(/) tok = "remove_dir"
@@ -155,16 +251,22 @@ FNR == 1 {
 END { if (fn_name != "") emit() }
 
 function emit(   i, guarded, reaches, verdict, n, parts) {
-  if (hits == "" || in_test_fn) { body = ""; hits = ""; return }
+  # A trailing statement with no terminator (the last line of a fn body) still
+  # has to be tested before the verdict is taken.
+  if (stmt != "" && guard_is_dead(stmt)) dead_guard = 1
+  stmt = ""
+  if (hits == "" || in_test_fn) { body = ""; hits = ""; dead_guard = 0; return }
   guarded = 0
   for (i = 1; i <= ng; i++) if (index(body, GUARD[i]) > 0) guarded = 1
-  reaches = 0
-  for (i = 1; i <= nth; i++) if (index(body, TH[i]) > 0) reaches = 1
-  verdict = guarded ? "GUARDED" : (reaches ? "TENANT_HOME" : "OTHER")
+  reaches = file_reaches_tenant_home(file)
+  if (!reaches) for (i = 1; i <= nth; i++) if (index(body, TH[i]) > 0) reaches = 1
+  # DEAD_GUARD outranks everything: a guard written dead by construction is
+  # worse than no guard, because its presence is what stops anyone looking.
+  verdict = dead_guard ? "DEAD_GUARD" : (guarded ? "GUARDED" : (reaches ? "TENANT_HOME" : "OTHER"))
   n = split(hits, parts, " ")
   for (i = 1; i <= n; i++) {
     if (parts[i] == "") continue
     print file ":" fn_name ":" verdict ":" parts[i]
   }
-  body = ""; hits = ""
+  body = ""; hits = ""; dead_guard = 0
 }

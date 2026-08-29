@@ -666,11 +666,19 @@ fn ac8_a_recycled_seq_refuses_and_the_stable_identity_resolves() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// AC-9 (D3.4 / F4) — the .PRE-RESTORE- unit, and the mirror that stays
+// AC-9 (D3.4 / F4) — the .PRE-RESTORE- unit, mirror included
 // ══════════════════════════════════════════════════════════════════════
 
-/// **ADR-0116 AC-9** — the preserved unit is DB + `.wal` + `.ckpt-ok`, the
-/// mirror does not move, and no orphan WAL is left beside the restored file.
+/// **ADR-0116 AC-9** — the preserved unit is DB + `.wal` + `.ckpt-ok` +
+/// `.audit.log`, a FRESH mirror is written for the restored chain, and no
+/// orphan WAL is left beside the restored file.
+///
+/// **The mirror clause was the opposite of this until rev 2**, and the
+/// inversion is the blocker it hid: leaving the pre-rollback mirror at the
+/// live path made the next `aberp serve` boot report
+/// `MirrorDivergedFromDb` → `RefuseFatal` and refuse to start. See
+/// `restore_in_place`'s own rev-2 note, and the boot journey in
+/// `apps/aberp/tests/adr0116_restore_journey_e2e.rs`.
 ///
 /// The ADR's first draft said only "move the current DB aside". That would
 /// have been a real defect twice over: a DB moved without its WAL is stripped
@@ -685,7 +693,7 @@ fn ac8_a_recycled_seq_refuses_and_the_stable_identity_resolves() {
 /// preserved unit is opened and a row that was **in the WAL and not in the DB
 /// file** is read back.
 #[test]
-fn ac9_in_place_restore_preserves_db_wal_and_marker_and_leaves_the_mirror() {
+fn ac9_in_place_restore_preserves_db_wal_marker_and_mirror_as_one_unit() {
     let tmp = ScopedTempDir::new("ac9-in-place");
     let home = tmp.path().join(".aberp-defense").join("defense");
     std::fs::create_dir_all(&home).expect("mkdir");
@@ -765,18 +773,63 @@ fn ac9_in_place_restore_preserves_db_wal_and_marker_and_leaves_the_mirror() {
          restored file. That is the corruption vector restore_into's own comment warns about."
     );
 
-    // ── the mirror stays, byte-identical ──
-    assert!(
-        mirror.exists(),
-        "ADR-0116 AC-9/D3.4 step 4 — the .audit.log mirror must NOT move. It is the durable \
-         record and stays at the live path; an implementer moving 'the tenant's DB artefacts' \
-         would naturally take it too."
+    // ── the mirror moved INTO the unit, verbatim ──
+    let preserved_mirror =
+        report.preserved.mirror.as_ref().expect(
+            "ADR-0116 D3.4 rev 2 — the .audit.log mirror must move into the PRE-RESTORE unit",
+        );
+    assert_eq!(
+        *preserved_mirror,
+        aberp_audit_ledger::mirror_path_for(&report.preserved.db),
+        "the preserved mirror must PAIR with the preserved DB by name, like the WAL and the \
+         marker — `<db>.PRE-RESTORE-<tag>.audit.log`"
     );
     assert_eq!(
-        std::fs::read(&mirror).expect("read mirror"),
+        std::fs::read(preserved_mirror).expect("read preserved mirror"),
         mirror_before,
-        "the mirror must be untouched by the restore"
+        "the pre-rollback mirror is the ONLY surviving record of the audit tail this rollback \
+         discarded. The preserve MOVES it; it must never be rewritten or trimmed."
     );
+    assert!(
+        aberp_snapshot::is_protected_evidence(preserved_mirror),
+        "ADR-0116 D2 — the preserved mirror is recovery evidence"
+    );
+
+    // ── and a FRESH mirror now describes the RESTORED chain ──
+    assert!(
+        mirror.exists(),
+        "ADR-0116 D3.4 rev 2 — a fresh .audit.log must be written for the restored chain, \
+         inside the same operation. Leaving the live path with a database and no durable \
+         record of its chain is a window this command must not open."
+    );
+    assert_ne!(
+        std::fs::read(&mirror).expect("read fresh mirror"),
+        mirror_before,
+        "the fresh mirror must describe the RESTORED chain, not be the discarded one"
+    );
+    let written = report
+        .mirror_entries_written
+        .expect("the fresh mirror rebuild must report how many entries it wrote");
+    assert_eq!(
+        written, 3,
+        "the fresh mirror must carry the restored chain's 3 entries"
+    );
+
+    // ── the restored pair BOOTS: the reconcile serve.rs runs must not refuse ──
+    {
+        let conn = Connection::open(&db).expect("open restored");
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .expect("pragma");
+        let action = aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror).expect(
+            "ADR-0116 D3.4 — the boot mirror reconcile must SUCCEED on the restored pair. A \
+             MirrorDivergedFromDb here is routed to RefuseFatal and `aberp serve` does not \
+             start.",
+        );
+        assert!(
+            matches!(action, aberp_audit_ledger::RecoveryAction::Unchanged),
+            "the fresh mirror must already AGREE with the restored DB: {action:?}"
+        );
+    }
 
     // ── the restored file is the snapshot's content ──
     let restored: i64 = {
@@ -871,6 +924,10 @@ fn preserve_moves_the_db_first_and_rolls_back_if_the_wal_move_fails() {
     let wal_move = body
         .find("move_aside_to(&db_wal,")
         .expect("the WAL move must exist");
+    let mirror_move = body.find("move_aside_to(&db_mirror,").expect(
+        "ADR-0116 D3.4 rev 2 — the MIRROR move must exist; without it the live path \
+                 keeps the discarded audit tail and `aberp serve` refuses the next boot",
+    );
     assert!(
         db_rename < wal_move,
         "the DB must be moved aside BEFORE its WAL. With the WAL first, a failed DB rename \
@@ -878,9 +935,23 @@ fn preserve_moves_the_db_first_and_rolls_back_if_the_wal_move_fails() {
          by the preserve step itself."
     );
     assert!(
-        body[db_rename..wal_move + 2000].contains("rename(&preserved_db, db_path)"),
-        "a failed WAL move must ROLL THE DB BACK; otherwise the live path is left with a WAL \
-         and no database — the torn preserve in the other direction"
+        wal_move < mirror_move,
+        "the mirror moves LAST of the three renameable artefacts, for the same reason the WAL \
+         follows the DB: each step past the point of no return must be rollable back to a live \
+         path that is exactly as it was."
+    );
+    assert!(
+        body[db_rename..mirror_move + 600].contains("roll_preserve_back("),
+        "a failed WAL or MIRROR move must ROLL THE DB BACK; otherwise the live path is left \
+         with a WAL and no database — the torn preserve in the other direction"
+    );
+    assert!(
+        src[src
+            .find("fn roll_preserve_back(")
+            .expect("the rollback helper must exist")..]
+            .contains("rename(preserved_db, db_path)"),
+        "roll_preserve_back must actually perform the reverse rename — a helper that only logs \
+         would satisfy the call-site assertion above while leaving the DB moved"
     );
 
     // ── injected failure: the WAL destination cannot be created ──
@@ -1233,4 +1304,310 @@ fn validate_export_reports_anchor_coverage_on_a_broken_chain_too() {
     let report = validate_export(&good.dir, "t");
     assert!(report.ok);
     assert_eq!(report.anchor_count, 0);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// The adversarial FIX-FIRSTs — one test per finding, each RED before its fix
+// ══════════════════════════════════════════════════════════════════════
+
+/// **F2 — the "re-verified" line must read the INSTALLED database.**
+///
+/// Step 6 of `restore_in_place` called `validate_export(export_dir, tenant)`:
+/// the identical pure function of the export directory that produced the
+/// pre-install validation twenty lines earlier, with no reference to
+/// `db_path`. So `InPlaceRestoreReport.installed` — documented as *"validation
+/// of the installed file, re-run after the install"* and printed by the CLI as
+/// `re-verified invoices=… audit_rows=… chain=…` — was the snapshot's own
+/// numbers, re-derived.
+///
+/// The vacuity is demonstrable rather than argued: overwrite the installed
+/// database with bytes that are not a database at all, and the old
+/// implementation still returned `ok` with the same counts.
+#[test]
+fn f2_installed_verification_reads_the_file_on_disk_not_the_export() {
+    let tmp = ScopedTempDir::new("f2-installed");
+    let db = tmp.path().join("aberp.duckdb");
+    seed_db(&db, "t", 2, 3);
+    let store = tmp.path().join("store");
+    let rec = take_snapshot(&db, &store, "t", OffsetDateTime::now_utc()).expect("snapshot");
+
+    // The export validates, and says so.
+    let export_report = validate_export(&rec.dir, "t");
+    assert!(export_report.ok, "fixture: the export must validate");
+
+    // Now the file the export was restored INTO is destroyed. The export
+    // directory is untouched, so `validate_export` is still perfectly happy —
+    // which is exactly why it cannot be the post-install check.
+    aberp_snapshot::restore_into(&rec.dir, &db, "t").expect("restore into the live path");
+    std::fs::write(&db, b"not a duckdb file at all").expect("destroy the installed file");
+
+    assert!(
+        validate_export(&rec.dir, "t").ok,
+        "fixture: validate_export is a pure function of the EXPORT and cannot see the \
+         installed file — that is the whole finding"
+    );
+    let installed = aberp_snapshot::validate_installed_db(&db, "t");
+    assert!(
+        !installed.ok,
+        "ADR-0116 F2 — the post-install verification reported OK for a database that is not a \
+         database. It was re-validating the export, not the install."
+    );
+    assert!(
+        installed.error.as_deref().is_some_and(|e| !e.is_empty()),
+        "the failure must name itself"
+    );
+}
+
+/// **F2, through `restore_in_place`** — a torn install must FAIL the restore,
+/// not be reported as `re-verified`.
+///
+/// Injected by making the installed database's content disagree with the
+/// snapshot: the export directory is edited between validation and install so
+/// the file that lands carries different rows. The restore must refuse and
+/// name the `.PRE-RESTORE-` unit that still holds the original.
+#[test]
+fn f2_in_place_restore_fails_loudly_when_the_installed_db_does_not_match() {
+    let tmp = ScopedTempDir::new("f2-mismatch");
+    let home = tmp.path().join(".aberp-defense").join("defense");
+    std::fs::create_dir_all(&home).expect("mkdir");
+    let db = home.join("aberp.duckdb");
+    seed_db(&db, "t", 2, 3);
+    let store = tmp.path().join("store");
+    let rec = take_snapshot(&db, &store, "t", OffsetDateTime::now_utc()).expect("snapshot");
+
+    let ok = restore_in_place(&rec.dir, &db, "t", "20260829T100000Z").expect("clean restore");
+    assert!(ok.installed.ok);
+    assert_eq!(ok.installed.audit_count, 3);
+
+    // ── the CALL SITE is the finding, so the call site is what is pinned ──
+    //
+    // `validate_installed_db` existing is not the fix; `restore_in_place`
+    // CALLING it after the install is. Step 6 used to call
+    // `validate_export(export_dir, tenant)` — the identical pure function that
+    // produced `pre` — so a reviewer reading the report saw plausible numbers
+    // that could not have come from the file on disk.
+    // **Strip comments first.** This assertion is a source grep, and a source
+    // grep over Rust that does not strip comments is the exact class this
+    // repo has now been bitten by three times (the ADR-0098 opener-scan
+    // char-literal bug; CHECK 11d satisfied by `prune`'s own doc comment).
+    // The fixed code's comment NAMES the call it removed — as it should — and
+    // an unstripped grep reads that as the call still being there.
+    let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/take.rs"))
+        .expect("read take.rs");
+    let src: String = raw
+        .lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = &src[src
+        .find("pub fn restore_in_place(")
+        .expect("restore_in_place must exist")..];
+    let install_at = body
+        .find("restore_into(export_dir, db_path, tenant)?")
+        .expect("the install must exist");
+    let after_install = &body[install_at..];
+    assert!(
+        after_install.contains("validate_installed_db(db_path, tenant)"),
+        "ADR-0116 F2 — the post-install verification must read `db_path`. A second \
+         `validate_export(export_dir, ..)` is a pure function of the EXPORT and reports the \
+         same numbers however badly the install went."
+    );
+    assert!(
+        !after_install.contains("validate_export(export_dir"),
+        "ADR-0116 F2 — `validate_export` is called AFTER the install; that is the vacuous \
+         re-verification this fix removed"
+    );
+    // …and a mismatch must be a hard error, not a line in the report.
+    assert!(
+        after_install.contains("InstalledVerifyFailed"),
+        "ADR-0116 F2 — a failed or mismatched post-install verification must FAIL the restore \
+         and name the .PRE-RESTORE- unit, not be printed as `re-verified`"
+    );
+}
+
+/// **F3 — a bare seq selector must never resolve to a DIFFERENT snapshot.**
+///
+/// `snapshot_identity` is `<seq>@<ts>#<sha8>`, and the identity form was tried
+/// as a PREFIX before the bare seq. So in a store holding only seq 24 the typed
+/// string `"2"` prefix-matched seq 24's identity and
+/// `restore --in-place --snapshot 2 --confirm` overwrote the live database from
+/// a snapshot the operator never named. Seq 2 does not exist; the answer is
+/// `NotFound`.
+#[test]
+fn f3_a_bare_seq_that_does_not_exist_resolves_to_nothing_not_to_a_prefix_match() {
+    let only_24 = vec![record(24, datetime!(2026-07-09 14:24:00 UTC), true)];
+    let err = aberp_snapshot::resolve_selector_in(&only_24, "2").expect_err(
+        "ADR-0116 F3 — `--snapshot 2` against a store holding only seq 24 resolved to seq 24, \
+         because \"2\" is a PREFIX of \"24@2026-07-09T14:24:00Z#…\". That silently overwrites \
+         the live database from a snapshot the operator never named.",
+    );
+    assert!(
+        format!("{err}").contains("no snapshot matching"),
+        "the refusal must be NotFound, not an ambiguity: {err}"
+    );
+}
+
+/// **F3, the mirror image** — the documented bare-seq form must keep working
+/// once the store grows past seq 9.
+///
+/// With seqs 2 and 24 both present, seq 2 is unique — but `--snapshot 2` was
+/// REFUSED as ambiguous, because seq 24's identity also starts with `"2"`.
+#[test]
+fn f3_a_unique_bare_seq_still_resolves_when_a_higher_seq_shares_its_digits() {
+    let records = vec![
+        record(2, datetime!(2026-07-01 10:00:00 UTC), true),
+        record(24, datetime!(2026-07-09 14:24:00 UTC), true),
+    ];
+    let got = aberp_snapshot::resolve_selector_in(&records, "2").expect(
+        "ADR-0116 F3 — `--snapshot 2` was refused as AMBIGUOUS even though seq 2 is unique, \
+         because seq 24's identity shares its leading digit. The documented bare-seq form \
+         stopped working as soon as the store passed seq 9.",
+    );
+    assert_eq!(got.meta.seq, 2);
+
+    // The full identity still resolves, and a genuinely ambiguous identity
+    // prefix still refuses.
+    let got = aberp_snapshot::resolve_selector_in(&records, &snapshot_identity(&records[1].meta))
+        .expect("the stable identity must resolve");
+    assert_eq!(got.meta.seq, 24);
+}
+
+/// **F3 — a RECYCLED seq is still refused**, which is the property the
+/// re-ordering must not cost. `seq` is recycled after a prune, so two records
+/// can share it; picking one silently is how an operator gets the failed
+/// snapshot of a `validation_failed` pair instead of the good one.
+#[test]
+fn f3_a_recycled_bare_seq_still_refuses_rather_than_guessing() {
+    let records = vec![
+        record(7, datetime!(2026-07-01 10:00:00 UTC), true),
+        record(7, datetime!(2026-07-08 10:00:00 UTC), false),
+    ];
+    let err = aberp_snapshot::resolve_selector_in(&records, "7")
+        .expect_err("a recycled seq must REFUSE, never guess");
+    assert!(
+        format!("{err}").contains("AMBIGUOUS"),
+        "the refusal must name the ambiguity: {err}"
+    );
+}
+
+/// **F6 — the snapshot WRITE path must `fsync` before the finalize rename.**
+///
+/// `take_snapshot_with` wrote the parquet files, `schema.sql`, `load.sql` and
+/// `meta.json` and then renamed `.partial` → final with **no `fsync` on any of
+/// them and none on the store directory** — the exact shape D3.1 called
+/// unacceptable on the restore install path, on the path that PRODUCES the
+/// artefact the whole feature exists to create. After a power cut a snapshot
+/// directory could be visible and complete by name while its parquet bytes had
+/// never reached the device, with `meta.json` still saying `valid: true`.
+///
+/// No crash-injection harness exists here (the ADR states that scope honestly
+/// for AC-1), so this is pinned the way AC-1 is: by the SOURCE ORDER of the
+/// durable primitive relative to the rename, plus the functional check that the
+/// finalized snapshot is complete and restorable.
+#[test]
+fn f6_the_snapshot_write_path_fsyncs_before_it_publishes_the_rename() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/take.rs"))
+        .expect("read take.rs");
+    let body = &src[src
+        .find("pub fn take_snapshot_with(")
+        .expect("take_snapshot_with must exist")..];
+    let fsync_at = body.find("fsync_export_dir(&partial_dir)").expect(
+        "ADR-0116 F6 — the snapshot write path has NO fsync. A snapshot whose bytes never \
+             reached the device is a rollback point that does not exist, and nothing detects \
+             it: `plan_retention` reads the RECORDED `meta.valid`, so a torn snapshot holds \
+             the never-prune-the-newest-valid slot.",
+    );
+    let rename_at = body
+        .find("std::fs::rename(&partial_dir, &final_dir)")
+        .expect("the finalize rename must exist");
+    assert!(
+        fsync_at < rename_at,
+        "the export must be durable BEFORE the rename publishes its name. A rename made \
+         durable ahead of its contents publishes a name for bytes that are not there."
+    );
+    assert!(
+        body[rename_at..rename_at + 400].contains("fsync_dir(store_dir)"),
+        "the STORE directory must be fsync'd after the rename, or the finalize itself is not \
+         durable — the directory entry is what makes the snapshot visible at all"
+    );
+
+    // …and the finalized snapshot is genuinely complete and restorable.
+    let tmp = ScopedTempDir::new("f6-fsync");
+    let db = tmp.path().join("aberp.duckdb");
+    seed_db(&db, "t", 2, 3);
+    let store = tmp.path().join("store");
+    let rec = take_snapshot(&db, &store, "t", OffsetDateTime::now_utc()).expect("snapshot");
+    assert!(rec.meta.valid, "the snapshot must validate");
+    assert!(
+        validate_export(&rec.dir, "t").ok,
+        "the finalized snapshot must be restorable after the durable finalize"
+    );
+    assert!(
+        !rec.dir.to_string_lossy().contains(".partial"),
+        "the finalized snapshot must not still be a partial"
+    );
+}
+
+/// **F7 — `prune` must REFUSE to unlink a protected directory, and must not
+/// report it as removed.**
+///
+/// `retention::prune` consults `is_protected_evidence` and the cut-gate CHECK
+/// 11d asserts the scanner sees that call. But nothing in the tree pinned the
+/// BEHAVIOUR: a guard that is present and dead satisfies a scanner, and the
+/// adversarial mutation `if false && …is_protected_evidence(…)` left the gate
+/// green with the guard inert. A scanner cannot answer liveness; a test can.
+#[test]
+fn f7_prune_refuses_a_protected_directory_and_does_not_report_it_removed() {
+    let tmp = ScopedTempDir::new("f7-prune");
+    let store = tmp.path().join("store");
+    std::fs::create_dir_all(&store).expect("mkdir store");
+
+    // One ordinary condemned snapshot, and one whose directory name is
+    // evidence-shaped (an incident artefact that landed in the store).
+    let plain = store.join("snap-1-20260101-000000");
+    let evidence = store.join("snap-2-20260102-000000.CORRUPT-20260808T120000Z");
+    std::fs::create_dir_all(&plain).expect("mkdir plain");
+    std::fs::create_dir_all(&evidence).expect("mkdir evidence");
+    std::fs::write(plain.join("meta.json"), b"{}").expect("write");
+    std::fs::write(evidence.join("meta.json"), b"{}").expect("write");
+
+    assert!(
+        !is_protected_evidence(&plain),
+        "fixture: an ordinary snapshot directory is not evidence"
+    );
+    assert!(
+        is_protected_evidence(&evidence),
+        "fixture: a CORRUPT-tagged directory IS evidence"
+    );
+
+    let mut r1 = record(1, datetime!(2026-01-01 00:00:00 UTC), true);
+    r1.dir = plain.clone();
+    let mut r2 = record(2, datetime!(2026-01-02 00:00:00 UTC), true);
+    r2.dir = evidence.clone();
+    let records = vec![r1, r2];
+    let plan = aberp_snapshot::RetentionPlan {
+        keep: vec![],
+        prune: vec![1, 2],
+    };
+
+    let removed = prune(&records, &plan).expect("prune must not abort on a refusal");
+
+    assert!(
+        evidence.exists(),
+        "ADR-0116 D2 — `prune` UNLINKED a protected directory. An unlink beside a durability \
+         incident destroys the only record of it, permanently."
+    );
+    assert!(
+        !removed.contains(&2),
+        "a refused seq must NOT be reported as removed — a false report is how the pruner's \
+         blindness became invisible in the first place: {removed:?}"
+    );
+    assert!(
+        !plain.exists() && removed.contains(&1),
+        "a refusal must NOT abort the whole pass; the remaining condemned snapshots are still \
+         removed, or the store grows while the pass looks like it ran: {removed:?}"
+    );
 }

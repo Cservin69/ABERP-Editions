@@ -1336,6 +1336,17 @@ fi
 #          removal that reaches a tenant-home path fails here.
 #    11c — corpus liveness: a scanner that classifies nothing makes 11b
 #          vacuously green, so a floor is required in the SAFE direction too.
+#    11d — `retention::prune` must CONSULT the guard (the scanner's verdict).
+#    11e — **no guard may be DEAD.** F7: 11d's verdict was still token
+#          PRESENCE in the fn body, so the mutation
+#          `if false && …is_protected_evidence(…)` left the gate GREEN with the
+#          guard inert. The scanner now verdicts a guard that is dead BY
+#          CONSTRUCTION as DEAD_GUARD; this arm fails on any.
+#    11f — MATCHER LIVENESS (the 10P-0 pattern). A scanner that silently stops
+#          recognising the two known escapes reports "no violations", which is
+#          the most dangerous green there is. Four fixtures pin the verdicts
+#          this check actually rests on, including both mutations the
+#          adversarial review found escaping (M1, M5).
 #    Teeth: cut_gate_negative_probes.sh "[CHECK 11]".
 #    ENFORCE_EVIDENCE_GUARD=0 disables it for a deliberate, temporary local probe.
 echo "[CHECK 11] ADR-0116 D2 — recovery-evidence guard present + tenant-home removal sites frozen (ENFORCED · D5)"
@@ -1368,6 +1379,43 @@ fi
 if [[ ! -f "$ev_scan" || ! -f "$ev_manifest" ]]; then
   flag11 "✗ evidence removal scanner or frozen manifest missing: $ev_scan / $ev_manifest"
 else
+  # 11f — MATCHER LIVENESS, before anything is derived from the scanner.
+  ev_probe="$(mktemp "${TMPDIR:-/tmp}/ev_probe.XXXXXX")"
+  printf 'fn c(rec: &R) {\n    if crate::evidence::is_protected_evidence(&rec.dir) {\n        return;\n    }\n    std::fs::remove_dir_all(&rec.dir).ok();\n}\n' > "$ev_probe"
+  awk -f "$ev_scan" "$ev_probe" | grep -q ':GUARDED:' \
+    || flag11 "✗ HARNESS: the scanner no longer verdicts a live guard as GUARDED — every guarded site would read as unguarded and 11d could never pass honestly"
+  # M1 — the guard is PRESENT and dead. This is the mutation that escaped the
+  # whole gate before F7; it must be RED now, on one line and split across
+  # lines (rustfmt decides which).
+  printf 'fn c(rec: &R) {\n    if false && crate::evidence::is_protected_evidence(&rec.dir) {\n        return;\n    }\n    std::fs::remove_dir_all(&rec.dir).ok();\n}\n' > "$ev_probe"
+  awk -f "$ev_scan" "$ev_probe" | grep -q ':DEAD_GUARD:' \
+    || flag11 "✗ HARNESS: the scanner no longer detects a SHORT-CIRCUITED guard (mutation M1: \`if false && is_protected_evidence(..)\`). GUARDED would be back to token presence, and the guard could be neutered by editing an operator — the ADR-0098 opener-scan class one level in"
+  printf 'fn c(rec: &R) {\n    if false\n        && crate::evidence::is_protected_evidence(&rec.dir)\n    {\n        return;\n    }\n    std::fs::remove_dir_all(&rec.dir).ok();\n}\n' > "$ev_probe"
+  awk -f "$ev_scan" "$ev_probe" | grep -q ':DEAD_GUARD:' \
+    || flag11 "✗ HARNESS: the scanner detects a short-circuited guard only when it fits on ONE line — a rustfmt split hides it. The statement buffer in the scanner has regressed"
+  # M5 — the removal spelled through a direct import. Nothing in-tree uses
+  # this spelling, which is precisely why it must stay pinned: a gate that
+  # bans ONE spelling is the class already on record here from PR #41.
+  printf 'use std::fs::remove_file;\nfn sweep(tenant_home: &Path) {\n    for e in std::fs::read_dir(tenant_home).unwrap().flatten() {\n        remove_file(e.path()).ok();\n    }\n}\n' > "$ev_probe"
+  awk -f "$ev_scan" "$ev_probe" | grep -q ':TENANT_HOME:' \
+    || flag11 "✗ HARNESS: the scanner no longer sees a removal spelled through a direct import (\`use std::fs::remove_file;\` … \`remove_file(p)\`, mutation M5). A tenant-home sweeper written that way passes the whole gate"
+  # …and DEAD_GUARD must NOT fire on `let _ = guarded_remove(..)`, which is
+  # idiomatic and completely safe: `guarded_remove` PERFORMS the guarded
+  # action and returns a Result, unlike `is_protected_evidence`, whose
+  # returned bool IS the decision. `recover::cleanup_siblings_with_infix`
+  # spells it that way today, and a gate that reddens correct code is a gate
+  # that gets switched off.
+  printf 'fn c(db_path: &Path) {\n    for e in std::fs::read_dir(db_path.parent().unwrap()).unwrap().flatten() {\n        let _ = aberp_snapshot::guarded_remove(&e.path());\n        let _ = std::fs::remove_file(e.path());\n    }\n}\n' > "$ev_probe"
+  awk -f "$ev_scan" "$ev_probe" | grep -q ':GUARDED:' \
+    || flag11 "✗ HARNESS: the scanner verdicts \`let _ = guarded_remove(..)\` as anything but GUARDED — the discarded-result rule must apply to the PREDICATE (is_protected_evidence), never to the guarded ACTION"
+  # …and it must NOT cry wolf on a method call or a fn DEFINITION, or the
+  # widened matcher would flood the frozen manifest and get switched off.
+  printf 'fn q(x: &X) {\n    x.remove_file();\n    guarded_remove_file(x);\n}\nfn remove_file(p: &Path) {}\n' > "$ev_probe"
+  if awk -f "$ev_scan" "$ev_probe" | grep -q ':'; then
+    flag11 "✗ HARNESS: the widened removal matcher fires on \`self.remove_file()\`, \`guarded_remove_file()\` or a \`fn remove_file\` DEFINITION — it would classify half the tree and the check would be abandoned"
+  fi
+  rm -f "$ev_probe"
+
   ev_files="$(mktemp "${TMPDIR:-/tmp}/ev_files.XXXXXX")"
   ev_raw="$(mktemp "${TMPDIR:-/tmp}/ev_raw.XXXXXX")"
   ev_cur="$(mktemp "${TMPDIR:-/tmp}/ev_cur.XXXXXX")"
@@ -1411,12 +1459,18 @@ else
     # comments and strings before matching, so its GUARDED verdict means the
     # call is real code.
     if ! grep -q '^crates/aberp-snapshot/src/retention.rs:prune:GUARDED:' "$ev_raw"; then
-      flag11 "✗ retention::prune does not CONSULT is_protected_evidence (scanner verdict, comment-aware) — the pruner's blindness to evidence must be a DELIBERATE refusal, not a structural accident (ADR-0116 D2.3)"
+      flag11 "✗ retention::prune does not CONSULT is_protected_evidence (scanner verdict, comment-aware, LIVENESS-aware) — the pruner's blindness to evidence must be a DELIBERATE refusal, not a structural accident (ADR-0116 D2.3)"
+    fi
+    # 11e — no guard anywhere may be dead by construction (ADR-0116 F7 / M1).
+    ev_dead="$(grep ':DEAD_GUARD:' "$ev_raw" || true)"
+    if [[ -n "$ev_dead" ]]; then
+      flag11 "✗ an ADR-0116 D2 guard is PRESENT but DEAD — short-circuited by a boolean literal, or its result discarded. A guard that cannot refuse is worse than no guard: its presence is what stops anyone looking. Fix the guard, never this check:"
+      printf '%s\n' "$ev_dead" | sed 's/^/      /'
     fi
     # 11c — liveness. A scanner that emits nothing makes 11b vacuously green.
     # The tree has ~30 removal sites across the three classes; require the
     # classification to be non-trivial so "no violations" cannot mean "no scan".
-    ev_total="$(grep -c ':\(GUARDED\|TENANT_HOME\|OTHER\):' "$ev_raw" || true)"
+    ev_total="$(grep -c ':\(GUARDED\|DEAD_GUARD\|TENANT_HOME\|OTHER\):' "$ev_raw" || true)"
     ev_guarded="$(grep -c ':GUARDED:' "$ev_raw" || true)"
     if [[ "${ev_total:-0}" -lt 15 ]]; then
       flag11 "✗ HARNESS: only ${ev_total:-0} removal sites classified across the workspace — the corpus or the scanner is broken, so a green CHECK 11b means nothing"

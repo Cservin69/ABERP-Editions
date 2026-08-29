@@ -43,6 +43,29 @@ crates/aberp-snapshot/src/recover.rs:build_and_validate
 # has no Handle and its export connection is the only opener in the process.
 crates/aberp-snapshot/src/take.rs:take_snapshot_with
 #
+# ── SANCTIONED SERVE-IS-PROVEN-STOPPED SEAM (ADR-0116 D3.4 rev 2) ───────────
+# `rebuild_mirror_for_restored_db` writes the FRESH `<db>.audit.log` for a
+# database that `restore --in-place` has just installed. It is the strictest
+# provenance in this file, not the weakest:
+#
+#   * it is reachable ONLY from `restore_in_place`, whose caller
+#     (`aberp::snapshot::run_restore_in_place`) refuses to proceed unless
+#     `ensure_serve_is_stopped` takes DuckDB's own EXCLUSIVE file lock — and
+#     re-asserts it at the commit point, so a serve started during the
+#     pre-flight cannot slip through. There is provably no other writer;
+#   * it is a separate process from `aberp serve` with no shared Handle to
+#     route through, the same reason `emit_reopen_cli` is listed above;
+#   * it reaches `ensure_consistent_with_db` with NO mirror at the live path
+#     (the preserve step moved it into the `.PRE-RESTORE-` unit), so it takes
+#     the `Created` branch and writes `[1..=db_max_seq]` from the DB under the
+#     mirror's own flock. It is the SAME entry point serve boot uses, so the
+#     mirror it leaves is the one boot would have produced.
+#
+# It exists because leaving the pre-rollback mirror at the live path made
+# `aberp serve` refuse to boot after every backwards in-place restore
+# (`MirrorDivergedFromDb` -> `RefuseFatal`).
+crates/aberp-snapshot/src/take.rs:rebuild_mirror_for_restored_db
+#
 # ── INSIDE THE DURABILITY CORE / THE PRIMITIVES THEMSELVES ──────────────────
 # `WriteGuard::drop` IS the lockstep mirror sync, running with the writer mutex
 # held. `emit_poison_recovery_audit` runs under the same held mutex on a

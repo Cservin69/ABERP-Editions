@@ -75,8 +75,8 @@ pub use store::{
 };
 pub use take::{
     ensure_not_prod_path, ensure_restore_allowed, restore_in_place, restore_into, take_snapshot,
-    take_snapshot_with, validate_export, InPlaceRestoreReport, MirrorReconcile, PreservedUnit,
-    ValidationReport,
+    take_snapshot_with, validate_export, validate_installed_db, InPlaceRestoreReport,
+    MirrorReconcile, PreservedUnit, ValidationReport,
 };
 
 /// Typed error surface for the snapshot subsystem. Library crate → no
@@ -132,6 +132,26 @@ pub enum SnapshotError {
         count: usize,
         candidates: String,
     },
+
+    /// **ADR-0116 F2** — the in-place restore installed a file that does not
+    /// verify, or does not match the snapshot it came from. The previous
+    /// database is intact inside the named `.PRE-RESTORE-` unit.
+    #[error(
+        "the IN-PLACE restore installed {db} but it failed re-verification: {detail}. The \
+         previous database is intact at {preserved} (with its .wal, .ckpt-ok and .audit.log \
+         siblings) — move the unit back to recover it"
+    )]
+    InstalledVerifyFailed {
+        db: PathBuf,
+        preserved: String,
+        detail: String,
+    },
+
+    /// **ADR-0116 D3.4** — a fresh audit mirror could not be written for the
+    /// restored chain. Non-fatal at the call site (an absent mirror is what
+    /// the boot path creates), carried as a typed error for the log line.
+    #[error("could not rebuild the audit mirror for the restored database: {0}")]
+    MirrorRebuildFailed(String),
 }
 
 impl SnapshotError {

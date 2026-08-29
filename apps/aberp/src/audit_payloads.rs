@@ -5542,6 +5542,9 @@ mod tests {
             snapshot_dir: "/snaps/snap-7".into(),
             target: "/tmp/recovery/aberp.duckdb".into(),
             restored_at: "2026-06-15T19:00:00Z".into(),
+            anchor_verdict: "no-anchors-at-all".into(),
+            anchor_coverage: "0 rows, NONE verified".into(),
+            discarded_audit_rows: Some(7),
         };
         assert!(serde_json::from_slice::<serde_json::Value>(&restored.to_bytes()).is_ok());
 
@@ -5631,12 +5634,51 @@ impl SnapshotValidationFailedPayload {
 }
 
 /// Payload for [`aberp_audit_ledger::EventKind::SnapshotRestored`].
+///
+/// # ADR-0116 D4 — the restored chain carries what it was restored UNDER
+///
+/// The Defense anchor sanction is deliberately three-way (refuse on a real
+/// gap, warn loudly when anchoring has not rolled out at all, warn on a
+/// pre-D4 snapshot whose coverage was never recorded). Before this revision
+/// the two warning arms produced a `tracing::warn!` on stderr and **nothing
+/// else** — no acknowledgement, and no record on the restored database itself.
+/// "This chain had no timestamp coverage at restore time" is precisely the
+/// fact a court would ask about, and it existed only in a log line nobody
+/// keeps.
+///
+/// So the verdict rides on the row. Same reasoning for `discarded_audit_rows`:
+/// a `--accept-data-loss` restore threw away committed audit history, and the
+/// only durable record of how much was shell history.
+///
+/// The three new fields are `#[serde(default)]` so rows written before this
+/// revision still deserialize (they carry no anchor verdict, which reads back
+/// as `"not-recorded"`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotRestoredPayload {
     pub seq: u64,
     pub snapshot_dir: String,
     pub target: String,
     pub restored_at: String,
+    /// ADR-0116 D4 — the anchor verdict this restore proceeded under:
+    /// `full-coverage` | `short-coverage` | `no-anchors-at-all` |
+    /// `not-recorded`.
+    #[serde(default = "anchor_verdict_unknown")]
+    pub anchor_verdict: String,
+    /// Human rendering of the same coverage (`describe_anchors`), e.g.
+    /// `"0 rows, NONE verified"`.
+    #[serde(default)]
+    pub anchor_coverage: String,
+    /// ADR-0116 D3.3 — committed audit entries this restore DISCARDED.
+    /// `None` = the live head could not be read, so the amount is UNKNOWN —
+    /// never the same statement as zero.
+    #[serde(default)]
+    pub discarded_audit_rows: Option<u64>,
+}
+
+/// Pre-D4 `snapshot.restored` rows carry no anchor verdict; that is
+/// "not-recorded", never "no anchors".
+fn anchor_verdict_unknown() -> String {
+    "not-recorded".to_string()
 }
 
 impl SnapshotRestoredPayload {

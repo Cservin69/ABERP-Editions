@@ -1002,6 +1002,33 @@ pub struct ServeArgs {
     /// matter to the SPA.
     #[arg(long, default_value_t = 0)]
     pub port: u16,
+
+    /// **ADR-0116 D3.4** — run the DB-side boot preconditions and EXIT,
+    /// without binding a port or reading the OS keychain.
+    ///
+    /// Boot has two halves. The second (session token, NAV credentials, TLS
+    /// cert, listener) is about talking to the outside world and is unaffected
+    /// by what is in the database. The FIRST — open the tenant DB, ensure the
+    /// schema, reconcile the `<db>.audit.log` mirror against it and route the
+    /// result through `boot_mirror_route` — is the half a restore can break,
+    /// and it is the half that decides whether `aberp serve` starts at all.
+    ///
+    /// This flag runs exactly that half, through the real `serve::run`, and
+    /// exits 0 if serve would go on to bind or non-zero with serve's own
+    /// refusal message if it would not. It exists because the alternative for
+    /// a gate is spawning a real `aberp serve`, which reads the operator's
+    /// actual OS keychain (the test bypass is compiled out of every
+    /// `--features production` build) and may block on an ACL prompt — so the
+    /// customer-journey e2e could not walk the one step an operator cannot
+    /// skip.
+    ///
+    /// It is NOT a health check for a running server and starts nothing. Run
+    /// against a tenant whose `aberp serve` is up, it fails on DuckDB's
+    /// exclusive file lock exactly as a second `serve` would — which is the
+    /// safe direction (ADR-0098's two-instance hazard is refused, never
+    /// raced), but it means a green boot-check also tells you serve is stopped.
+    #[arg(long, default_value_t = false)]
+    pub boot_check: bool,
 }
 
 #[derive(Debug, Parser)]

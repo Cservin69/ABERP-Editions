@@ -451,14 +451,56 @@ pub fn take_snapshot_with(
     };
     write_meta(&partial_dir, &meta)?;
 
+    // ── ADR-0116 D1 / F6 — make the snapshot DURABLE before it is visible ──
+    //
+    // This path had **no `fsync` at all**: `EXPORT DATABASE` wrote the parquet
+    // files, `schema.sql`, `load.sql` and `meta.json` through the page cache,
+    // and the finalize rename made the directory visible immediately. After a
+    // power cut a snapshot directory could therefore be present and complete
+    // by name while its parquet bytes had never reached the device — and
+    // `meta.json` would still say `valid: true`, because validation ran
+    // against the page cache that the crash discarded.
+    //
+    // That is the exact defect D3.1 fixed on the RESTORE install path, on the
+    // argument that "the path whose entire job is producing a trustworthy
+    // database after a durability incident was itself not crash-safe". It is
+    // sharper here: this is the path that PRODUCES the artefact the whole
+    // feature exists to create, and the one event most likely to make you need
+    // a snapshot is the one that can tear it.
+    //
+    // The recipe is `crash_safe::atomic_install`'s, generalised to a directory:
+    // every file durable, then the directory that indexes them, then the
+    // rename, then the store directory that indexes THAT. Ordering is the
+    // whole point — a rename made durable before its contents would publish a
+    // name for bytes that are not there.
+    fsync_export_dir(&partial_dir)?;
+
     // Atomic finalize: the snapshot only becomes visible to listing/seq
     // derivation once it is whole.
     std::fs::rename(&partial_dir, &final_dir).map_err(|e| SnapshotError::io(&final_dir, e))?;
+    crate::crash_safe::fsync_dir(store_dir)?;
 
     Ok(SnapshotRecord {
         dir: final_dir,
         meta,
     })
+}
+
+/// `fsync` every regular file directly inside `dir`, then `dir` itself.
+///
+/// The export is flat (one parquet per table + `schema.sql` + `load.sql` +
+/// `meta.json`), so a single non-recursive pass covers it — the same shape
+/// [`dir_size`] already assumes. A file that vanishes between the `read_dir`
+/// and the open is not an error: nothing else writes into a `.partial` we own.
+fn fsync_export_dir(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir).map_err(|e| SnapshotError::io(dir, e))? {
+        let entry = entry.map_err(|e| SnapshotError::io(dir, e))?;
+        let meta = entry.metadata().map_err(|e| SnapshotError::io(dir, e))?;
+        if meta.is_file() {
+            crate::crash_safe::fsync_file(&entry.path())?;
+        }
+    }
+    crate::crash_safe::fsync_dir(dir)
 }
 
 /// Guard executed BEFORE any restore touches disk. The safety lives here,
@@ -672,6 +714,13 @@ pub struct PreservedUnit {
     pub wal: Option<PathBuf>,
     /// `<db>.ckpt-ok.PRE-RESTORE-<tag>`, when a marker existed.
     pub ckpt_ok: Option<PathBuf>,
+    /// **ADR-0116 D3.4 rev 2** — `<db>.PRE-RESTORE-<tag>.audit.log`, the audit
+    /// mirror as it stood before the rollback, when one existed.
+    ///
+    /// Named off the PRESERVED path (like the WAL and the marker), so
+    /// `mirror_path_for(&preserved.db)` finds it and the preserved unit is a
+    /// complete, self-consistent DB+WAL+marker+mirror group.
+    pub mirror: Option<PathBuf>,
     /// The `PRE-RESTORE-<tag>` suffix itself.
     pub tag: String,
 }
@@ -681,8 +730,20 @@ pub struct PreservedUnit {
 pub struct InPlaceRestoreReport {
     /// The `.PRE-RESTORE-` unit the previous database was moved into.
     pub preserved: PreservedUnit,
-    /// Validation of the installed file, re-run after the install.
+    /// **ADR-0116 F2** — validation of the **installed database file**,
+    /// re-read from `db_path` after the install.
+    ///
+    /// This used to be a second call to `validate_export(export_dir)` — a pure
+    /// function of the export directory that never mentions `db_path` — so the
+    /// line the CLI prints as `re-verified` was byte-identical to the
+    /// pre-install validation and still reported `ok` after the installed file
+    /// was overwritten with garbage. It now opens the file that is actually on
+    /// disk. See [`validate_installed_db`].
     pub installed: ValidationReport,
+    /// **ADR-0116 D3.4 rev 2** — entries written into the FRESH mirror built
+    /// from the restored chain, or `None` if that rebuild failed (in which
+    /// case the live path has no mirror and the next boot creates one).
+    pub mirror_entries_written: Option<u64>,
 }
 
 /// **ADR-0116 D3.4 — the guarded in-place restore that replaces the hand-swap.**
@@ -700,12 +761,47 @@ pub struct InPlaceRestoreReport {
 ///    mandatory pre-restore snapshot (both live in the app layer, which owns
 ///    the lock and the ledger);
 /// 2. **move the current DB aside as `.PRE-RESTORE-<tag>` — as ONE UNIT:
-///    `aberp.duckdb` + `aberp.duckdb.wal` + `aberp.duckdb.ckpt-ok`.**
-/// 3. **the `.audit.log` mirror does NOT move.** It is the durable record and
-///    stays at the live path.
-/// 4. install via [`restore_into`] (WAL deleted first, then `atomic_install`);
-/// 5. write a fresh `.ckpt-ok` marker for the installed file;
-/// 6. re-verify the installed file and return the report.
+///    `aberp.duckdb` + `aberp.duckdb.wal` + `aberp.duckdb.ckpt-ok` +
+///    `aberp.duckdb.audit.log`.**
+/// 3. install via [`restore_into`] (WAL deleted first, then `atomic_install`);
+/// 4. write a fresh `.ckpt-ok` marker for the installed file;
+/// 5. re-verify the INSTALLED FILE (not the export — see [`validate_installed_db`]);
+/// 6. write a FRESH mirror matching the restored chain.
+///
+/// # Why the mirror moves too (the rev-2 blocker)
+///
+/// Steps 2 and 3 read the other way round until this revision: *"the
+/// `.audit.log` mirror does NOT move. It is the durable record and stays at
+/// the live path."* That rule is right in general and **wrong once the
+/// operator has acknowledged that the mirror's tail is not to be replayed**,
+/// and leaving it in place made this command's headline case a no-op across a
+/// restart:
+///
+/// After a BACKWARDS rollback the mirror still holds the tail the operator
+/// discarded, and the app layer then appends `SnapshotRestored` at the next
+/// seq on the RESTORED chain — a seq the mirror already holds with a different
+/// entry. At the next boot `ensure_consistent_with_db` reports
+/// `MirrorDivergedFromDb`, `serve.rs::boot_mirror_route` classifies that as
+/// `RefuseFatal`, and **`aberp serve` does not start**. The only way out was
+/// the hand-reconciliation this command exists to eliminate. Reproduced end to
+/// end through the shipped binary (adversarial review §1, `adv_b6`).
+///
+/// The premise the old rule rested on has also changed: `boot_mirror_route`'s
+/// comment says *"a mirror that disagrees with the DB is the fingerprint of a
+/// torn-write / lost DB commit"*. Since D3.4 it is **also** the fingerprint of
+/// a deliberate, acknowledged rollback, and the two are indistinguishable on
+/// disk. Rather than teach boot to tell them apart from a marker file — a
+/// second source of truth that can be lost, forged, or left behind — the
+/// restore removes the ambiguity at the point where the decision is actually
+/// made: the discarded tail becomes **protected evidence at its new name**
+/// (`is_protected_evidence` covers the whole `.PRE-RESTORE-` unit), and boot is
+/// left with a DB and a mirror that agree.
+///
+/// A fresh mirror is written from the restored DB inside this same operation
+/// (step 6), so there is no window where the live path carries a database and
+/// no durable record of its chain. If that write fails it is logged and NOT
+/// fatal: an ABSENT mirror is the one disagreement the boot path resolves
+/// safely on its own (`RecoveryAction::Created`).
 ///
 /// # Why the WAL moves with it (F4)
 ///
@@ -748,8 +844,9 @@ pub fn restore_in_place(
     let suffix = format!("PRE-RESTORE-{tag}");
     let db_wal = wal_sibling(db_path);
     let db_ckpt = crate::crash_safe::marker_path(db_path);
+    let db_mirror = mirror_path_for(db_path);
 
-    // ── Step 2/3 — move DB + .wal + .ckpt-ok as ONE unit; mirror stays ──
+    // ── Step 2 — move DB + .wal + .ckpt-ok + .audit.log as ONE unit ─────
     //
     // **The siblings are named off the PRESERVED path, not suffixed in place.**
     // `<db>.PRE-RESTORE-<tag>` + `<db>.PRE-RESTORE-<tag>.wal`, NOT
@@ -787,20 +884,25 @@ pub fn restore_in_place(
     let preserved_wal = match move_aside_to(&db_wal, &wal_sibling(&preserved_db)) {
         Ok(w) => w,
         Err(e) => {
-            // Put the DB back. Leaving it moved would strand the live path
-            // with a WAL and no database — the torn preserve in the other
-            // direction.
-            if let Err(rollback) = std::fs::rename(&preserved_db, db_path) {
-                tracing::error!(
-                    error = %rollback,
-                    preserved = %preserved_db.display(),
-                    db = %db_path.display(),
-                    "ADR-0116 D3.4 — the pre-restore WAL move FAILED and the database could \
-                     not be rolled back. The live path now has a WAL and no database; the \
-                     database is at the preserved path. Move it back BY HAND before doing \
-                     anything else — the two belong together."
-                );
-            }
+            roll_preserve_back(&preserved_db, db_path, None, "WAL");
+            return Err(e);
+        }
+    };
+    // The MIRROR follows the WAL, for the reason the WAL follows the DB: it is
+    // moved only once the point of no return is behind us, and a failure here
+    // rolls the whole unit back so a failed preserve leaves the live path
+    // EXACTLY as it was. The mirror is half the audit ledger — a live database
+    // stranded without it, or with it, while the restore aborted would be a
+    // torn preserve in the one place the tree cannot tolerate one.
+    let preserved_mirror = match move_aside_to(&db_mirror, &mirror_path_for(&preserved_db)) {
+        Ok(m) => m,
+        Err(e) => {
+            roll_preserve_back(
+                &preserved_db,
+                db_path,
+                preserved_wal.as_deref(),
+                "audit mirror",
+            );
             return Err(e);
         }
     };
@@ -824,6 +926,7 @@ pub fn restore_in_place(
         db: preserved_db.clone(),
         wal: preserved_wal,
         ckpt_ok: preserved_ckpt,
+        mirror: preserved_mirror,
         tag: suffix.clone(),
     };
     if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -838,15 +941,18 @@ pub fn restore_in_place(
         preserved_db = %preserved.db.display(),
         preserved_wal = ?preserved.wal.as_ref().map(|p| p.display().to_string()),
         preserved_ckpt = ?preserved.ckpt_ok.as_ref().map(|p| p.display().to_string()),
+        preserved_mirror = ?preserved.mirror.as_ref().map(|p| p.display().to_string()),
         "ADR-0116 D3.4 — live database moved aside as PRE-RESTORE evidence (DB + WAL + \
-         checkpoint marker as one unit). The .audit.log mirror is deliberately NOT moved: \
-         it is the durable record and stays at the live path."
+         checkpoint marker + audit mirror as one unit). The mirror moves WITH the database \
+         it belongs to: after an acknowledged backwards rollback its tail is exactly what \
+         the operator discarded, and leaving it at the live path made the next `aberp serve` \
+         boot refuse with MirrorDivergedFromDb. It is protected evidence at its new name."
     );
 
-    // ── Step 4 — install ────────────────────────────────────────────────
+    // ── Step 3 — install ────────────────────────────────────────────────
     restore_into(export_dir, db_path, tenant)?;
 
-    // ── Step 5 — a fresh marker for the file that is actually there ─────
+    // ── Step 4 — a fresh marker for the file that is actually there ─────
     //
     // Without this, the restored file sits beside a marker describing the OLD
     // one. `checkpoint_is_current` then returns false on the SHA mismatch, so
@@ -866,12 +972,212 @@ pub fn restore_in_place(
         }
     }
 
-    // ── Step 6 — re-verify what is now on disk ──────────────────────────
-    let installed = validate_export(export_dir, tenant);
+    // ── Step 5 — re-verify what is now ON DISK, not what we imported ────
+    //
+    // ADR-0116 F2 — this used to be a second `validate_export(export_dir)`
+    // call: the identical pure function of the export directory that produced
+    // `pre` twenty lines above, with no reference to `db_path` at all. The
+    // numbers the CLI prints as `re-verified` were therefore the SNAPSHOT's,
+    // re-derived, and they still came back `ok` after the installed database
+    // was overwritten with `b"not a duckdb file at all"`.
+    let installed = validate_installed_db(db_path, tenant);
+    if !installed.ok {
+        return Err(SnapshotError::InstalledVerifyFailed {
+            db: db_path.to_path_buf(),
+            preserved: preserved.db.display().to_string(),
+            detail: installed
+                .error
+                .unwrap_or_else(|| "installed database failed verification".to_string()),
+        });
+    }
+    // A parity mismatch is as damning as an unopenable file: the install
+    // succeeded mechanically but did not produce the snapshot's content.
+    if (
+        installed.invoice_count,
+        installed.audit_count,
+        installed.chain_len,
+    ) != (pre.invoice_count, pre.audit_count, pre.chain_len)
+    {
+        return Err(SnapshotError::InstalledVerifyFailed {
+            db: db_path.to_path_buf(),
+            preserved: preserved.db.display().to_string(),
+            detail: format!(
+                "the installed database does not match the snapshot it was restored from: \
+                 installed invoices={} audit_rows={} chain={} but the snapshot carries \
+                 invoices={} audit_rows={} chain={}",
+                installed.invoice_count,
+                installed.audit_count,
+                installed.chain_len,
+                pre.invoice_count,
+                pre.audit_count,
+                pre.chain_len,
+            ),
+        });
+    }
+
+    // ── Step 6 — a FRESH mirror for the RESTORED chain ──────────────────
+    //
+    // The blocker this revision closes. See the rev-2 note on this function.
+    // Best-effort by design: an ABSENT mirror is the ONE disagreement the boot
+    // path resolves safely by itself (`RecoveryAction::Created` rebuilds it
+    // from the DB), so a failure here degrades to "the next boot writes it",
+    // never to "the next boot refuses".
+    let mirror_entries_written = match rebuild_mirror_for_restored_db(db_path) {
+        Ok(n) => {
+            tracing::info!(
+                db = %db_path.display(),
+                entries = n,
+                "ADR-0116 D3.4 — wrote a FRESH audit mirror matching the restored chain; the \
+                 pre-rollback mirror is preserved inside the PRE-RESTORE unit"
+            );
+            Some(n)
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                db = %db_path.display(),
+                "ADR-0116 D3.4 — could not write a fresh audit mirror for the restored \
+                 database. The restore itself is durable and the live path now has NO mirror, \
+                 which the next boot creates from the DB (RecoveryAction::Created). Nothing \
+                 needs to be done by hand."
+            );
+            None
+        }
+    };
+
     Ok(InPlaceRestoreReport {
         preserved,
         installed,
+        mirror_entries_written,
     })
+}
+
+/// Undo a partially-completed preserve so a failure leaves the live path
+/// EXACTLY as it was. The reverse renames are the same operations that just
+/// succeeded in the forward direction, so they fail only under a filesystem
+/// fault — which is why the failure to roll back is the loud one.
+fn roll_preserve_back(
+    preserved_db: &Path,
+    db_path: &Path,
+    preserved_wal: Option<&Path>,
+    what: &str,
+) {
+    if let Some(w) = preserved_wal {
+        if let Err(e) = std::fs::rename(w, wal_sibling(db_path)) {
+            tracing::error!(error = %e, wal = %w.display(), "ADR-0116 D3.4 — could not roll the preserved WAL back");
+        }
+    }
+    if let Err(rollback) = std::fs::rename(preserved_db, db_path) {
+        tracing::error!(
+            error = %rollback,
+            failed_step = what,
+            preserved = %preserved_db.display(),
+            db = %db_path.display(),
+            "ADR-0116 D3.4 — the pre-restore {what} move FAILED and the database could not be \
+             rolled back. The live path has no database; the database is at the preserved \
+             path. Move it back BY HAND before doing anything else — the unit belongs together."
+        );
+    }
+}
+
+/// **ADR-0116 F2** — validate the database file that is actually at
+/// `db_path`, as opposed to the export directory it was built from.
+///
+/// Same smoke set as [`validate_export`] (invoice count, `audit_ledger`
+/// count, ADR-0008 chain verification from genesis, anchor coverage) run
+/// against the real file, so an install that produced an unopenable or
+/// wrong-content database is caught by the step whose name claims to check it.
+///
+/// The connection carries `PRAGMA disable_checkpoint_on_shutdown` for the
+/// ADR-0098 C2 reason every opener in this tree does: a plain read-write
+/// connection's drop folds the on-disk WAL in place. Verification must not be
+/// able to write to the thing it verifies.
+pub fn validate_installed_db(db_path: &Path, tenant: &str) -> ValidationReport {
+    let tenant_id = match TenantId::new(tenant.to_string()) {
+        Some(t) => t,
+        None => return fail(format!("invalid tenant id {tenant:?}")),
+    };
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return fail(format!(
+                "open installed database {}: {e}",
+                db_path.display()
+            ))
+        }
+    };
+    if let Err(e) = conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;") {
+        return fail(format!("installed database is not usable: {e}"));
+    }
+    let invoice_count: i64 = conn
+        .query_row("SELECT count(*) FROM invoice", [], |r| r.get(0))
+        .unwrap_or(-1);
+    let audit_count: i64 =
+        match conn.query_row("SELECT count(*) FROM audit_ledger", [], |r| r.get(0)) {
+            Ok(n) => n,
+            Err(e) => return fail(format!("audit_ledger unreadable in the installed DB: {e}")),
+        };
+    let ledger = Ledger::from_connection(conn, tenant_id, BinaryHash::from_bytes([0u8; 32]));
+    let (anchor_count, anchored_through_seq) = anchor_coverage(&ledger);
+    match ledger.verify_chain() {
+        Ok(chain_len) => ValidationReport {
+            ok: true,
+            invoice_count,
+            audit_count,
+            chain_len,
+            error: None,
+            anchor_count,
+            anchored_through_seq,
+        },
+        Err(e) => ValidationReport {
+            ok: false,
+            invoice_count,
+            audit_count,
+            chain_len: 0,
+            error: Some(format!(
+                "hash-chain verification failed on the INSTALLED database: {e}"
+            )),
+            anchor_count,
+            anchored_through_seq,
+        },
+    }
+}
+
+/// **ADR-0116 D3.4 rev 2** — write a fresh `<db>.audit.log` for the restored
+/// database, replacing the one that moved into the PRE-RESTORE unit.
+///
+/// Reaches [`ensure_consistent_with_db`] with NO mirror at the live path, which
+/// is its `Created` branch: `rebuild_mirror_from_db_locked` writes
+/// `[1..=db_max_seq]` from the DB and `fsync`s the file under its own lock. It
+/// is deliberately the same entry point the boot path uses, so the mirror this
+/// leaves behind is byte-for-byte the one boot would have produced.
+///
+/// SANCTIONED NON-SHARED WRITER (cut-gate CHECK 10P residual). This opens the
+/// tenant DB independently, but it can only run inside `restore --in-place`,
+/// which has already PROVEN `aberp serve` is stopped by taking DuckDB's own
+/// exclusive file lock and re-asserting it at the commit point. There is no
+/// shared `Handle` in that process to route through.
+fn rebuild_mirror_for_restored_db(db_path: &Path) -> Result<u64> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")?;
+    let mirror_path = mirror_path_for(db_path);
+    match ensure_consistent_with_db(&conn, &mirror_path) {
+        Ok(aberp_audit_ledger::RecoveryAction::Created { entries_written }) => Ok(entries_written),
+        // Anything other than `Created` means a mirror was already at the live
+        // path — which cannot happen after a successful preserve, so it is
+        // reported rather than silently accepted.
+        Ok(other) => {
+            tracing::warn!(
+                ?other,
+                mirror = %mirror_path.display(),
+                "ADR-0116 D3.4 — the post-restore mirror rebuild found an EXISTING mirror at \
+                 the live path. The preserve step should have moved it; the reconcile result \
+                 is reported as-is."
+            );
+            Ok(0)
+        }
+        Err(e) => Err(SnapshotError::MirrorRebuildFailed(e.to_string())),
+    }
 }
 
 /// `<path>.<suffix>` — appends to the FULL filename, so

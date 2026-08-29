@@ -179,7 +179,7 @@ pub(crate) fn wal_fence_violated(before: WalFence, now: WalFence) -> bool {
 }
 
 /// `fsync` a regular file's contents + metadata to disk.
-fn fsync_file(path: &Path) -> Result<()> {
+pub(crate) fn fsync_file(path: &Path) -> Result<()> {
     let f = std::fs::File::open(path).map_err(|e| SnapshotError::io(path, e))?;
     f.sync_all().map_err(|e| SnapshotError::io(path, e))
 }
@@ -189,7 +189,7 @@ fn fsync_file(path: &Path) -> Result<()> {
 /// way to persist a directory entry change. A platform that refuses to
 /// open a directory (rare) is a soft failure: the rename already happened,
 /// so we log and continue rather than fail the whole checkpoint.
-fn fsync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
     match std::fs::File::open(dir) {
         Ok(f) => f.sync_all().map_err(|e| SnapshotError::io(dir, e)),
         Err(e) => {

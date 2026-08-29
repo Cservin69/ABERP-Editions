@@ -254,11 +254,39 @@ pub fn snapshot_identity(meta: &SnapshotMeta) -> String {
 ///
 ///   1. the full directory name — `snap-42-20260615-143000` (always unique
 ///      on a filesystem, so this is the form to prefer);
-///   2. the stable identity token from [`snapshot_identity`] — `42@<ts>#<sha8>`
-///      — or any unambiguous prefix of it;
-///   3. a bare `seq` — **ambiguous after a prune**, so this refuses whenever
-///      two records share the seq;
-///   4. a timestamp substring.
+///   2. a bare `seq`, matched EXACTLY — **ambiguous after a prune**, so this
+///      refuses whenever two records share the seq;
+///   3. the stable identity token from [`snapshot_identity`] — `42@<ts>#<sha8>`
+///      — or any unambiguous prefix of it **that reaches the `@`**;
+///   4. a timestamp / directory-name substring — for NON-numeric selectors
+///      only (see below).
+///
+/// # ADR-0116 F3 — why the bare seq is tried BEFORE the identity prefix
+///
+/// The identity is `<seq>@<ts>#<sha8>`, so an identity *prefix* match on the
+/// bare string `"2"` also matches seq **24**'s identity — and the identity form
+/// used to be tried first. Two consequences, both reproduced:
+///
+///   * a store holding only seq 24 resolved `--snapshot 2` to **seq 24** and
+///     overwrote the live database from a snapshot the operator never named.
+///     Seq 2 does not exist; the correct answer is `NotFound`.
+///   * a store holding seqs 2 **and** 24 REFUSED `--snapshot 2` as ambiguous,
+///     even though seq 2 is unique — so the documented bare-seq form stopped
+///     working the moment a store grew past seq 9.
+///
+/// Both are closed by ordering the exact form first and by requiring a prefix
+/// to reach the `@` separator before it may match: a bare number is a seq, and
+/// an identity prefix has to look like one.
+///
+/// The same reasoning ends the search there. A bare integer that names no seq
+/// would otherwise fall through to the SUBSTRING form and match
+/// `snap-24-20260615-143000` on the digit `2` — the identical defect one form
+/// further down. **A selector that parses as an integer is a seq and only a
+/// seq**; a date is addressed with the directory name or a hyphenated
+/// fragment (`-20260615-`), both of which are non-numeric and still reach
+/// form 4. Refusing a numeric selector that names nothing is the safe
+/// direction: the alternative is overwriting a live database from a snapshot
+/// the operator did not name.
 ///
 /// A form that matches nothing falls through to the next; a form that matches
 /// several returns [`SnapshotError::AmbiguousSelector`] naming every
@@ -280,21 +308,32 @@ pub fn resolve_selector_in(records: &[SnapshotRecord], selector: &str) -> Result
         return Ok(one);
     }
 
-    // (2) the stable identity token (or a prefix of it).
-    let by_identity: Vec<&SnapshotRecord> = records
-        .iter()
-        .filter(|r| snapshot_identity(&r.meta).starts_with(selector))
-        .collect();
-    if let Some(one) = pick_one(&by_identity, selector)? {
-        return Ok(one);
-    }
-
-    // (3) a bare seq — the recycled-identity trap. Two records CAN share it.
+    // (2) a bare seq, EXACTLY — the recycled-identity trap. Two records CAN
+    //     share it, and `pick_one` refuses rather than guessing. Tried before
+    //     the identity prefix (ADR-0116 F3): `"2"` is a seq, not the first
+    //     character of seq 24's identity.
     if let Ok(seq) = selector.parse::<u64>() {
         let by_seq: Vec<&SnapshotRecord> = records.iter().filter(|r| r.meta.seq == seq).collect();
         if let Some(one) = pick_one(&by_seq, selector)? {
             return Ok(one);
         }
+        // A bare number that names no snapshot must NOT fall through to the
+        // identity-prefix form, which would silently resolve it to a
+        // higher-seq snapshot whose identity happens to start with those
+        // digits. Nothing below can legitimately match a bare integer.
+        return Err(SnapshotError::NotFound(selector.to_string()));
+    }
+
+    // (3) the stable identity token, or a prefix of it that REACHES the `@`.
+    //     A prefix shorter than `<seq>@` is just a number with a different
+    //     name, and matching it here is what let `--snapshot 2` resolve to
+    //     seq 24 (ADR-0116 F3).
+    let by_identity: Vec<&SnapshotRecord> = records
+        .iter()
+        .filter(|r| selector.contains('@') && snapshot_identity(&r.meta).starts_with(selector))
+        .collect();
+    if let Some(one) = pick_one(&by_identity, selector)? {
+        return Ok(one);
     }
 
     // (4) a timestamp / directory-name substring.

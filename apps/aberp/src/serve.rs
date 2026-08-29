@@ -1183,7 +1183,14 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     tracing::info!(
         "boot step: reading session token from OS keychain (may prompt for keychain access)"
     );
-    let session_token = {
+    // ADR-0116 D3.4 — `--boot-check` never binds a listener, so it needs no
+    // bearer token and must not touch the OS keychain (which can block on an
+    // ACL prompt after any rebuild, and whose test bypass is compiled out of
+    // every `--features production` build). The value is never read: the
+    // boot-check returns before `AppState` is built.
+    let session_token = if args.boot_check {
+        String::new()
+    } else {
         let _s = tracing::info_span!("serve.session_token").entered();
         load_or_create_session_token(&args.tenant)?
     };
@@ -1223,7 +1230,13 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // NAV credentials are loaded (none exist), the seller-identity gate is
     // optional (handled at seller-save time), and the SPA — seeing a Ready
     // handshake — mounts the dashboard, never the setup wizard.
-    let initial_boot_state = if !nav_enabled {
+    let initial_boot_state = if args.boot_check {
+        // Same reason as the session token above: no listener, no handshake,
+        // no keychain. The state is never observed.
+        ServeBootState::Ready {
+            operator_login: "boot-check".to_string(),
+        }
+    } else if !nav_enabled {
         tracing::info!(
             tenant = %args.tenant,
             "boot step: NAV synchron OFF for this tenant — skipping keychain + §169 seller gate, \
@@ -1910,6 +1923,30 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 }
             }
         }
+    }
+
+    // ── ADR-0116 D3.4 — `--boot-check` stops HERE, deliberately ─────────
+    //
+    // Everything above is the half of boot a restore can break: the tenant DB
+    // opened, the audit-ledger schema ensured, the `<db>.audit.log` mirror
+    // reconciled against it and routed through `boot_mirror_route`. If that
+    // block was going to refuse, it has already returned `Err` with the same
+    // context a real boot produces — so an exit code here is serve's own
+    // verdict on the database, not a re-implementation of it.
+    //
+    // Everything BELOW is about talking to the outside world (registry
+    // self-heal, TLS cert, listener, daemons) and is independent of what the
+    // restore put on disk. Stated plainly rather than left implied: this flag
+    // does NOT prove the listener binds or that TLS is valid.
+    if args.boot_check {
+        println!(
+            "boot-check: PASSED — the tenant database at {} opened, its audit-ledger schema is \
+             present, and the .audit.log mirror reconciles with it. `aberp serve` would \
+             continue to the listener from here. (This checks the DB-side boot preconditions \
+             only; it binds no port and reads no keychain.)",
+            args.db.display()
+        );
+        return Ok(());
     }
 
     // S433 — self-heal the tenant registry with the running tenant and,
