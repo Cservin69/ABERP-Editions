@@ -2065,8 +2065,27 @@ pub async fn run_supervised(deps: SnapshotDaemonDeps, cancel: CancellationToken)
             tracing::debug!(
                 store = %deps.store_dir.display(),
                 "ADR-0116 D1.2 — the store already holds a snapshot within one interval; \
-                 skipping this tick's snapshot (the floor or a trigger got there first)"
+                 skipping this tick's SNAPSHOT (the floor or a trigger got there first). The \
+                 live-file durable checkpoint still runs — see below."
             );
+            // ── ADR-0095 §3 STILL RUNS ON A SKIPPED TICK ────────────────
+            //
+            // The live-file durable checkpoint is folded into this cadence and
+            // is durability behaviour **independent of whether a snapshot was
+            // taken**: it is what keeps a recent verified-good live file
+            // existing between clean shutdowns, closing ADR-0095 root cause #2
+            // ("nothing checkpoints the live file on a path a crash
+            // traverses").
+            //
+            // Letting D1.2's skip `continue` past it would have silently
+            // un-wired that — and precisely in the configuration ADR-0116 sets
+            // up, where a scheduled out-of-process floor satisfies the
+            // staleness window on most ticks. The snapshot cadence and the
+            // checkpoint cadence share a loop; they must not share a
+            // condition.
+            let handle = deps.db.clone();
+            let _ = tokio::task::spawn_blocking(move || live_checkpoint_logged(&handle)).await;
+
             let nap = sleep_to_next_grid_boundary(deps.interval, OffsetDateTime::now_utc());
             tokio::select! {
                 _ = cancel.cancelled() => return,

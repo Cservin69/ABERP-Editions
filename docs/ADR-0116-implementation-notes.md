@@ -158,7 +158,13 @@ Said here rather than papered over.
    would not catch?
 5. **Drift #2 (the anchor sanction)** is the most consequential deviation and is the one
    to argue with directly if you disagree.
-6. **`store_is_stale` uses the newest snapshot valid-or-not.** A DB that fails validation
+6. **The D1.2 skip and the ADR-0095 §3 live checkpoint share a loop but must not
+   share a condition.** The first cut of the skip `continue`d past
+   `live_checkpoint_logged`, silently un-wiring the live-file durable checkpoint on
+   every skipped tick — and precisely in the configuration this ADR sets up, where a
+   scheduled floor satisfies the staleness window most ticks. Fixed, and called out
+   here because it is the kind of coupling that reads as correct.
+7. **`store_is_stale` uses the newest snapshot valid-or-not.** A DB that fails validation
    every cycle therefore suppresses retries for a full interval. Deliberate (avoids a
    snapshot storm on a broken DB), but it means a broken tenant produces one failed
    forensic snapshot per interval rather than a burst — check that is what you want.
