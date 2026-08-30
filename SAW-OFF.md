@@ -384,7 +384,7 @@ content anchor). So there is **no commit-object discrepancy**: commit =
 `f7519b4…` (baseline) and content = `2d612811…` (baseline) ⇒ **prod untouched**.
 **No action taken on prod** (read-only verification only).
 
-## Cut-gate cost — the harness multiplies the gate (BACKLOG, do not close by dropping probes)
+## Cut-gate cost — the harness multiplies the gate (CLOSED 2026-08-30 by sharding)
 
 **Filed 2026-08-25, at the v0.6.1 cut.** The required check
 `ADR-0093 DB-isolation cut-gate` was CANCELLED by its `timeout-minutes` cap —
@@ -447,6 +447,38 @@ remove. The three fixes below are still the fixes.
 against a cap well under 75 minutes, and `timeout-minutes` is lowered again in
 the same change. Closing it by removing a probe, skipping a check, or
 narrowing a scan scope does not count and should be rejected in review.
+
+**CLOSED 2026-08-30 — the harness is sharded; the acceptance test is met.**
+The first direction above was taken, in the form that preserves every probe:
+`tools/cut_gate_negative_probes.sh` now takes `PROBE_SHARD_INDEX` /
+`PROBE_SHARD_TOTAL` and runs a disjoint round-robin subset of the SAME probes —
+same plant, same full `fresh()` tree copy, same signature asserted against the
+same COMPLETE gate. `cut-gate.yml` runs 6 such shards in parallel.
+
+*Nothing was traded away for the speed.* No probe was removed, no `ENFORCE_*`
+check skipped, no scan scope narrowed, and no probe now runs against anything
+less than the whole gate. The per-probe cost is unchanged; only the number of
+probes each JOB carries went down.
+
+*The partition is itself gated*, because "fast because it silently stopped
+running" is the exact failure this file exists to refuse. The script freezes
+`EXPECTED_PROBES` and fails unless (a) the suite's probe ordinal count still
+equals that freeze, (b) run + skipped accounts for every probe, and (c) this
+shard ran *exactly* its arithmetic share. So a probe deleted, a `fresh()` that
+lost its accounting site, a probe skipped by every shard (zero coverage), and an
+accounting site that was never made shard-aware are each RED — not quietly fast.
+
+*The required context name is unchanged.* `ADR-0093 DB-isolation cut-gate` is
+now a fan-in job that requires every gate job and every shard to be `success`;
+`failure`, `cancelled` and `skipped` all fail it. Branch protection was not
+touched — renaming that context would have silently un-gated `main`.
+
+Caps came down in the same change, as the acceptance required: the gate job
+75 → 20 min, each probe shard capped at 30. **If a shard ever approaches its
+cap, raise the shard count — do not raise the cap.** Shard count is a free knob
+until the per-shard fixed cost (one tree copy per probe, paid in every shard)
+dominates; that fixed cost is the residual, and the second direction above
+(cutting `fresh()`) remains the way to attack it if it ever matters.
 
 ---
 
