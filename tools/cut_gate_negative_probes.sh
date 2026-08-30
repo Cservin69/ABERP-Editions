@@ -33,7 +33,72 @@ WORK="$(mktemp -d "$TMPDIR/cutgate-probes.XXXXXX")"
 pass=0; bad=0
 i=0
 
+# ── SHARDING — a PARTITION of the suite, never a reduction of it ─────────────
+# This harness is O(probes x full-gate-run): every probe copies the whole tree
+# and runs the WHOLE gate against it. At 77 probes that measured 70m10s on a
+# GitHub runner — 94% of cut-gate.yml's 75-minute cap, with 4m50s to spare —
+# while the IDENTICAL harness on IDENTICAL input took 54m38s two runs earlier.
+# Ordinary runner variance was therefore already able to CANCEL a REQUIRED
+# check (a false red on main, since cut-gate.yml also runs on push:main), and
+# the next probe-adding ADR blew the cap outright. See SAW-OFF.md.
+#
+# The fix keeps every probe exactly as it is. Each shard runs a DISJOINT subset
+# of the SAME probes: the same plant, against the same full fresh() tree copy,
+# asserting the same signature against the same complete gate. Nothing is
+# batched, cached, reordered, approximated or shared between probes, and no
+# probe is dropped — cut-gate.yml runs PROBE_SHARD_TOTAL of these jobs in
+# parallel and a fan-in job requires EVERY one of them green.
+#
+# Defaults are 1/1 — with no environment set this script behaves exactly as the
+# un-sharded harness did, so a local `bash tools/cut_gate_negative_probes.sh`
+# still runs the complete suite.
+#
+# The partition is round-robin on the probe ORDINAL (probe n -> shard
+# ((n-1) % TOTAL) + 1), NOT a contiguous split: probes are grouped by CHECK in
+# file order and their costs differ, so a contiguous split would pile all of
+# CHECK 11 into one shard and simply move the cliff. Round-robin gives every
+# shard probes from every CHECK family and near-equal cost.
+PROBE_SHARD_TOTAL="${PROBE_SHARD_TOTAL:-1}"
+PROBE_SHARD_INDEX="${PROBE_SHARD_INDEX:-1}"
+# EXPECTED_PROBES is a FREEZE, in the same spirit as every other manifest this
+# gate holds — it is the anti-silent-drop teeth for the sharding itself. The
+# shard's expected workload is derived from THIS number rather than from
+# anything the run accumulated, so a deleted probe, or a fresh() that loses its
+# accounting site (which is how a probe stops being a probe), moves the count
+# and goes RED instead of quietly testing less. Adding a probe is a deliberate
+# one-line bump here.
+EXPECTED_PROBES=77
+if [[ ! "$PROBE_SHARD_TOTAL" =~ ^[1-9][0-9]*$ ]] || [[ ! "$PROBE_SHARD_INDEX" =~ ^[1-9][0-9]*$ ]] \
+   || (( PROBE_SHARD_INDEX > PROBE_SHARD_TOTAL )); then
+  echo "NEGATIVE-PROBES: ✗ FAILED — bad shard spec (1-based, index <= total): PROBE_SHARD_INDEX=$PROBE_SHARD_INDEX PROBE_SHARD_TOTAL=$PROBE_SHARD_TOTAL" >&2
+  exit 1
+fi
+# The probe ordinal must survive `c="$(fresh)"`. fresh() runs inside a command
+# substitution SUBSHELL, so a shell variable incremented there is lost in the
+# parent — this file already carries that exact scar (see the fresh() note on
+# the `i=$((i+1))` counter that never persisted and made every copy collide).
+# A FILE survives the subshell; the harness is strictly serial, so a plain
+# read-modify-write is sound here.
+PROBE_CTR="$RUN_TMP/probe.ordinal"; printf '0' > "$PROBE_CTR"
+skipped=0
+probe_skipped() {  # true iff the CURRENT probe's ordinal belongs to another shard
+  local n; n="$(cat "$PROBE_CTR")"
+  (( (n - 1) % PROBE_SHARD_TOTAL != PROBE_SHARD_INDEX - 1 ))
+}
+
 fresh() {  # -> path to a fresh, clean copy of the tree (excludes .git)
+  # Claim this probe's ordinal. Deliberately the FIRST thing fresh() does, and
+  # deliberately unconditional: fresh() is called exactly once per probe, in
+  # probe order, so the ordinal is exact. Note this function must print NOTHING
+  # but the path — its stdout IS its return value.
+  local n; n=$(( $(cat "$PROBE_CTR") + 1 )); printf '%s' "$n" > "$PROBE_CTR"
+  # A probe belonging to another shard still gets a REAL copy. Handing back a
+  # stub would be cheaper, but every plant below writes into this tree with
+  # `printf >>`, `perl -0pi`, `grep -v`, and python3 heredocs that `assert` on an
+  # anchor string — against a stub those fail loudly and fill the log of a
+  # perfectly healthy shard with noise, and against a SHARED sink they would
+  # accumulate and make each other's anchors drift. Fidelity is worth the copy:
+  # the plant runs identically in every shard, only the gate run is skipped.
   # NOTE (ADR-0098 Session C): use mktemp -d for a UNIQUE dir per call. The
   # prior `i=$((i+1)); d="$WORK/copy.$i"` form incremented `i` inside this
   # function's command-substitution subshell (`c="$(fresh)"`), so the counter
@@ -96,6 +161,9 @@ gate_rc() {  # run the COPY's gate; echo exit code; stash output in $1/.out
 }
 
 expect_pass() {  # $1 dir  $2 label
+  # Not this shard's probe: the plant above already ran (identically), we simply
+  # do not spend a full gate run proving what another shard is proving.
+  if probe_skipped; then skipped=$((skipped+1)); return 0; fi
   local rc; rc="$(gate_rc "$1")"
   if [[ "$rc" == "0" ]]; then
     printf '  ✓ %s\n' "$2"; pass=$((pass+1))
@@ -105,6 +173,9 @@ expect_pass() {  # $1 dir  $2 label
   fi
 }
 expect_fail() {  # $1 dir  $2 signature  $3 label
+  # Not this shard's probe: the plant above already ran (identically), we simply
+  # do not spend a full gate run proving what another shard is proving.
+  if probe_skipped; then skipped=$((skipped+1)); return 0; fi
   # MUST run before gate_rc: gate_rc writes "$1/.out" inside the copy, which
   # would itself satisfy the -newer test and mask a no-op plant.
   if ! assert_planted "$1"; then
@@ -504,7 +575,9 @@ expect_fail "$c" "a NEW/REGROWN WRAPPER-HIDDEN write-fork" "CHECK 10N-b — N-le
 echo "[CHECK 10N] the wrapper-hidden fork planted in snapshot.rs — 10M-a (ZERO-tolerance) does NOT see it; only 10N does"
 c="$(fresh)"
 printf '\nfn _adr0105_probe_blindspot(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n    let mut l = aberp_audit_ledger::Ledger::open(p, t, bh).unwrap();\n    _adr0105_probe_blindspot_append(&mut l);\n}\nfn _adr0105_probe_blindspot_append(l: &mut aberp_audit_ledger::Ledger) {\n    let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n}\n' >> "$c/apps/aberp/src/snapshot.rs"
-if ! assert_planted "$c"; then
+# Not this shard's probe (see SHARDING above) — the plant ran, the gate run did not.
+if probe_skipped; then skipped=$((skipped+1));
+elif ! assert_planted "$c"; then
   printf '  ✗ HARNESS BUG: CHECK 10N blind-spot probe — the plant modified NOTHING.\n'; bad=$((bad+1))
 else
   rc="$(gate_rc "$c")"
@@ -535,7 +608,9 @@ expect_pass "$c" "CHECK 10N — a wrapper-hidden fork inside #[cfg(test)] is cor
 echo "[CHECK 10N] an opener whose helper routes through the shared Handle must NOT trip 10N (Handle barrier, no false-positive)"
 c="$(fresh)"
 printf '\nfn _adr0105_probe_handle_routed(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash, db: &aberp_db::HandleArc) {\n    let mut l = aberp_audit_ledger::Ledger::open(p, t, bh).unwrap();\n    _adr0105_probe_handle_append(db, &mut l);\n}\nfn _adr0105_probe_handle_append(db: &aberp_db::HandleArc, _l: &mut aberp_audit_ledger::Ledger) {\n    let mut g = db.write().unwrap();\n    let tx = g.transaction().unwrap();\n    let _ = aberp_audit_ledger::append_in_tx(&tx, todo!(), aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n}\n' > "$c/apps/aberp/src/zz_adr0105_probe_handle.rs"
-if ! assert_planted "$c"; then
+# Not this shard's probe (see SHARDING above) — the plant ran, the gate run did not.
+if probe_skipped; then skipped=$((skipped+1));
+elif ! assert_planted "$c"; then
   printf '  ✗ HARNESS BUG: CHECK 10N Handle-barrier probe — the plant modified NOTHING.\n'; bad=$((bad+1))
 else
   rc="$(gate_rc "$c")"
@@ -577,7 +652,9 @@ fi
 echo "[ADR-0105 F1] a Connection::open LAUNDERED through Ledger::from_connection on one line — must be caught, not skipped"
 c="$(fresh)"
 printf '\npub fn _adr0105_f1_laundered_fork(p: &std::path::Path) -> anyhow::Result<()> {\n    let mut l = Ledger::from_connection(Connection::open(p)?, tid(), bh());\n    l.append(EventKind::Test, Vec::new(), actor(), None)?;\n    Ok(())\n}\n' >> "$c/apps/aberp/src/snapshot.rs"
-if ! assert_planted "$c"; then
+# Not this shard's probe (see SHARDING above) — the plant ran, the gate run did not.
+if probe_skipped; then skipped=$((skipped+1));
+elif ! assert_planted "$c"; then
   printf '  ✗ HARNESS BUG: ADR-0105 F1 probe — the plant modified NOTHING.\n'; bad=$((bad+1))
 else
   rc="$(gate_rc "$c")"
@@ -602,7 +679,9 @@ fi
 echo "[CHECK 10P] B1 — a daemon heartbeat appending on a db.read() CLONE (no writer mutex, no AUDIT_APPEND_LOCK): 10P must go red where 10M/10N are structurally blind"
 c="$(fresh)"
 printf 'fn _adr0099r2_probe_read_clone_appender(db: &aberp_db::HandleArc) {\n    let mut conn = db.read().unwrap();\n    let tx = conn.transaction().unwrap();\n    let _ = aberp_audit_ledger::append_in_tx(&tx, todo!(), todo!(), vec![], todo!(), None);\n    tx.commit().unwrap();\n}\n' > "$c/apps/aberp/src/zz_adr0099r2_probe_read.rs"
-if ! assert_planted "$c"; then
+# Not this shard's probe (see SHARDING above) — the plant ran, the gate run did not.
+if probe_skipped; then skipped=$((skipped+1));
+elif ! assert_planted "$c"; then
   printf '  ✗ HARNESS BUG: CHECK 10P B1 probe — the plant modified NOTHING.\n'; bad=$((bad+1))
 else
   rc="$(gate_rc "$c")"
@@ -621,7 +700,9 @@ fi
 echo "[CHECK 10P] B4 — a non-shared MIRROR writer (Connection::open + ensure_consistent_with_db): 10L cannot see it (its append token is .sync_mirror only). NOT the seq-2508 mechanism — that was a lost DB commit (ADR-0099 R2.2); this is the second-writer class 10P exists for"
 c="$(fresh)"
 printf 'fn _adr0099r2_probe_mirror_writer(p: &std::path::Path) {\n    let conn = duckdb::Connection::open(p).unwrap();\n    let mp = aberp_audit_ledger::mirror_path_for(p);\n    let _ = aberp_audit_ledger::ensure_consistent_with_db(&conn, &mp);\n}\n' > "$c/apps/aberp/src/zz_adr0099r2_probe_mirror.rs"
-if ! assert_planted "$c"; then
+# Not this shard's probe (see SHARDING above) — the plant ran, the gate run did not.
+if probe_skipped; then skipped=$((skipped+1));
+elif ! assert_planted "$c"; then
   printf '  ✗ HARNESS BUG: CHECK 10P B4 probe — the plant modified NOTHING.\n'; bad=$((bad+1))
 else
   rc="$(gate_rc "$c")"
@@ -774,6 +855,49 @@ rm -f "$c/tools/adr0116_evidence_removal_scan.awk"
 expect_fail "$c" "evidence removal scanner or frozen manifest missing" "CHECK 11 — a deleted scanner is RED, not vacuously green"
 
 echo
+# ── shard accounting — the teeth of the sharding itself ──────────────────────
+# Sharding is only sound if the shards PARTITION the suite: every probe in
+# exactly one shard, none in zero. The two ways that silently breaks are an
+# accounting site that was never made shard-aware (its probe then runs in EVERY
+# shard — wasteful but harmless) and a probe skipped by all of them (ZERO
+# coverage, and the suite still prints green). Both are coverage bugs wearing a
+# performance-fix costume, which is exactly what this file exists to refuse.
+#
+# So the expected workload is recomputed from the FROZEN EXPECTED_PROBES rather
+# than from anything this run accumulated, and compared three ways.
+ran=$((pass+bad))
+total="$(cat "$PROBE_CTR")"
+expect_ran=0
+for ((n=1; n<=EXPECTED_PROBES; n++)); do
+  (( (n - 1) % PROBE_SHARD_TOTAL == PROBE_SHARD_INDEX - 1 )) && expect_ran=$((expect_ran+1))
+done
+echo "shard $PROBE_SHARD_INDEX/$PROBE_SHARD_TOTAL — probes run here: $ran   left to other shards: $skipped   suite total: $total (frozen: $EXPECTED_PROBES)"
 echo "probes passed: $pass   broken/escaped: $bad"
+
+if [[ "$total" -ne "$EXPECTED_PROBES" ]]; then
+  echo "NEGATIVE-PROBES: ✗ FAILED — the suite ran $total probes but EXPECTED_PROBES=$EXPECTED_PROBES."
+  echo "  A probe was added or removed, or a fresh() lost its accounting site. The shard partition is"
+  echo "  derived from this frozen count, so it must move DELIBERATELY: bump EXPECTED_PROBES and re-check"
+  echo "  cut-gate.yml's shard matrix. A drifting count is how a shard silently stops covering a probe."
+  exit 1
+fi
+if [[ "$((ran + skipped))" -ne "$EXPECTED_PROBES" ]]; then
+  echo "NEGATIVE-PROBES: ✗ FAILED — $ran run + $skipped skipped = $((ran + skipped)), not $EXPECTED_PROBES."
+  echo "  Every probe must be either run here or explicitly left to another shard; one that is neither is"
+  echo "  a probe that reports nothing anywhere."
+  exit 1
+fi
+if [[ "$ran" -ne "$expect_ran" ]]; then
+  echo "NEGATIVE-PROBES: ✗ FAILED — shard $PROBE_SHARD_INDEX/$PROBE_SHARD_TOTAL accounted for $ran probes but its"
+  echo "  round-robin share of $EXPECTED_PROBES is exactly $expect_ran. Either an accounting site is not"
+  echo "  shard-aware (its probe runs in every shard) or a probe is being skipped by all of them (zero"
+  echo "  coverage). Both change what the suite covers; neither is a timing problem."
+  exit 1
+fi
+
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi
-echo "NEGATIVE-PROBES: ✓ ALL CHECKS HAVE TEETH"
+if (( PROBE_SHARD_TOTAL > 1 )); then
+  echo "NEGATIVE-PROBES: ✓ SHARD $PROBE_SHARD_INDEX/$PROBE_SHARD_TOTAL HAS TEETH ($ran probes; the suite is green only when every shard is)"
+else
+  echo "NEGATIVE-PROBES: ✓ ALL CHECKS HAVE TEETH"
+fi

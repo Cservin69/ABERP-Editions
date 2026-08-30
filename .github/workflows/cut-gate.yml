@@ -21,51 +21,27 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  db-isolation:
-    name: ADR-0093 DB-isolation cut-gate
+  # ── the gates themselves (cheap: no probe re-runs) ──────────────────────────
+  # Runs every ENFORCE_* gate once, plus the two SMALL probe harnesses whose own
+  # gates are cheap (durable-ack ~4 s, checkpoint-sites ~7 s per run). The
+  # expensive one — cut_gate_negative_probes.sh, which re-runs the WHOLE
+  # DB-isolation gate once per probe — is sharded into `negative-probes` below.
+  gates:
+    name: gates (all ENFORCED) + small probe harnesses
     runs-on: ubuntu-latest
-    # ADR-0098 R6: raised 5 -> 15. ADR-0105: raised 15 -> 30.
-    # ADR-0099 R6: raised 30 -> 75.
+    # HISTORY of this cap, because it is the thing that kept breaking:
+    # ADR-0098 R6 raised it 5 -> 15, ADR-0105 15 -> 30, ADR-0099 R6 30 -> 75.
+    # Every one of those was pure timeout accommodation for the same underlying
+    # shape — the negative-probe harness re-running the WHOLE gate once per
+    # probe — and each one bought a little time instead of fixing it. The v0.6.1
+    # cut attempt died on the 30-minute cap with every probe PASSING and the
+    # gate exiting 0: the job was simply CANCELLED, which is a false red on a
+    # REQUIRED check (and a red on main, since this workflow runs on push:main).
     #
-    # The gate itself runs in ~15 s. The cost is the negative-probe harness
-    # (tools/cut_gate_negative_probes.sh), which fresh()-copies the whole tree
-    # once per probe and re-runs the full gate each time.
-    #
-    # MEASURED on this runner (job 92868392762, 2026-08-07), not estimated:
-    # **17.5 s per probe**, 46 probes -> ~13.4 min, job total **14 m 32 s**
-    # against the old 15-min cap — a ~28-second margin. The "~5 min" figure in
-    # the previous version of this comment was stale by a wide margin: the suite
-    # was already at ~12.3 min (41 probes) BEFORE the 5 ADR-0105 CHECK-10N
-    # probes were added, so it had been running one slow runner away from the cap
-    # for some time. That is precisely the failure this comment already records:
-    # the job gets CANCELLED, which is a false red on a REQUIRED check (and a red
-    # on main, since this workflow also runs on push:main).
-    #
-    # Pure timeout accommodation — every ENFORCE_* check still runs in full and
-    # must pass. No de-gate, no probe skipped.
-    #
-    # FLAG (v0.2.6), now load-bearing rather than nice-to-have: the harness is
-    # O(probes x full-tree-copy + full-gate-run). Speeding up fresh() (git
-    # archive / a shared worktree, or a single copy reused read-only with the
-    # plant applied via overlay) would take this back to a couple of minutes and
-    # remove the standing cap risk. Until then, every new probe costs ~17.5 s and
-    # the cap must be re-checked when probes are added.
-    #
-    # ADR-0099 R6 (2026-08-25): the *per-run* cost of the gate itself tripled.
-    # R6 added ~145 gate lines, the 313-line tools/adr0099_audit_writer_scan.awk
-    # behind CHECK 10P, and widened the R6 scan scope to the whole crates/ tree.
-    # The harness multiplies that: probe_count (56) x one_full_gate_run, so a
-    # ~3x per-run regression lands as ~46 min against a 30-min cap. The v0.6.1
-    # cut attempt died exactly there: every probe PASSED and the gate exited 0,
-    # but the job was CANCELLED by the cap — a false red on a REQUIRED check.
-    #
-    # 30 -> 75 is pure timeout accommodation and gates strictly MORE than
-    # before: it is what lets the FULL suite (all 56 probes + every ENFORCE_*
-    # check) actually run to completion. No probe dropped, no gate logic
-    # touched. The real fix — shard the harness across matrix jobs, or cut the
-    # per-probe full-gate cost — is filed in SAW-OFF.md (see "Cut-gate cost");
-    # a timeout must not become the ceiling on how much we are allowed to gate.
-    timeout-minutes: 75
+    # That escalation ends here. The harness is now SHARDED (see the
+    # `negative-probes` job below), so this job carries only work that is O(1)
+    # in the probe count and its cap is back to a sane 20 minutes.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
@@ -81,11 +57,22 @@ jobs:
           ENFORCE_LAUNCHER_ARM_MATCH: "1"        # CHECK 7 (chunk 4)
         run: bash tools/cut_gate_db_isolation.sh
 
-      - name: Prove the cut-gate has teeth (negative probes)
-        # Plants each invariant's violation in a throwaway copy and asserts the
-        # gate FAILS — so a green gate above is a meaningful signal, not a
-        # gate that can no longer go red.
-        run: bash tools/cut_gate_negative_probes.sh
+      - name: Shard-set gate — the probe matrix is exactly 1..N
+        # The negative-probe suite is sharded, and each shard proves its OWN
+        # arithmetic. What no single shard job can see is whether the other
+        # shards exist: a matrix like [1, 1, 2, 3, 4, 5] runs every job, passes
+        # every job's share check, and leaves shard 6's probes running NOWHERE.
+        # This holds the shard set closed so that cannot happen quietly.
+        run: bash tools/cut_gate_probe_shard_matrix.sh
+
+      - name: Prove the shard-set gate has teeth (negative probes)
+        # Plants every way the matrix can lose a shard — a duplicate, a gap, an
+        # off-by-one, an empty list, the matrix deleted, and the total written
+        # as a literal instead of derived — and asserts RED. Pins the
+        # non-triggers too: raising or lowering the shard count is the
+        # documented remedy when a shard nears its cap, and a check that
+        # blocked it would simply get deleted the first time it was needed.
+        run: bash tools/cut_gate_probe_shard_matrix_probes.sh
 
       - name: ADR-0110 D3 durable-ack gate (money-path census, ENFORCED)
         # D3 ports Portable PROD_v2.33.6's power-loss durability to Defense's
@@ -145,3 +132,93 @@ jobs:
         # a strict prefix of the SANCTIONED wrapper's name, so a matcher that
         # cannot tell those apart would cry wolf and get switched off.
         run: bash tools/cut_gate_checkpoint_probes.sh
+
+  # ── the negative-probe harness, SHARDED ─────────────────────────────────────
+  # tools/cut_gate_negative_probes.sh plants each invariant's violation in a
+  # throwaway copy of the tree and asserts the gate FAILS — so a green gate is a
+  # meaningful signal rather than a gate that can no longer go red. It is also
+  # O(probes x full-gate-run), and that product is what kept eating this
+  # workflow's cap: on the v0.6.4 landing run it took 70 m 10 s against the
+  # 75-minute cap (94%, 4 m 50 s to spare), while the IDENTICAL harness on
+  # IDENTICAL input took 54 m 38 s two runs earlier. Ordinary runner variance
+  # was one bad draw away from CANCELLING a REQUIRED check, and the next
+  # probe-adding ADR would have blown the cap outright.
+  #
+  # The shards are a PARTITION, not a reduction. Each job runs a disjoint
+  # round-robin subset of the SAME probes: same plant, same full fresh() tree
+  # copy, same signature asserted against the same COMPLETE gate. No probe is
+  # dropped, batched, cached or approximated, and the script itself proves that
+  # — it holds EXPECTED_PROBES frozen and fails if its shard's probe count is
+  # not exactly its share, so a probe skipped by every shard (zero coverage) or
+  # an accounting site that was never made shard-aware is RED, not quietly fast.
+  #
+  # The suite is green only when EVERY shard is green; `db-isolation` below is
+  # the fan-in that enforces that and is the REQUIRED status check.
+  #
+  # Shard count is a free knob: raising it lowers wall-time until the per-shard
+  # fixed cost (one tree copy per probe, ~1-2 s each, paid in every shard)
+  # dominates. 6 is the measured sweet spot.
+  negative-probes:
+    name: negative probes ${{ matrix.shard }}/${{ strategy.job-total }} (cut-gate has teeth)
+    runs-on: ubuntu-latest
+    # ~1/6 of the old 70 min. 30 is deliberate headroom (>2x), not a target —
+    # the point of this change is that the cap stops being the binding
+    # constraint. If this ever approaches 30 again, raise the shard count, do
+    # NOT raise the cap.
+    timeout-minutes: 30
+    strategy:
+      # Every shard must report. Without this, one shard's failure cancels its
+      # siblings and their probes report nothing at all — which would look like
+      # a single narrow failure when it may be a broad one.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Prove the cut-gate has teeth (shard ${{ matrix.shard }} of ${{ strategy.job-total }})
+        env:
+          PROBE_SHARD_INDEX: ${{ matrix.shard }}
+          # DERIVED from the matrix, never written twice. A literal "6" here that
+          # disagreed with the matrix length would be invisible: with a TOTAL one
+          # higher than the number of jobs, the probes belonging to the missing
+          # shard run in NO job at all, and every job still reports "ran exactly
+          # its share". `strategy.job-total` is the matrix length by definition,
+          # so that particular silent hole cannot be opened.
+          PROBE_SHARD_TOTAL: ${{ strategy.job-total }}
+        run: bash tools/cut_gate_negative_probes.sh
+
+  # ── REQUIRED STATUS CHECK ───────────────────────────────────────────────────
+  # The `name:` below is the branch-protection context on main and MUST NOT
+  # change: renaming it silently un-gates the branch, because protection would
+  # then wait on a context no job produces (and GitHub does not warn).
+  #
+  # This job is a pure fan-in. It runs `if: always()` so it ALWAYS reports —
+  # a job that is skipped because a dependency failed produces no conclusion,
+  # which would leave the required check pending forever instead of red — and
+  # it inspects each dependency's result explicitly. Only the literal string
+  # 'success' passes: 'failure', 'cancelled' (the cap, or a concurrency
+  # cancellation) and 'skipped' are all treated as NOT proven, which is the
+  # safe direction and is exactly the "cancelled is a false green" trap this
+  # workflow has been bitten by before.
+  db-isolation:
+    name: ADR-0093 DB-isolation cut-gate
+    runs-on: ubuntu-latest
+    needs: [gates, negative-probes]
+    if: always()
+    timeout-minutes: 10
+    steps:
+      - name: Require every gate job and every probe shard to be green
+        env:
+          GATES: ${{ needs.gates.result }}
+          PROBES: ${{ needs.negative-probes.result }}
+        run: |
+          echo "gates            = $GATES"
+          echo "negative-probes  = $PROBES   (matrix aggregate: 'success' only if EVERY shard succeeded)"
+          rc=0
+          [ "$GATES" = "success" ]  || { echo "✗ the ENFORCED gate job did not succeed ($GATES)"; rc=1; }
+          [ "$PROBES" = "success" ] || { echo "✗ at least one negative-probe shard did not succeed ($PROBES)"; rc=1; }
+          if [ "$rc" -ne 0 ]; then
+            echo "ADR-0093 DB-isolation cut-gate: ✗ FAILED"
+            exit 1
+          fi
+          echo "ADR-0093 DB-isolation cut-gate: ✓ every ENFORCED check passed and every probe shard has teeth"
