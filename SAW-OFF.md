@@ -205,7 +205,7 @@ two-cell matrix — **Portable** (default features) and **Defense**
 
 | Gate | Portable | Defense |
 |---|---|---|
-| ADR-0093 DB-isolation cut-gate (CHECK 1–7) + negative probes — **fail-fast** | ✅ | ✅ |
+| ADR-0093 DB-isolation cut-gate + negative probes — **moved to `cut-gate.yml` 2026-08-30**, see note below | — | — |
 | `cargo fmt --all -- --check` | ✅ | ✅ |
 | `cargo build --workspace --locked --all-targets` | ✅ default | ✅ `--features production` |
 | `cargo test --workspace --locked` | ✅ default | ✅ `--features production` |
@@ -223,9 +223,28 @@ The `production` feature lives only on `aberp`/`aberp-ui`, so the `aberp`
 binary tests take `--features production` on the Defense arm while the
 edition-agnostic crate tests run featureless.
 
-`cut-gate.yml` runs the same CHECK 1–7 cut-gate + negative probes as a
-standalone, toolchain-free job (seconds), so the isolation mandate is gated
-fast and independently of the 8-minute build.
+`cut-gate.yml` runs the cut-gate + negative probes (plus the ADR-0110
+durable-ack and ADR-0111 checkpoint-site gates and their probes) as a
+standalone, toolchain-free job, so the isolation mandate is gated
+independently of the 8-minute build.
+
+> **2026-08-30 (ADR-0116 / v0.6.4 landing) — the gate steps were removed from
+> `ci.yml`.** Both workflows had been running `cut_gate_db_isolation.sh`,
+> `cut_gate_negative_probes.sh`, `cut_gate_checkpoint_sites.sh` and
+> `cut_gate_checkpoint_probes.sh` with identical `ENFORCE_*` env on identical
+> triggers — so the probe harness was billed to two jobs per PR. ADR-0116
+> touched no workflow file; it grew those two gate *scripts*, and the harness
+> multiplied the growth. The `ci.yml` copy went 50 m 07 s (main `5020773`) to
+> 69 m 18 s, which pushed that job past its 90-min cap and got `Test`
+> CANCELLED — a false red on a required check. The four steps now run once,
+> in `cut-gate.yml`, whose job name **is** the required context
+> `ADR-0093 DB-isolation cut-gate`; nothing is de-gated. `ci.yml` keeps the
+> strict-SVG lint (never duplicated) and remains the **sole** home of fmt,
+> build, the workspace test suite, the named integration tests,
+> `clippy -D warnings` and `cargo deny` — which is why that job was **not**
+> deleted, only slimmed. The one thing given up is fail-fast ordering inside
+> `ci.yml`; `cut-gate.yml` runs concurrently and still reddens in ~51 s.
+> The underlying O(probes × full-gate-run) cost is still open below.
 
 The three cut-gate CHECKs added this chunk (each defended by a negative probe
 in `tools/cut_gate_negative_probes.sh`):
@@ -411,6 +430,17 @@ allowed to gate.**
 - **Cut the per-run scan cost.** The R6 scanners walk the whole `crates/`
   tree per invocation. Scope narrowing is **not** acceptable, but a single
   pass that feeds several checks, or a file-list computed once and reused, is.
+
+**Update 2026-08-30 (v0.6.4): the DOUBLE billing is gone; the cost is not.**
+`ci.yml` was running the same harness as a fail-fast prelude, so every PR paid
+it twice — and ADR-0116's script growth (50 m 07 s -> 69 m 18 s per copy) blew
+`ci.yml`'s 90-min cap and got its `Test` step CANCELLED. Those four gate steps
+were removed from `ci.yml`; they now run once, in `cut-gate.yml`, which is the
+required context. That halves the spend and unblocked the v0.6.4 cut, but it
+does **not** close this entry: `cut-gate.yml` alone is at **54 m 38 s against
+its 75-min cap** (73%), and the per-probe cost still tracks gate size, so the
+next probe-adding ADR walks into the same cliff with no second copy left to
+remove. The three fixes below are still the fixes.
 
 **Acceptance for closing this entry:** the full suite — every probe, every
 `ENFORCE_*` check, at the current or wider scope — completes with margin

@@ -7,9 +7,14 @@
 #
 #   • Defense   = --features production    (real-NAV production build)
 #
-# and runs the ADR-0093/0002 DB-isolation cut-gate (+ its negative probes) as
-# a fast fail-fast BEFORE the heavy build, so an isolation regression goes red
-# in seconds rather than after the 8-min DuckDB compile.
+# The ADR-0093/0002 DB-isolation cut-gate and the ADR-0111 checkpoint-site
+# gate (with both negative-probe harnesses) used to run here too, as a
+# fail-fast prelude. They were removed on 2026-08-30 because cut-gate.yml —
+# the OTHER required status check — already runs the identical scripts on the
+# identical triggers, so this workflow was paying a ~70-min harness a second
+# time and being CANCELLED at its own cap. See the block above those removed
+# steps for the measurements. This workflow keeps the strict-SVG lint (not
+# duplicated anywhere) and remains the sole home of the toolchain work.
 #
 # The Portable arm was dropped 2026-08-04: this repository is Defense-only,
 # and the Portable line is built in ABERP.git per the architecture. That makes
@@ -49,23 +54,20 @@ jobs:
   workspace:
     name: ${{ matrix.edition }} · build + lint + test
     runs-on: ubuntu-latest
-    # ADR-0105: raised 60 -> 90.
+    # ADR-0105 raised this 60 -> 90 to survive the negative-probe harness this
+    # job used to duplicate from cut-gate.yml. That harness is gone from here
+    # (2026-08-30, see the removal note further down), which removed ~70 min
+    # from the job: the remaining toolchain tail measured **19 m 54 s** on
+    # main @5020773 (steps "Install Tauri system dependencies" through
+    # "cargo-deny check", including a 12 m 56 s Test and a cold-ish cache).
     #
-    # This job ALSO runs the negative-probe harness (as its fail-fast first
-    # step), so it carries the same ~17.5 s/probe cost as cut-gate.yml — the
-    # suite runs TWICE per PR, once in each workflow.
-    #
-    # MEASURED on this repo's own history: the ci run for PR #33 took **59 min
-    # against this 60-min cap**, and PR #29 was **CANCELLED at exactly 60**.
-    # Warm-cache runs sit at 25-28 min; the 59-min case is a cold/evicted cargo
-    # cache (see the portable-arm wedge this workflow already documents). Adding
-    # the 5 ADR-0105 probes puts ~1.5 min more on a job with a recorded
-    # cancellation at the cap, and a cancelled job is a FALSE RED on a required
-    # check — indistinguishable from a real regression.
-    #
-    # Pure timeout accommodation: no step skipped, no lint relaxed, no
-    # `continue-on-error`. Speeding up the probe harness (the v0.2.6 FLAG in
-    # cut-gate.yml) is what would actually reclaim the headroom.
+    # 90 is DELIBERATELY LEFT AS-IS rather than tightened to fit ~20 min. The
+    # historical cancellations this cap was raised for were cold/evicted cargo
+    # caches, not runaway work, and an evicted cache can still put ~40 min on
+    # the Build+Test steps. A cap that fits the warm case turns a cache miss
+    # into a CANCELLED required check — a false red indistinguishable from a
+    # real regression, which is the exact failure this comment has recorded
+    # twice already. Headroom here is cheap; a false red is not.
     timeout-minutes: 90
     strategy:
       # Defense-only from 2026-08-04: this repository's CI builds the Defense
@@ -83,39 +85,55 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # ── Fail-fast DB-isolation gate (toolchain-free, ~seconds) ──────────
-      # Runs BEFORE the ~8-min build so an ADR-0093/0002 isolation regression
-      # (prod launch surface, cross-edition root, in-place checkpoint rewrite,
-      # prod snapshot store, crossed launcher arms) goes red immediately. The
-      # negative probes prove the gate itself still has teeth. Identical for
-      # both arms (static source check) — cheap enough to keep per-arm so each
-      # job is self-contained.
-      - name: ADR-0093 DB-isolation cut-gate (CHECK 1–10, all ENFORCED)
-        env:
-          ENFORCE_EDITION_DB_BINDING: "1"
-          ENFORCE_CHUNK3_INVARIANTS: "1"
-          ENFORCE_CHECKPOINT_ATOMIC: "1"
-          ENFORCE_SNAPSHOT_STORE_ISOLATION: "1"
-          ENFORCE_LAUNCHER_ARM_MATCH: "1"
-        run: bash tools/cut_gate_db_isolation.sh
-
-      - name: Cut-gate negative probes (prove the gate has teeth)
-        run: bash tools/cut_gate_negative_probes.sh
-
-      # ── ADR-0111 checkpoint-site gate (toolchain-free, ~seconds) ────────
-      # Keeps every durable checkpoint of the live DB under the shared
-      # Handle's writer lock. A path-based checkpoint renames a new inode over
-      # the live file while the Handle holds the old one, so later commits land
-      # in an orphan the kernel frees at exit — and the lockstep sync_mirror
-      # durably mirrors them anyway: mirror ahead of DB, the audit-chain fork.
-      # Runs before the build so the regression is red in seconds.
-      - name: ADR-0111 checkpoint-site cut-gate (call-site census, ENFORCED)
-        env:
-          ENFORCE_CHECKPOINT_SITES: "1"
-        run: bash tools/cut_gate_checkpoint_sites.sh
-
-      - name: Checkpoint-site gate negative probes (prove the gate has teeth)
-        run: bash tools/cut_gate_checkpoint_probes.sh
+      # ── DB-isolation / checkpoint-site gates: run in cut-gate.yml ───────
+      # These four steps used to run HERE as well:
+      #
+      #   tools/cut_gate_db_isolation.sh      (5x ENFORCE_*)
+      #   tools/cut_gate_negative_probes.sh
+      #   tools/cut_gate_checkpoint_sites.sh  (ENFORCE_CHECKPOINT_SITES)
+      #   tools/cut_gate_checkpoint_probes.sh
+      #
+      # They were REMOVED here on 2026-08-30 (ADR-0116 / v0.6.4 landing).
+      # Nothing is de-gated: `.github/workflows/cut-gate.yml` invokes the very
+      # same four scripts with byte-identical ENFORCE_* env, on the identical
+      # trigger set (push:main + pull_request:main), and its job
+      # `ADR-0093 DB-isolation cut-gate` is a branch-protection REQUIRED
+      # status check. A regression in any of them still blocks the merge; it
+      # is simply no longer paid for twice per PR.
+      #
+      # WHY THIS HAD TO CHANGE — the harness was being billed to two jobs.
+      # `cut_gate_negative_probes.sh` re-copies the tree and re-runs the whole
+      # gate once per probe, so its cost tracks the gate's size. MEASURED on
+      # this repo, same commit, same runner class:
+      #
+      #   main @5020773   this step 50 m 07 s  ->  ci job 71 m 27 s / 90 cap
+      #   ADR-0116 @ff0da0f  this step 69 m 18 s  ->  ci job CANCELLED at 90
+      #
+      # ADR-0116 changed NO workflow file. It grew the two gate SCRIPTS
+      # (cut_gate_db_isolation.sh +178, cut_gate_negative_probes.sh +92), and
+      # because both workflows ran them, the +19 min landed twice. ci.yml —
+      # which must also fit a ~20-min build/test/clippy/deny tail — blew its
+      # cap and `Test` was axed mid-run: a CANCELLED required check, i.e. a
+      # false red indistinguishable from a real regression.
+      #
+      # Raising this job's cap to 120 was the alternative. It was rejected as
+      # a band-aid: it keeps paying ~70 min of duplicate work every PR and
+      # re-arms the same cliff for the next probe-adding ADR. Deleting this
+      # WHOLE job (the other option considered) was rejected outright — see
+      # the note below.
+      #
+      # DO NOT "simplify" by deleting this job because cut-gate.yml exists.
+      # cut-gate.yml is deliberately TOOLCHAIN-FREE: it runs no cargo at all.
+      # This job is the ONLY place fmt, build, the workspace test suite, the
+      # named integration tests, clippy -D warnings and cargo-deny run. Its
+      # name is the second required context, `defense · build + lint + test`.
+      #
+      # What is LOST: the fail-fast ordering, i.e. this job no longer aborts
+      # in ~51 s before the build when an isolation gate is red — it now burns
+      # its full ~20 min. That is runner time, not coverage: cut-gate.yml runs
+      # CONCURRENTLY and still surfaces that same red in ~51 s.
+      #
+      # The SVG lint below stays: it is NOT duplicated in cut-gate.yml.
 
       # ── Asset hygiene: strict-parse every tracked SVG (toolchain-free) ──
       # PROD_Defense_v0.2.10 shipped two SVGs with a literal "--" inside an XML
