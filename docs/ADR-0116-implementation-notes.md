@@ -706,7 +706,17 @@ new `Connection::open` here would have cost a frozen-manifest bump on a guard wh
 job is to be inert. It follows ADR-0116 F4 — an unreadable table is UNKNOWN, never zero, so
 **both** counts must read an explicit `0` before it refuses.
 
-*Stated, not hidden:* the latch arm keys on "the live database is provably empty". A latched
+*Stated, not hidden (2 of 2).* The latch arm can produce exactly one false refusal: a
+DELIBERATE in-place restore to a snapshot carrying zero invoices AND zero audit entries
+leaves the live DB legitimately empty beside the unit, and the next boot refuses. That state
+is indistinguishable from the latch without an install-intent record — the second source of
+truth this ADR already rejected once, for the same reason. It is the cheap direction to be
+wrong in: nothing is lost, the refusal spells the exact undo, and reaching it needs a
+snapshot of a company that has never issued anything plus `--confirm --accept-data-loss`
+plus the intent to wipe back to empty. The alternative is serving an empty company over a
+real one with nothing louder than an `INFO` line.
+
+*Stated, not hidden (1 of 2):* the latch arm keys on "the live database is provably empty". A latched
 home that has since been SERVED and has accumulated real rows is no longer empty, and this
 will not refuse it — correctly, because by then a refusal would strand data the operator
 actually created. The way IN is closed at the source; this closes the way OUT for a home that
@@ -770,6 +780,51 @@ MU-A on the detector that uses it.
 The dead-end pin is *"the only place the string appears is the sentence that rules it out"*,
 not *"the string is absent"*: naming `aberp restore --in-place` and `aberp recover` as things
 that CANNOT run is the fix, so a pin on absence would have forbidden the fix itself.
+
+### Rev 5 measured results (2026-08-30, worktree `~/Documents/Claude/Projects/ABERP-snap-wt`, `--features production`, `--locked`)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo build --workspace --locked --all-targets` | clean |
+| `cargo build --release --locked -p aberp` | clean |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | clean |
+| `cargo test --workspace --locked --no-fail-fast` | **206 test binaries · 3 468 passed · 0 failed · 2 ignored** |
+| `ADR-0093 DB-isolation cut-gate` (CHECK 1-11, all ENFORCED) | **`CUT-GATE: ✓ PASSED`** — 29 removal sites / 3 guarded / 9 frozen; opener fingerprint set unchanged (98) |
+| `ADR-0111 checkpoint-site cut-gate` + probes | **PASSED** / **PASSED** |
+| `ADR-0110 D3 durable-ack gate` + probes | **PASSED** / **PASSED — the gate has teeth** |
+| `cut_gate_negative_probes.sh` | **`probes passed: 77   broken/escaped: 0` · `ALL CHECKS HAVE TEETH`** |
+| SVG well-formedness lint + its negative probe | PASS / PASS |
+| `cargo deny check --deny advisory-not-detected --deny license-not-encountered --deny license-exception-not-encountered --deny unmatched-skip` | advisories ok, bans ok, licenses ok, sources ok |
+
+No enforcement flag was disabled, no check skipped, no `continue-on-error`, no probe dropped.
+`serve_numbering_route::put_preserves_identity_and_bank_sections` — the rev-3 note's
+pre-existing, out-of-scope flake — passed. Both `aberp_cad_extract` binaries passed with the
+venv (`ABERP_TEST_PYTHON` absolute).
+
+**Two things went red before they went green, and neither was the branch.** Both are worth
+recording because both cost a full re-run and neither is obvious from a log.
+
+**A stale build artefact from a DELETED worktree.** The first two full-suite runs reported 17
+failures across 5 `aberp-cad-extract-wrapper` binaries, all instant (`0.00s`) and all
+`NotFound` on a committed STEP fixture. The path in the panic was
+`…/ABERP-adv-rev5-64712-afe4bdb/python/…` — the rev-5 ADVERSARIAL's worktree, which no longer
+exists. `CARGO_MANIFEST_DIR` is baked in by `env!()` at compile time and cargo's `env-dep`
+fingerprint did not invalidate on the change, so this worktree's `target/` was serving test
+binaries compiled against a dead checkout. Eight artefacts carried the dead path
+(`grep -rl <dead-path> target/`); `cargo clean -p aberp-cad-extract-wrapper -p aberp-snapshot
+-p aberp-invoice-pdf` cleared them and the rebuilt suite is the 206/3 468/0 above. **A red in
+those five binaries is worth one `grep -rl` over `target/` before it is worth any debugging**
+— they pass in isolation either way, which is what makes the cause invisible.
+
+**One transient probe.** The first negative-probe run reported `76 / 1`, the escape being
+`[CHECK 11] HARNESS — DEAD_GUARD must not fire on the PREDICATE rule applied to the guarded
+ACTION` with `exit=2` and its gate output truncated mid-CHECK-10M. Reproduced by hand in the
+real tree, the same mutation gives `exit=1` and prints the expected
+*"must apply to the PREDICATE"* — the gate does exactly what the probe asks. The clean re-run
+returned `77 / 0`. So the escape was that probe's copied tree dying early, not a check without
+teeth: an `exit=2` with TRUNCATED gate output is a harness/environment signal, not a verdict —
+the same distinction the harness already draws between HARNESS BUG and ESCAPED.
 
 ### Rev 5 — `788ee85` reworded, not squashed
 

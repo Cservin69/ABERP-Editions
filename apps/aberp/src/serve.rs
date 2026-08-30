@@ -858,6 +858,21 @@ enum BootMirrorRoute {
 /// counts must read as an explicit `0` before this refuses. A guard that ADDS
 /// a refusal must never be the reason a boot fails, so every uncertainty here
 /// resolves to "carry on".
+///
+/// # The one false refusal this can produce, stated rather than hidden
+///
+/// A deliberate in-place restore to a snapshot carrying **zero invoices and
+/// zero audit entries** leaves the live DB legitimately empty beside the unit,
+/// and this refuses the next boot. That state is indistinguishable from the
+/// latch without an install-intent record, which the ADR has already rejected
+/// once for this purpose (a second source of truth that can be lost, forged or
+/// left behind — the objection that sank the rollback-marker file).
+///
+/// It is the cheap direction to be wrong in: no data is lost, the refusal
+/// spells the exact undo, and the alternative is serving an empty company over
+/// a real one with nothing louder than an `INFO` line. Reaching it needs a
+/// snapshot of a company that has never issued anything, plus `--confirm
+/// --accept-data-loss`, plus the intent to wipe back to empty.
 fn refuse_a_latched_interrupted_restore(db: &Path, conn: &Connection) -> anyhow::Result<()> {
     let units = aberp_snapshot::find_pre_restore_units(db);
     let Some(unit) = units.first() else {
