@@ -57,6 +57,23 @@ jobs:
           ENFORCE_LAUNCHER_ARM_MATCH: "1"        # CHECK 7 (chunk 4)
         run: bash tools/cut_gate_db_isolation.sh
 
+      - name: Shard-set gate — the probe matrix is exactly 1..N
+        # The negative-probe suite is sharded, and each shard proves its OWN
+        # arithmetic. What no single shard job can see is whether the other
+        # shards exist: a matrix like [1, 1, 2, 3, 4, 5] runs every job, passes
+        # every job's share check, and leaves shard 6's probes running NOWHERE.
+        # This holds the shard set closed so that cannot happen quietly.
+        run: bash tools/cut_gate_probe_shard_matrix.sh
+
+      - name: Prove the shard-set gate has teeth (negative probes)
+        # Plants every way the matrix can lose a shard — a duplicate, a gap, an
+        # off-by-one, an empty list, the matrix deleted, and the total written
+        # as a literal instead of derived — and asserts RED. Pins the
+        # non-triggers too: raising or lowering the shard count is the
+        # documented remedy when a shard nears its cap, and a check that
+        # blocked it would simply get deleted the first time it was needed.
+        run: bash tools/cut_gate_probe_shard_matrix_probes.sh
+
       - name: ADR-0110 D3 durable-ack gate (money-path census, ENFORCED)
         # D3 ports Portable PROD_v2.33.6's power-loss durability to Defense's
         # money paths. One test is not a gate: the fault-injection suite
@@ -142,7 +159,7 @@ jobs:
   # fixed cost (one tree copy per probe, ~1-2 s each, paid in every shard)
   # dominates. 6 is the measured sweet spot.
   negative-probes:
-    name: negative probes ${{ matrix.shard }}/6 (cut-gate has teeth)
+    name: negative probes ${{ matrix.shard }}/${{ strategy.job-total }} (cut-gate has teeth)
     runs-on: ubuntu-latest
     # ~1/6 of the old 70 min. 30 is deliberate headroom (>2x), not a target —
     # the point of this change is that the cap stops being the binding
@@ -158,10 +175,16 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v5
-      - name: Prove the cut-gate has teeth (shard ${{ matrix.shard }} of 6)
+      - name: Prove the cut-gate has teeth (shard ${{ matrix.shard }} of ${{ strategy.job-total }})
         env:
           PROBE_SHARD_INDEX: ${{ matrix.shard }}
-          PROBE_SHARD_TOTAL: "6"
+          # DERIVED from the matrix, never written twice. A literal "6" here that
+          # disagreed with the matrix length would be invisible: with a TOTAL one
+          # higher than the number of jobs, the probes belonging to the missing
+          # shard run in NO job at all, and every job still reports "ran exactly
+          # its share". `strategy.job-total` is the matrix length by definition,
+          # so that particular silent hole cannot be opened.
+          PROBE_SHARD_TOTAL: ${{ strategy.job-total }}
         run: bash tools/cut_gate_negative_probes.sh
 
   # ── REQUIRED STATUS CHECK ───────────────────────────────────────────────────
@@ -190,7 +213,7 @@ jobs:
           PROBES: ${{ needs.negative-probes.result }}
         run: |
           echo "gates            = $GATES"
-          echo "negative-probes  = $PROBES   (all 6 shards; 'success' only if every one succeeded)"
+          echo "negative-probes  = $PROBES   (matrix aggregate: 'success' only if EVERY shard succeeded)"
           rc=0
           [ "$GATES" = "success" ]  || { echo "✗ the ENFORCED gate job did not succeed ($GATES)"; rc=1; }
           [ "$PROBES" = "success" ] || { echo "✗ at least one negative-probe shard did not succeed ($PROBES)"; rc=1; }
