@@ -429,6 +429,80 @@ they are likely one fix. Items 3, 4 and 5 are independent, and item 4 in
 particular is a constant change whose blast radius is the whole fixture
 corpus.
 
+> ### ✅ ALL FIVE CLOSED — 2026-09-01
+>
+> On branch `feat/d-19-located-holes-geometry`, in `holes.py` alone. Every
+> defect was reproduced first, fixed as geometry rather than as a
+> tolerance, and pinned by a FAMILY rather than by the one part it was
+> found on. The 43 committed fixtures keep their answers bit-identically;
+> three new ones are committed, one per root cause.
+>
+> The five turned out to be **two** root causes, not four:
+>
+> - **N4 + N3 — an inward root.** Round 7 already held that a root inward
+>   of the mouth lies in the void the bore hollowed out and cannot bound
+>   the solid — and applied it only to a TIE. The argument never mentioned
+>   the tie; confining it to one is what left an *undercut* seat (nose
+>   wider than bore, so the two roots are NOT equidistant) reading to the
+>   sphere's near pole. `_root_for_end`'s filter is now unconditional and
+>   the tangency falls out of it. Measured across 4 cutters x 8 undercuts
+>   spanning six decades, and across 13 nose depths for the drop.
+>   *Correction inside the correction:* the bound must be the mouth's
+>   REACH (`_edge_axial_extent`), not its mean — a mouth cut across a
+>   slope straddles its own average, and the mean-bounded first cut took
+>   a conical boss's MIRROR cone, 7 mm above the apex.
+> - **Item 3 + N2 + N1 — a parametric artifact read as geometry.** The
+>   *seam* marched as a barrier (item 3: 69 of 81 configurations short,
+>   0.04–3.98 mm, a contiguous band; closed by `_same_carrier`), and the
+>   *apex* admitted as a cap (N2 over-quoting by the point length; N1
+>   measuring 22.0 mm into a 20 mm plate, exiting in mid-air below the
+>   part; closed by `_collapsed_isoline_radius`).
+>
+> **Item 4 was NOT closed by the candidate fix the entry proposed.**
+> Raising `DEGENERATE_ISOLINE_RATIO` to ~`1e-6` would have moved a
+> tolerance; the defect is that a *dimensionless ratio against 1e-9* was
+> being asked to locate a degeneracy that `GeomAPI_IntCS` only resolves to
+> about the kernel's confusion (measured: the apex arrives at `v = 7.9e-08`
+> with a ratio of `6.8e-08`, 89x the admitted figure). The ratio arm keeps
+> the anisotropy job it was fit for; a second, MODEL-SPACE arm at
+> `1e3 x SURFACE_CONFUSION_MM` does the resolution job it was not. The two
+> populations were measured over the whole corpus plus the sweeps —
+> collapsed roots at ≤`1.09e-07` mm/rad, the smallest regular one at
+> `2.5` mm/rad — so the floor sits three orders above the noise and four
+> below the nearest real surface, and the answers are flat across every
+> decade between.
+>
+> **Flagged — one decision, not a math fix.** N1's *end condition* is a
+> design call: when the point breaks the far face the plate is holed but
+> the full-diameter bore is blind, and nothing in the geometry settles
+> which a drilling cycle prices from. Taken conservatively at BLIND on the
+> full-diameter depth (a blind cycle pecks and dwells, so it is the dearer
+> and therefore the visible direction), pinned as its own named test so
+> changing it is deliberate. The *depth* half of N1 was a pure math fix.
+>
+> **Three round-7 guards were re-pointed, none dropped.** The seam fix took
+> the pinch off `bore_beside_a_conical_boss`, so the guards for the ray
+> refinement and the barrier-chord floor no longer showed anything there.
+> Both were re-measured over a 203-part randomised family — the refinement
+> still changes an answer on 1, the floor on 13 — and moved onto parts that
+> still exercise them. The band's tie-break guard was superseded outright
+> and replaced with a revert-proof for the rule that now does the job.
+>
+> Mining cost is unchanged: 2.33 ms/bore at 150 holes and 8.96 at 600,
+> against 2.33 and 8.76 on `origin/main`. The one measurable regression —
+> the new same-carrier test asked before the cheap filters, which doubled
+> the bill on a 600-hole plate — was found by measurement and reordered.
+>
+> **Slice C is now UNBLOCKED and is NOT built here.** Drilling cycle-time
+> pricing needs a cycle-time model (SFM/feed per material and diameter,
+> peck logic on depth:diameter, tool change and approach), a *researched*
+> seed table — ADR-0097 shipped fully wired with an all-zero seed and
+> priced 0.00 EUR forever, which is the lesson — a catalogue/calibration
+> path, reasoning-log lines, and its own adversarial round. That is a
+> separate meaningful chunk, not a wiring exercise: `located_holes`
+> remains computed-and-unconsumed at `engine.rs`'s
+> `feature_machining_minutes`, exactly as ADR-0112 Part B left it.
+
 <a id="d-20"></a>
 ### D-20 — Pricing-queue hardening: four follow-ups the D-PRICEQ fix did not close
 

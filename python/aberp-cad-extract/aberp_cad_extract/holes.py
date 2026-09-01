@@ -259,6 +259,91 @@ on every committed fixture — OCCT's STEP writer re-parametrises planes,
 so every one of them is direct — which is why the part that proves it is
 built in memory.
 
+CORRECTED AGAIN (round 8 / backlog D-19, the five open defects). Slice C
+— drilling cycle-time pricing — was gated on these, all five PRE-EXISTING
+on the feature and four of them UNDER-quotes. Two root causes:
+
+**A root inward of the mouth is inside the bore's own void.** Round 7
+already said so, and applied it only to a TIE: two roots equidistant from
+the mouth are a tangency, the inward twin lies in the void the bore
+hollowed out, so the outward one wins. The argument never mentioned the
+tie. Confining it to one left the identical defect alive the moment the
+two roots were not equidistant, which is any UNDERCUT — a ball-end seat
+whose nose is wider than the bore it ends, a spherical seat, a lollipop
+cutter's relief. There the sphere meets the cylinder on a circle of the
+BORE's radius rather than on its own equator, and its near pole sits ~2r
+up INSIDE the bore, nearer the mouth than the true bottom is. Nearest took
+it. A Ø8 seat undercut by five ten-thousandths of a millimetre read 2.7995
+deep against 10.8 — 74% short — and reported a plainly blind pocket as
+THROUGH, because the cavity's outward normal up there points back down the
+bore (N4). At the depths where that phantom root lands on the bore's own
+far end the span collapses to zero and a zero-deep bore is DROPPED: a Ø16
+seat returned no holes at all, a silent under-COUNT (N3). The filter is
+now unconditional, and the tangency falls out of it rather than being
+special-cased.
+
+One correction inside the correction, because the first cut of it was
+wrong in the other direction. "Inward of the mouth" has to be measured
+against the mouth's REACH and not its mean: a mouth cut across a slope
+straddles its own average, so the mean-bounded filter threw away the true
+crossing on a bore under a conical boss and took the MIRROR cone's, seven
+millimetres above the apex. :func:`_edge_axial_extent` is the bound, and
+it narrows without ever emptying — refuse every root and the whole field
+comes back, which is what keeps a cap that computes a bit inside its own
+mouth from being lost.
+
+**A parametric artifact is not geometry**, in two places that look
+unrelated and are the same mistake.
+
+- The cone's SEAM, marched as a barrier. :func:`_rim_barriers` takes a rim
+  face's own edges that touch the mouth to be the part edges the bore CUT,
+  and divides the mouth's footprint along them. A seam passes that
+  description and is not one: it is where a closed surface was opened to
+  carry a parameter domain, the skin runs straight across it, and the
+  material does not change. On a bore under a conical boss the seam lies
+  beside the axis and laid a phantom wall clean across the footprint, with
+  the axis on one side and the CONE'S ENTIRE SHARE OF THE MOUTH on the
+  other. Every ray was blocked, :meth:`_EndEvidence._rim_winner` narrowed
+  to zero caps and fell back to the innermost crossing of the whole rim —
+  the plate's flat top, below the boss it actually breaks out of. A
+  contiguous band, ~42% of its local region, short by 0.04 to 3.98 mm.
+  Insensitive to ray count by construction, so no ladder reaches it.
+  ``bore_beside_a_conical_boss`` passed only because the march's reach ran
+  out two millimetres before it would have blocked the last ray.
+
+  :func:`_same_carrier` is the test, and it is GEOMETRIC because the
+  topological answer does not survive the miner's actual input. In memory
+  OCCT flags the seam and keeps one face either side of it; through STEP
+  the cone comes back as two faces with two different surface objects and
+  no flag. Same cone, same skin, none of the bookkeeping.
+
+- The cone's APEX, admitted as a cap. :func:`_crossing_normal` exists to
+  refuse exactly this — a point the axis touches and carries through,
+  still in the same void — and the screen it refused on was a derivative
+  ratio against 1e-9. ``GeomAPI_IntCS`` does not resolve a degeneracy to
+  1e-9. It reported a 118° point's apex at ``v = 7.9e-08`` where the apex
+  is at zero, the collapsed derivative came back at 6.8e-08 — 89x the
+  admitted ratio — and the apex arrived looking like an ordinary point
+  with an ordinary normal. Sporadic, which is worse than systematic: it
+  fired on the tip depths where OCCT's rounding happened to land off the
+  apex, over-quoting by the whole point length (~0.3xD) (N2). Where the
+  point BREAKS the far face the apex is below the part, and the bore was
+  measured to it: 22.0 deep in a 20 mm plate, exiting two millimetres
+  under the material, which is the one defect of the set that is visibly
+  impossible rather than merely wrong (N1). The screen is now
+  :func:`_collapsed_isoline_radius`, which keeps the ratio arm for
+  anisotropy and adds a MODEL-SPACE arm at the kernel's own confusion —
+  measured seven orders clear of both populations.
+
+A breakout point's END CONDITION is a decision and not a measurement, and
+it is taken conservatively: BLIND, at the full-diameter depth. The plate
+is holed and the full-diameter bore is not, and nothing in the geometry
+settles which one a drilling cycle should be priced from; a blind cycle
+pecks and dwells against a closed bottom and is the dearer of the two, so
+it is the over-price direction and therefore the visible one.
+``test_r8_a_breakout_point_reads_BLIND_by_a_flagged_decision`` is where to
+come and argue with that when slice C wants to price breakout relief.
+
 Open or capped (ADR-0112 adversarial, B2 + N2)
 ------------------------------------------------
 
@@ -526,7 +611,37 @@ CAP_OUTWARD_MIN_COS: float = 1e-6
 #: derivative at ~1e-16 against ~1e0 for its partner — a ratio of 1e-16.
 #: At any regular point the two are within a few orders of magnitude of
 #: each other. Nothing real lives within nine orders of 1e-9.
+#:
+#: NARROWED IN SCOPE (round 8, N2). This arm now answers ANISOTROPY only
+#: — "small compared with its partner" — and it is no longer asked to
+#: answer RESOLUTION as well. It could not: the parameter it judges comes
+#: from ``GeomAPI_IntCS``, which locates a degeneracy to about the
+#: kernel's confusion and not to 1e-9, so a 118 deg drill point's apex
+#: arrived with a ratio of 6.8e-08 and was read as an ordinary point.
+#: :data:`DEGENERATE_ISOLINE_CONFUSIONS` is the second arm, and
+#: :func:`_collapsed_isoline_radius` is where the two are taken together.
 DEGENERATE_ISOLINE_RATIO: float = 1e-9
+
+#: The second arm of the same test, in MULTIPLES of
+#: :data:`SURFACE_CONFUSION_MM`: an isoline whose own radius in model
+#: space is under ``this x confusion`` mm per radian has collapsed,
+#: however healthy its partner.
+#:
+#: A resolution floor, not a tuning knob. What it has to clear is the
+#: intersector's own parametric error, which is a property of OCCT and
+#: not of the part: measured over the committed corpus and the
+#: adversarial sweeps, a root that sits ON a degeneracy comes back with
+#: an isoline radius of at most 1.09e-07 mm/rad — the kernel's confusion,
+#: near enough exactly, which is what one would expect of a point the
+#: intersector believes is on the surface. What it must not reach is a
+#: real surface: the smallest isoline radius at any REGULAR cap root
+#: anywhere in the same measurement is 2.5 mm/rad.
+#:
+#: 1e3 puts the floor at 1e-4 mm/rad — three orders above the noise it
+#: swallows and four below the nearest real surface — and the answers are
+#: flat across every decade between, which
+#: ``test_r8_the_degeneracy_floor_is_not_a_tuned_epsilon`` walks.
+DEGENERATE_ISOLINE_CONFUSIONS: float = 1e3
 
 #: How far out of ONE PLANE, as a sine, the isoline tangents around a
 #: collapsed isoline may lie before that point is ruled to have no
@@ -613,7 +728,8 @@ DEGENERATE_PROBE_DIRECTIONS: int = 4
 #: — OCCT's own ``Precision::Confusion``, in mm, restated here so the
 #: feature-off import guard stays a pure-Python affair.
 #:
-#: Used only to size :func:`_tangency_band`, never to compare positions.
+#: Used to size :func:`_tangency_band` and
+#: :func:`_collapsed_isoline_radius`, never to compare positions.
 SURFACE_CONFUSION_MM: float = 1e-7
 
 
@@ -629,6 +745,34 @@ SURFACE_CONFUSION_MM: float = 1e-7
 #: the instant the track leaves the footprint, which on the straight edge
 #: that cuts an ordinary chamfer or fillet happens within a step or two.
 BARRIER_REACH_RADII: float = 3.0
+
+#: How many points of a mouth edge :func:`_edge_axial_extent` samples to
+#: find how far that edge reaches along the bore's axis.
+#:
+#: The extent bounds :func:`_root_for_end`'s inward test, and reporting it
+#: SHORT is the direction that costs, so this is set by how well a smooth
+#: curve's extreme survives being sampled rather than by cost. A mouth
+#: edge is at most the bore's own circumference long and bends on the
+#: scale of the bore's radius, so 33 samples put the missed extreme at
+#: order ``r/1000`` of a turn squared — orders inside the tangency band
+#: the caller pads by anyway, and inside it for a bore of any size because
+#: both scale with the radius.
+EDGE_EXTENT_SAMPLES: int = 33
+
+#: The side of the square parameter grid :func:`_same_carrier` probes one
+#: face's carrier at before deciding it is the other's too.
+#:
+#: Three is the smallest grid that can tell a SURFACE apart from a curve
+#: through it: two probes on one isoline are satisfied by any surface
+#: containing that line, and the third row is the first that can fall off
+#: it. Nine points over the trimmed domain, at the corners, the edges and
+#: the middle, is what a seam has to survive — and a seam survives it
+#: exactly, at 0.0 mm, because it IS the same surface. What must not
+#: survive is a genuinely different neighbour, and those miss by a part
+#: dimension: on the committed corpus the nearest same-TYPE pair that is
+#: not the same surface projects 1.5 mm out, seven orders above
+#: :data:`SURFACE_CONFUSION_MM`.
+CARRIER_PROBE_GRID: int = 3
 
 #: Steps per radius of :data:`BARRIER_REACH_RADII`.
 #:
@@ -1166,6 +1310,44 @@ def _edge_axial_mean(edge, origin, direction) -> Optional[float]:
     return total / samples
 
 
+def _edge_axial_extent(edge, origin, direction) -> Optional[Tuple[float, float]]:
+    """How far along the axis this edge REACHES, at both ends of it.
+
+    :func:`_edge_axial_mean` says roughly where an edge sits, which is all
+    that is needed to sort it to one end of the bore. This says how far it
+    spreads, and the difference matters wherever a mouth is not planar:
+    the mean of a mouth cut across a slope is a place the mouth may not
+    reach on either side of the axis, and :func:`_root_for_end` needs the
+    reach rather than the average of it.
+
+    Sampled more finely than the mean for the same reason. Reporting the
+    extent SHORT is the direction that costs — it would disqualify a root
+    the mouth really does straddle — so the sample is dense enough that a
+    smooth mouth's extreme is found to well inside the tangency band, and
+    the caller pads by that band besides.
+    """
+    try:
+        curve = BRepAdaptor_Curve(edge)
+        u0, u1 = float(curve.FirstParameter()), float(curve.LastParameter())
+    except Exception:  # noqa: BLE001 — an unreadable edge bounds nothing
+        return None
+    lo = hi = None
+    for k in range(EDGE_EXTENT_SAMPLES):
+        u = u0 + (u1 - u0) * k / (EDGE_EXTENT_SAMPLES - 1)
+        p = curve.Value(u)
+        t = _dot(
+            (
+                float(p.X()) - origin[0],
+                float(p.Y()) - origin[1],
+                float(p.Z()) - origin[2],
+            ),
+            direction,
+        )
+        lo = t if lo is None or t < lo else lo
+        hi = t if hi is None or t > hi else hi
+    return (lo, hi) if lo is not None else None
+
+
 def _edge_mid_point(edge) -> Optional[Tuple[float, float, float]]:
     """A point at the middle of this edge's parameter range.
 
@@ -1249,6 +1431,177 @@ def _plane_axis_intersection(
         float(p.Z()) - origin[2],
     )
     return _dot(to_plane, normal) / denom, normal
+
+
+def _collapsed_isoline_radius(surviving: float) -> float:
+    """How small an isoline's own radius may be — ``|D1U|`` or ``|D1V|``,
+    in mm per radian — before that isoline counts as COLLAPSED.
+
+    Two arms, because a collapse can be hidden two different ways, and
+    the round-8 defect (N2) was the second arm being missing.
+
+    ANISOTROPY is the first. Where the surviving derivative is enormous,
+    a genuinely regular partner can still be small in absolute terms, so
+    the collapse has to be judged RELATIVE to it. That is
+    :data:`DEGENERATE_ISOLINE_RATIO`, and it is what this test has always
+    been.
+
+    RESOLUTION is the second, and it is what the ratio alone cannot
+    supply. ``GeomAPI_IntCS`` does not hand back the parameter of the
+    degeneracy; it hands back a parameter NEAR it, and the size of "near"
+    is the intersector's own, not ours. At a cone's apex the collapsed
+    derivative is ``|v - v_apex| * sin(half-angle)``, exactly
+    proportional to that error — so on a 118 deg drill point OCCT
+    reported ``v = 7.9e-08`` where the apex is at ``v = 0`` and the ratio
+    came back at 6.8e-08, EIGHTY-NINE TIMES the 1e-9 the ratio arm
+    admits. The apex then passed as an ordinary point with an ordinary
+    normal, which is the one thing :func:`_crossing_normal` exists to
+    refuse, and the bore ran on to it: a blind hole over-quoted by the
+    whole point length (~0.3xD), and, where the point broke the far face,
+    a depth measured to a pole in the air BELOW the part.
+
+    Asking a ratio against 1e-9 to see a degeneracy located to 1e-7 is
+    asking the input a question it cannot answer. So the second arm is
+    absolute and in MODEL SPACE, at the kernel's own confusion inflated
+    by a stated margin:
+
+        floor = DEGENERATE_ISOLINE_CONFUSIONS * SURFACE_CONFUSION_MM
+
+    Both sides are measured across the committed corpus and the
+    adversarial sweeps, and the gap is not close. Every REGULAR cap root
+    the miner meets has an isoline radius of order the capping surface's
+    own size: the smallest anywhere is 2.5 mm/rad, and the smallest RATIO
+    3.75e-01. Every COLLAPSED one — an analytic sphere's pole, a NURBS
+    pole, a cone's apex, whether OCCT lands on the degeneracy exactly or
+    a whisker off it — comes in at 1.09e-07 mm/rad or below. The floor at
+    1e-4 sits three orders above the noise and four below the nearest
+    real surface.
+
+    Erring is one-directional, which is why the margin above matters less
+    than the margin below. A regular point wrongly called collapsed is
+    handed to :func:`_degenerate_point_normal`, whose coplanarity test
+    then refuses it, and a refused root leaves the bore's own parametric
+    end standing — the over-price direction, and the visible one. A
+    collapsed point wrongly called regular is the defect above.
+    """
+    return max(
+        DEGENERATE_ISOLINE_RATIO * surviving,
+        DEGENERATE_ISOLINE_CONFUSIONS * SURFACE_CONFUSION_MM,
+    )
+
+
+def _same_carrier(face_a, face_b) -> bool:
+    """Do these two faces lie on the SAME surface?
+
+    Asked geometrically, by taking points of one face's carrier and
+    projecting them onto the other's: two faces carry one surface exactly
+    when every point of either is on both, and a grid over the trimmed
+    domain is the honest sample of that.
+
+    It has to be geometric because the topological answer does not
+    survive the miner's actual input. In memory, OCCT marks a seam with
+    ``BRep_Tool.IsClosed_s`` and keeps ONE face on both sides of it,
+    sharing one ``Geom_Surface``. Write that part to STEP and read it
+    back — which is every part this miner will ever see — and the cone
+    comes back as TWO faces, each with its OWN ``Geom_ConicalSurface``
+    object, and ``IsClosed_s`` false on the edge between them. Same cone,
+    same skin, none of the flags. Measured on
+    ``bore_beside_a_shallower_conical_boss``: in memory the seam edge
+    reports ``seam=True`` and identical surface handles; through STEP it
+    reports ``seam=False`` and two different handles describing the same
+    cone.
+
+    The type is checked first because it is free and it is decisive: skin
+    that changes KIND at an edge is a crease whatever its numbers. That
+    leaves the projection to separate two faces of one surface from two
+    genuinely different surfaces of a kind — two cylinders of equal radius
+    on parallel axes, say — and the projection separates them by their own
+    offset, which is a part dimension rather than a tolerance.
+
+    Deliberately NOT a tangency test. The skin either side of a tangent
+    fillet edge is continuous and the two carriers still DIVERGE away from
+    it, which is the whole reason :func:`_rim_barriers` wants that edge as
+    a barrier: the crossing taken from the wrong side of it is off the
+    part. Same-surface is a strictly narrower claim, and it is the one
+    that means "there is nothing here to choose between".
+    """
+    surf_a, surf_b = BRep_Tool.Surface_s(face_a), BRep_Tool.Surface_s(face_b)
+    if surf_a is None or surf_b is None:
+        return False
+    if _adaptor(face_a).GetType() != _adaptor(face_b).GetType():
+        return False
+    u0, u1, v0, v1 = BRepTools.UVBounds_s(face_a)
+    if not all(math.isfinite(b) for b in (u0, u1, v0, v1)):
+        return False
+    projector = GeomAPI_ProjectPointOnSurf()
+    n = CARRIER_PROBE_GRID
+    for i in range(n):
+        for j in range(n):
+            u = u0 + (u1 - u0) * i / (n - 1) if n > 1 else 0.5 * (u0 + u1)
+            v = v0 + (v1 - v0) * j / (n - 1) if n > 1 else 0.5 * (v0 + v1)
+            try:
+                projector.Init(surf_a.Value(u, v), surf_b)
+                if not projector.NbPoints():
+                    return False
+                if float(projector.LowerDistance()) > SURFACE_CONFUSION_MM:
+                    return False
+            except Exception:  # noqa: BLE001 — a surface that will not answer is not proven same
+                return False
+    return True
+
+
+def _is_parametric_artifact(edge, face, neighbours) -> bool:
+    """Is ``edge`` an artifact of how the skin is PARAMETRISED or CUT UP,
+    rather than a real crease in it?
+
+    Two kinds, and neither divides anything:
+
+    - A SEAM, or any other cut through one continuous skin. A closed
+      surface has to be opened before it can carry a rectangular parameter
+      domain, and the cut is an edge with the SAME SURFACE on both sides.
+      The skin runs straight across it and the material does not change.
+      :func:`_same_carrier` is the test, asked geometrically because the
+      flag OCCT sets in memory does not survive a STEP round trip.
+    - A DEGENERATE edge. That is a whole parametric line collapsed onto
+      ONE point — a cone's apex, a sphere's pole. It has no extent to
+      divide a footprint with, and marching its "curve" across the mouth
+      tracks nothing.
+
+    Why this is here (round 8, the boss-overhang band). :func:`_rim_barriers`
+    takes a rim face's own edges that touch the mouth to be the part edges
+    the bore CUT, and marches each one across the mouth's footprint to
+    divide it. A seam passes that description and is not one. On a bore
+    under a conical boss the cone's seam is a straight line lying beside
+    the axis, and marching it laid a phantom wall clean across the
+    footprint with the axis on one side and the CONE'S ENTIRE SHARE OF THE
+    MOUTH on the other: every ray in :func:`_skin_reaches_axis` crossed
+    it, the cone was ruled not to be the skin over the axis,
+    :meth:`_EndEvidence._rim_winner` narrowed to zero caps and fell back
+    to the innermost crossing of the whole rim — the plate's flat top,
+    below the boss. A contiguous 42% of the local region read short, by
+    0.05 to 4.36 mm (up to 17.9%).
+
+    It is emphatically NOT a sampling artifact, and no ray count reaches
+    it: the whole arc is on the far side of the phantom. The committed
+    ``bore_beside_a_conical_boss`` passed only because the march's own
+    reach ran out two millimetres before it would have blocked the last
+    ray — which is to say it passed on an accident of
+    :data:`BARRIER_REACH_RADII`, and a boss a shade shorter took it back.
+
+    :func:`_crosses` already knew half of this: it refuses a barrier that
+    runs through the axis ITSELF partly because "a sphere's parametric
+    SEAM is such an edge, it is not a crease in the skin at all". True of
+    a seam wherever it runs, not only of one through the axis.
+    """
+    try:
+        if BRep_Tool.Degenerated_s(edge):
+            return True
+        if BRep_Tool.IsClosed_s(edge, face):
+            return True
+    except Exception:  # noqa: BLE001 — an edge that will not answer is not an artifact
+        return False
+    others = [other for other in neighbours if not other.IsSame(face)]
+    return bool(others) and all(_same_carrier(face, other) for other in others)
 
 
 def _isoline_tangent(surface, u, v, along_u) -> Optional[Tuple[float, float, float]]:
@@ -1402,9 +1755,9 @@ def _crossing_normal(surface, u, v, direction) -> Optional[Tuple[float, float, f
     mag_v = math.sqrt(d_v.X() ** 2 + d_v.Y() ** 2 + d_v.Z() ** 2)
 
     u_min, u_max, v_min, v_max = surface.Bounds()
-    if mag_u <= DEGENERATE_ISOLINE_RATIO * mag_v:
+    if mag_u <= _collapsed_isoline_radius(mag_v):
         lo, hi, along_u = u_min, u_max, True
-    elif mag_v <= DEGENERATE_ISOLINE_RATIO * mag_u:
+    elif mag_v <= _collapsed_isoline_radius(mag_u):
         lo, hi, along_u = v_min, v_max, False
     else:
         # A regular point. OCCT's own normal is trustworthy here.
@@ -1968,7 +2321,9 @@ def _barrier_track(edge, vertex, origin, e1, e2, radius) -> List[Tuple[float, fl
     return track
 
 
-def _rim_barriers(faces, mouth, origin, e1, e2, radius) -> List[List[Tuple[float, float]]]:
+def _rim_barriers(
+    faces, mouth, origin, e1, e2, radius, ancestors=None
+) -> List[List[Tuple[float, float]]]:
     """Every part edge the bore CUT at this rim, as a track across the
     mouth's footprint.
 
@@ -2006,6 +2361,15 @@ def _rim_barriers(faces, mouth, origin, e1, e2, radius) -> List[List[Tuple[float
             if cut is None:
                 continue
             seen.append(edge)
+            # Asked LAST, because it is the only expensive question here
+            # and it is only worth asking of an edge that has already
+            # proved to be a candidate barrier. Asked first it runs on
+            # every edge of the rim's faces, which on a 600-hole plate is
+            # every mouth on the plate's top face: measured, that alone
+            # doubled the mining bill.
+            neighbours = ancestors.of(edge) if ancestors is not None else []
+            if _is_parametric_artifact(edge, face, neighbours):
+                continue
             track = _barrier_track(edge, cut, origin, e1, e2, radius)
             if len(track) > 1:
                 tracks.append(track)
@@ -2131,9 +2495,13 @@ class _EndEvidence:
     mouth in half.
     """
 
-    __slots__ = ("caps", "touching", "mouths", "_face_keys")
+    __slots__ = ("caps", "touching", "mouths", "ancestors", "_face_keys")
 
-    def __init__(self):
+    def __init__(self, ancestors=None):
+        #: The part's edge -> faces map, carried so :meth:`_skin_over_axis`
+        #: can ask what lies on the OTHER side of a candidate barrier. A
+        #: barrier only divides the mouth if the skin changes across it.
+        self.ancestors = ancestors
         self.caps: List[
             Tuple[
                 float,
@@ -2227,7 +2595,9 @@ class _EndEvidence:
         e1, e2 = _perp_basis(direction)
         try:
             faces = [TopoDS.Face_s(self._face_keys.FindKey(key)) for key in keys]
-            barriers = _rim_barriers(faces, edges, origin, e1, e2, radius)
+            barriers = _rim_barriers(
+                faces, edges, origin, e1, e2, radius, self.ancestors
+            )
         except Exception:  # noqa: BLE001 — an unreadable rim narrows nothing
             return []
         if not barriers:
@@ -2515,6 +2885,7 @@ def _root_for_end(
     t_edge: float,
     at_low: bool,
     radius: float,
+    t_inward: Optional[float] = None,
 ) -> Tuple[float, Tuple[float, float, float]]:
     """Which crossing of ONE cap face belongs to THIS end of the bore.
 
@@ -2577,16 +2948,12 @@ def _root_for_end(
     answer. Requiring the straddle is why every one of the 43 committed
     fixtures stays bit-identical rather than 42 of them.
     """
-    best = min(roots, key=lambda root: abs(root[0] - t_edge))
-    reach = abs(best[0] - t_edge)
-    band = _tangency_band(radius)
-    tied = [root for root in roots if abs(abs(root[0] - t_edge) - reach) <= band]
     sign = -1.0 if at_low else 1.0
-    outward = [root for root in tied if sign * (root[0] - t_edge) >= 0.0]
-    inward = [root for root in tied if sign * (root[0] - t_edge) < 0.0]
-    if not (outward and inward):
-        return best
-    return max(outward, key=lambda root: sign * root[0])
+    band = _tangency_band(radius)
+    bound = t_edge if t_inward is None else t_inward
+    outward = [root for root in roots if sign * (root[0] - bound) >= -band]
+    field = outward or list(roots)
+    return min(field, key=lambda root: abs(root[0] - t_edge))
 
 
 def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence]:
@@ -2644,7 +3011,7 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
     origin, direction = group.origin, group.direction
     mid = 0.5 * (p_lo + p_hi)
     pad = 1e-6
-    low, high = _EndEvidence(), _EndEvidence()
+    low, high = _EndEvidence(ancestors), _EndEvidence(ancestors)
 
     for cyl_face in group.faces:
         explorer = TopExp_Explorer(cyl_face, TopAbs_EDGE)
@@ -2663,6 +3030,28 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
                     continue
                 at_low = t_edge < mid
                 end = low if at_low else high
+                # How far INWARD this mouth edge itself reaches. A root
+                # further in than that is inside the void the bore
+                # hollowed out — see :func:`_root_for_end`. Measured on
+                # the edge's REACH rather than its mean, because a mouth
+                # cut across a slope straddles its own mean.
+                #
+                # Computed at most ONCE per edge, and only for a face that
+                # offers this end more than one root — which is the only
+                # case that has anything to choose between, and is a small
+                # minority of a plate's caps. A plane offers one root and
+                # never pays for the walk.
+                inward: List[Optional[float]] = []
+
+                def reach_inward(_at_low=at_low, _edge=edge) -> Optional[float]:
+                    if not inward:
+                        extent = _edge_axial_extent(_edge, origin, direction)
+                        inward.append(
+                            None
+                            if extent is None
+                            else (extent[1] if _at_low else extent[0])
+                        )
+                    return inward[0]
                 # The far bound for THIS end: a low-end cap may lie as far
                 # below the bore as its own curvature carries it, but not
                 # above the high end.
@@ -2684,7 +3073,11 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
                     if not roots:
                         continue
                     t_cap, normal = _root_for_end(
-                        roots, t_edge, at_low, group.radius
+                        roots,
+                        t_edge,
+                        at_low,
+                        group.radius,
+                        reach_inward() if len(roots) > 1 else None,
                     )
                     end.caps.append(
                         (

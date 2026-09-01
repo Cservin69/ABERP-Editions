@@ -1214,6 +1214,102 @@ def ball_nose_blind_bore_d4_deep():
     return BRepAlgoAPI_Cut(bored, nose).Shape()
 
 
+def undercut_ball_seat():
+    """A ball-end seat whose NOSE is WIDER than the bore that leads to it.
+
+    An undercut, and an ordinary one — a ball-end mill plunged into a bore
+    it does not quite match, a spherical seat, a lollipop cutter's relief.
+    The sphere meets the cylinder on a circle of the BORE's radius rather
+    than on the sphere's own equator, so the sphere's near pole sits
+    INSIDE the bore's void, ~2r above the mouth.
+
+    That pole is the nearest root to the mouth, and round 7 took the
+    nearest: the pocket measured to a point in mid-void, 74% short, and
+    reported a plainly blind seat as THROUGH because the cavity's normal
+    up there points back down the bore. The tangency tie-break did not
+    reach it — a tie needs the two roots equidistant, and an undercut of
+    e >= 4e-7 mm is already outside the band (round 8, N4).
+
+    Ø8 bore, nose radius 4.0005 (e = 5e-4) centred at z=13.2005, so the
+    seat bottoms at exactly z=9.2.
+
+    Expected: 1 hole, Ø8.0, depth 10.8, entry (20, 20, 20), axis
+    (0, 0, -1), BLIND, and NOT a flat bottom. Round 7: 2.7995 and THROUGH.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    bored = BRepAlgoAPI_Cut(
+        block, _cyl(20.0, 20.0, 13.2005, 0, 0, 1, 4.0, 30.0)
+    ).Shape()
+    nose = BRepPrimAPI_MakeSphere(gp_Pnt(20.0, 20.0, 13.2005), 4.0005).Shape()
+    return BRepAlgoAPI_Cut(bored, nose).Shape()
+
+
+def bore_beside_a_shallower_conical_boss():
+    """:func:`bore_beside_a_conical_boss`, with the boss two mm shorter.
+
+    Same part in every other respect, and that is the point. The
+    committed 20 mm boss answered correctly for a reason that had nothing
+    to do with the geometry: the cone's parametric SEAM was being marched
+    across the mouth as though it were a part edge the bore had cut, and
+    the phantom wall it laid down would have shut the cone out of its own
+    end — except that the march's reach ran out two millimetres before it
+    got there.
+
+    Take the boss down to 18 and the reach is enough. The cone loses the
+    end, `_skin_over_axis` narrows to nothing, and the bore reads 20.0 —
+    the plate's flat top, 3.5 mm below the boss it actually breaks out of
+    (round 8, the zero-caps band).
+
+    R10 x 18 cone based at z=10 on the corner at (40, 20); bore at
+    (38.5, 22), 2.5 mm off the cone's axis, so the skin over the axis is
+    the cone at z = 10 + 18*(1 - 2.5/10) = 23.5.
+
+    Expected: 1 hole, Ø8.0, depth 23.5, axis (0,0,1), entry
+    (38.5, 22, 0), THROUGH. Round 7: 20.0, exiting 3.5 mm inside the boss.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    cone = BRepPrimAPI_MakeCone(
+        gp_Ax2(gp_Pnt(40.0, 20.0, 10.0), gp_Dir(0, 0, 1)), 10.0, 0.0, 18.0
+    ).Shape()
+    fused = BRepAlgoAPI_Fuse(block, cone).Shape()
+    return BRepAlgoAPI_Cut(
+        fused, _cyl(38.5, 22.0, -10.0, 0, 0, 1, 4.0, 100.0)
+    ).Shape()
+
+
+def breakout_drill_point():
+    """A blind Ø8 bore whose POINT breaks out of the far face.
+
+    The full-diameter bore stops inside the plate; the drill's point pokes
+    through the bottom and leaves a small hole in it. A commonplace
+    result of drilling to a depth specified at the shoulder.
+
+    The cone's apex is at z=-2.0, two millimetres BELOW a plate that
+    stops at z=0, and round 7 measured the bore to it: depth 22.0 on a
+    20 mm plate, an exit coordinate in mid-air under the part. The apex
+    is a point the axis touches and carries through, never a cap, and
+    `_crossing_normal` was written to refuse exactly that — but the
+    degeneracy screen it refuses on was 89x tighter than
+    `GeomAPI_IntCS`'s own parametric resolution, so the apex arrived
+    looking like an ordinary point (round 8, N1/N2).
+
+    Point cone: radius 4 over a height of 2.4, an included angle of
+    118.07 deg, apex at z=-2.0 — so the full-diameter bore runs from
+    z=0.4 to the plate top.
+
+    Expected: 1 hole, Ø8.0, depth 19.6, entry (20, 20, 20), axis
+    (0, 0, -1), BLIND, and NOT a flat bottom. Round 7: 22.0, exiting at
+    z=-2.0. See `test_r8_a_breakout_point_is_a_design_decision` for why
+    BLIND is the answer and not THROUGH.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    shaft = _cyl(20.0, 20.0, 0.4, 0, 0, 1, 4.0, 30.0)
+    point = BRepPrimAPI_MakeCone(
+        gp_Ax2(gp_Pnt(20.0, 20.0, -2.0), gp_Dir(0, 0, 1)), 0.0, 4.0, 2.4
+    ).Shape()
+    return BRepAlgoAPI_Cut(block, BRepAlgoAPI_Fuse(shaft, point).Shape()).Shape()
+
+
 def bore_beside_a_conical_boss():
     """A Ø8 bore under a conical boss that OVERHANGS the plate's edge.
 
@@ -1308,6 +1404,9 @@ FIXTURES = {
     "blind_bore_beside_two_chamfers_corner.step": blind_bore_beside_two_chamfers_corner,
     # ADR-0112 adversarial round 6.
     "bore_straddling_a_rounded_edge.step": bore_straddling_a_rounded_edge,
+    "undercut_ball_seat.step": undercut_ball_seat,
+    "bore_beside_a_shallower_conical_boss.step": bore_beside_a_shallower_conical_boss,
+    "breakout_drill_point.step": breakout_drill_point,
     "blind_bore_straddling_a_rounded_edge.step": blind_bore_straddling_a_rounded_edge,
     "bore_straddling_a_concave_fillet.step": bore_straddling_a_concave_fillet,
     "bore_through_a_domed_shoulder.step": bore_through_a_domed_shoulder,

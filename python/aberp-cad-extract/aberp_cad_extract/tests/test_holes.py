@@ -2340,7 +2340,7 @@ def test_r6_nearest_root_alone_re_breaks_the_ball_nose(
     monkeypatch.setattr(
         holes_mod,
         "_root_for_end",
-        lambda roots, t_edge, at_low, radius: min(
+        lambda roots, t_edge, at_low, radius, t_inward=None: min(
             roots, key=lambda root: abs(root[0] - t_edge)
         ),
     )
@@ -2703,23 +2703,39 @@ def test_r7_the_tangency_tie_holds_as_the_pocket_is_walked_down():
     assert not wrong, f"{len(wrong)}/{len(depths)} depths mis-mined: {wrong[:5]}"
 
 
-def test_r7_a_bit_exact_tie_re_breaks_the_whole_sweep(monkeypatch):
-    """REVERT-PROOF for the band, and the round-6 test's blind spot.
+def test_r7_a_bare_nearest_pick_re_breaks_the_whole_sweep(monkeypatch):
+    """REVERT-PROOF for the outward filter, across the FAMILY.
 
-    `test_r6_nearest_root_alone_re_breaks_the_ball_nose` pins the tie-break
-    by removing it entirely. It cannot see the defect this round is about,
-    because round 6's `==` and round 7's band agree exactly on the one
-    fixture that test uses. So put the criterion back to BIT-EXACT — the
-    code as round 6 shipped it — and require the sweep to collapse.
+    SUPERSEDES round 7's ``test_r7_a_bit_exact_tie_re_breaks_the_whole_sweep``,
+    which put the tie criterion back to BIT-EXACT and required the sweep to
+    collapse. It cannot any more, and the reason is that round 8 stopped
+    the tangency being a special case at all.
 
-    Most of the family must break, and the committed round-6 fixture must
-    NOT: that asymmetry IS the defect. A tie that fires on one pocket and
-    not on its neighbours is a coincidence, however geometric its prose.
+    Round 7 disqualified the INWARD twin of a tied pair, on the argument
+    that inward of the mouth is inside the void the bore itself hollowed
+    out and no surface can bound the solid there. That argument never
+    mentioned the tie — it is true of any inward root — and round 8's
+    undercut seat is where confining it to a tie cost money: a nose
+    0.0005 mm wider than its bore is not tied, so the inward pole won and
+    the pocket read 74% short and THROUGH. The filter is now unconditional
+    and the tie falls out of it, so the band no longer decides the
+    tangency and setting it to zero no longer breaks anything.
+
+    What still breaks the family is removing the filter, which is what
+    this pins. Most of the thirty-six cutters must go back to reading one
+    cutter DIAMETER short and THROUGH — the signature of the inward pole
+    winning — and the committed fixtures keep their own guard in
+    :func:`test_r6_nearest_root_alone_re_breaks_the_ball_nose`.
     """
     import aberp_cad_extract.holes as holes_mod
 
-    monkeypatch.setattr(holes_mod, "_tangency_band", lambda radius: 0.0)
-
+    monkeypatch.setattr(
+        holes_mod,
+        "_root_for_end",
+        lambda roots, t_edge, at_low, radius, t_inward=None: min(
+            roots, key=lambda root: abs(root[0] - t_edge)
+        ),
+    )
     verdicts = _ball_nose_verdicts(R7_BALL_NOSE_SIZES)
     broken = [
         radius
@@ -2729,17 +2745,39 @@ def test_r7_a_bit_exact_tie_re_breaks_the_whole_sweep(monkeypatch):
         or got[1] is not HoleEndCondition.BLIND
     ]
     assert len(broken) > len(verdicts) // 2, (
-        "with a bit-exact tie most of the size sweep must go back to being "
-        f"short and THROUGH; only {len(broken)}/{len(verdicts)} did"
+        "with a bare nearest-the-mouth pick most of the size sweep must go "
+        f"back to being short and THROUGH; only {len(broken)}/{len(verdicts)} did"
     )
-
-    # ... and every one of them short by exactly one cutter diameter,
-    # which is the signature of the INWARD pole winning the end.
     for radius in broken:
         got = verdicts[radius]
         assert got is not None and abs(
             got[0] - (20.0 - 13.2 + radius - 2.0 * radius)
         ) <= TOL, (radius, got)
+
+
+def test_r8_the_tangency_band_still_pads_the_outward_filter(monkeypatch):
+    """What the band is still for, now that it no longer breaks ties.
+
+    :func:`_root_for_end` admits a root that reaches BACK inside the mouth
+    by up to the band, because a cap sitting exactly ON the mouth — every
+    planar cap, and every tangency — computes its root and the mouth's own
+    reach by two different routes that agree analytically and to about a
+    ULP in doubles. Without the pad an exact cap can fall a bit inside its
+    own mouth and be refused.
+
+    The refusal is not itself an error, because the filter narrows and
+    never empties: refuse every root and the whole field comes back. So
+    this pins the property that matters — that the answers do not move
+    when the pad is taken away — rather than a breakage that does not
+    happen. It is the difference between a guard that is inert and one
+    that is not needed at ONE band value.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    before = _ball_nose_verdicts(R7_BALL_NOSE_SIZES[:12])
+    monkeypatch.setattr(holes_mod, "_tangency_band", lambda radius: 0.0)
+    after = _ball_nose_verdicts(R7_BALL_NOSE_SIZES[:12])
+    assert before == after
 
 
 def test_r7_a_bit_exact_tie_still_passes_the_round6_fixture(
@@ -2808,11 +2846,11 @@ def test_r7_the_untied_caps_stay_far_outside_the_band(fixtures_dir: Path):
     seen = []
     original = holes_mod._root_for_end
 
-    def spy(roots, t_edge, at_low, radius):
+    def spy(roots, t_edge, at_low, radius, t_inward=None):
         reaches = sorted(abs(root[0] - t_edge) for root in roots)
         if len(reaches) > 1:
             seen.append((reaches[1] - reaches[0], holes_mod._tangency_band(radius)))
-        return original(roots, t_edge, at_low, radius)
+        return original(roots, t_edge, at_low, radius, t_inward)
 
     holes_mod._root_for_end = spy
     try:
@@ -2878,16 +2916,77 @@ def _conical_boss(cone_height: float, bore_x: float = 38.5, bore_y: float = 22.0
     return BRepAlgoAPI_Cut(BRepAlgoAPI_Fuse(block, cone).Shape(), bore).Shape()
 
 
-def test_r7_evenly_spaced_rays_alone_re_break_the_boss(
-    fixtures_dir: Path, monkeypatch
-):
+def _boss_part(cone_z, cone_r, cone_h, bore_x, bore_y, bore_r):
+    """A bore beside a conical boss, from six free dimensions.
+
+    ``bore_beside_a_conical_boss`` with everything loosened, so the
+    round-7 guards can be pinned on the parts that still exercise them
+    after round 8 rather than on the one part they were found with.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCone,
+        BRepPrimAPI_MakeCylinder,
+    )
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    cone = BRepPrimAPI_MakeCone(
+        gp_Ax2(gp_Pnt(40.0, 20.0, cone_z), gp_Dir(0, 0, 1)), cone_r, 0.0, cone_h
+    ).Shape()
+    bore = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(bore_x, bore_y, -5.0), gp_Dir(0, 0, 1)), bore_r, 120.0
+    ).Shape()
+    return BRepAlgoAPI_Cut(BRepAlgoAPI_Fuse(block, cone).Shape(), bore).Shape()
+
+
+def _boss_cone_over_axis(cone_z, cone_r, cone_h, bore_x, bore_y, _bore_r):
+    """Where a :func:`_boss_part` cone's own surface crosses the bore axis.
+
+    The number the part was BUILT from, not one measured off it: the cone
+    stands ``cone_h`` over a base of ``cone_r`` at (40, 20), so at a
+    lateral offset ``d`` its surface is at ``cone_z + cone_h*(1 - d/cone_r)``.
+    """
+    d = math.hypot(40.0 - bore_x, 20.0 - bore_y)
+    return cone_z + cone_h * (1.0 - d / cone_r)
+
+
+#: A boss whose PROUD cone is the skin over the axis and whose rim is
+#: pinched hard enough that only the end-anchored refinement finds the
+#: free run. Cone surface over the axis at 21.7602, plate top at 20.
+R8_PINCHED_BOSS = (8.7018, 12.3795, 15.6619, 37.9676, 20.3229, 3.9942)
+
+#: A boss whose cone is BURIED below the plate top over the axis, so 20.0
+#: is right and the cone's crossing at 14.8604 is 5.14 mm inside the
+#: plate. What the chord floor keeps a phantom sliver from reaching.
+R8_BURIED_BOSS = (10.0059, 8.5702, 19.9336, 37.4411, 25.9565, 3.2010)
+
+
+def test_r7_evenly_spaced_rays_alone_re_break_the_boss(monkeypatch):
     """REVERT-PROOF for the end-anchored refinement.
 
     Put :func:`_mouth_ray_fractions` back to round 6's evenly spaced
-    ladder and the conical boss must go back to reading 20.0 — the plate
-    top, on a part whose skin over the axis is the cone 5 mm above it.
+    ladder and a pinched boss must go back to reading 20.0 — the plate
+    top, on a part whose skin over the axis is the cone 1.76 mm above it.
+
+    RE-POINTED (round 8). This guard was pinned on
+    ``bore_beside_a_conical_boss``, where round 8 took the pinch away: the
+    thing crowding that part's rim was the cone's own parametric SEAM,
+    marched across the mouth as though the bore had cut it, and with the
+    phantom gone the coarse ladder finds a route on its first ray. The
+    refinement is not thereby idle — it is load-bearing on 1 part in 203
+    of the same randomised family, which is this one — so the guard moves
+    to a part that still shows it rather than being deleted as inert.
     """
     import aberp_cad_extract.holes as holes_mod
+
+    part = _boss_part(*R8_PINCHED_BOSS)
+    assert len(mine_cylindrical_holes(part)) == 1
+    _approx(
+        mine_cylindrical_holes(part)[0].depth_mm,
+        _boss_cone_over_axis(*R8_PINCHED_BOSS),
+    )
 
     monkeypatch.setattr(
         holes_mod,
@@ -2897,9 +2996,9 @@ def test_r7_evenly_spaced_rays_alone_re_break_the_boss(
             for k in range(1, holes_mod.MOUTH_RAY_SAMPLES + 1)
         ],
     )
-    holes = _mine(fixtures_dir / "bore_beside_a_conical_boss.step")
-    assert len(holes) == 1
-    _approx(holes[0].depth_mm, 20.0)
+    coarse = mine_cylindrical_holes(part)
+    assert len(coarse) == 1
+    _approx(coarse[0].depth_mm, 20.0)
 
 
 def test_r7_the_boss_does_not_depend_on_the_ray_count(fixtures_dir: Path, monkeypatch):
@@ -2952,30 +3051,23 @@ def test_r7_the_mouth_ray_floor_is_load_bearing(monkeypatch):
     part — a bore under a boss whose cone is BURIED below the plate top
     over the axis — has no route at all, and reads 20.0 correctly. Drop
     :func:`_barrier_chord_tolerance` to a thousandth of a micron and the
-    miner finds one of those phantom slivers at ~1e-7 of a mouth edge and
-    reports the cone's crossing 6 mm inside the plate instead.
+    miner finds one of those phantom slivers and reports the cone's
+    crossing 5.1 mm inside the plate instead.
 
     So the floor is not a cost control. It is the statement that a ray
     aimed nearer a barrier than the barrier is known is not evidence.
+
+    RE-POINTED (round 8), for the same reason and in the same way as
+    :func:`test_r7_evenly_spaced_rays_alone_re_break_the_boss`: the
+    phantom this was pinned on emanated from the cone's parametric SEAM,
+    which is no longer marched. The floor still changes the answer on 13
+    parts in 203 of the same randomised family; this is one of them, and
+    the defect signature — a buried cone winning over the plate top — is
+    the one the original part showed.
     """
     import aberp_cad_extract.holes as holes_mod
-    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
-    from OCP.BRepPrimAPI import (
-        BRepPrimAPI_MakeBox,
-        BRepPrimAPI_MakeCone,
-        BRepPrimAPI_MakeCylinder,
-    )
-    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
 
-    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
-    cone = BRepPrimAPI_MakeCone(
-        gp_Ax2(gp_Pnt(40.0, 20.0, 6.2829), gp_Dir(0, 0, 1)), 11.1653, 0.0, 20.1485
-    ).Shape()
-    bore = BRepPrimAPI_MakeCylinder(
-        gp_Ax2(gp_Pnt(33.4153, 22.0507, -5.0), gp_Dir(0, 0, 1)), 3.7313, 120.0
-    ).Shape()
-    part = BRepAlgoAPI_Cut(BRepAlgoAPI_Fuse(block, cone).Shape(), bore).Shape()
-
+    part = _boss_part(*R8_BURIED_BOSS)
     holes = mine_cylindrical_holes(part)
     assert len(holes) == 1
     _approx(holes[0].depth_mm, 20.0)
@@ -2989,6 +3081,7 @@ def test_r7_the_mouth_ray_floor_is_load_bearing(monkeypatch):
         "without the floor this part must pick up a phantom route and read "
         f"the buried cone; got {unfloored[0].depth_mm}"
     )
+    _approx(unfloored[0].depth_mm, _boss_cone_over_axis(*R8_BURIED_BOSS))
 
 
 def test_r7_the_mouth_ray_floor_is_not_a_tuned_epsilon(fixtures_dir: Path):
@@ -3070,3 +3163,675 @@ def test_r7_the_refinement_is_inert_where_the_bore_cuts_no_edge(fixtures_dir: Pa
         assert aimed, "the boss aimed none, so this fixture tests nothing"
     finally:
         holes_mod._mouth_ray_fractions = original
+
+
+# ══ ROUND 8 / D-19: the five open located-holes geometry defects ═════════
+#
+# All five were PRE-EXISTING on the feature and none was a regression: the
+# backlog entry `docs/BACKLOG-designed-to-live.md` D-19 is the gate that
+# says slice C — drilling cycle-time pricing — must not ship until every
+# one of them is closed. Four of the five UNDER-quote.
+#
+# Two root causes cover them:
+#
+#   * `_root_for_end` kept a root INWARD of the mouth — inside the void
+#     the bore itself hollowed out — whenever it was the nearest one. That
+#     is N4 (undercut seat, 74% short and blind-read-as-through) and N3
+#     (the same seat at a depth where the phantom root coincides with the
+#     bore's far end, so the depth comes out zero and the hole is DROPPED).
+#   * a parametric artifact taken for real geometry, in two places: the
+#     cone SEAM marched as a barrier (the zero-caps boss band), and the
+#     cone APEX admitted as a cap because the degeneracy screen was
+#     tighter than `GeomAPI_IntCS`'s own resolution (N2, over-quoting by
+#     the point length; N1, measuring to a pole in the air below the part).
+
+
+R8_FIXTURES = {
+    # name: (diameter, depth, entry, axis, end condition, flat bottom)
+    "undercut_ball_seat.step": (
+        8.0, 10.8, (20.0, 20.0, 20.0), (0.0, 0.0, -1.0),
+        HoleEndCondition.BLIND, False,
+    ),
+    "bore_beside_a_shallower_conical_boss.step": (
+        8.0, 23.5, (38.5, 22.0, 0.0), (0.0, 0.0, 1.0),
+        HoleEndCondition.THROUGH, False,
+    ),
+    "breakout_drill_point.step": (
+        8.0, 19.6, (20.0, 20.0, 20.0), (0.0, 0.0, -1.0),
+        HoleEndCondition.BLIND, False,
+    ),
+}
+
+#: What round 7 answered on each, so the fix cannot rot into a fixture
+#: that never showed anything.
+R8_ROUND7 = {
+    "undercut_ball_seat.step": (2.7995, HoleEndCondition.THROUGH),
+    "bore_beside_a_shallower_conical_boss.step": (20.0, HoleEndCondition.THROUGH),
+    "breakout_drill_point.step": (22.0, HoleEndCondition.BLIND),
+}
+
+
+@pytest.mark.parametrize("name", sorted(R8_FIXTURES))
+def test_r8_the_three_headline_parts(fixtures_dir: Path, name):
+    """Each root cause's headline part, pinned on every field."""
+    diameter, depth, entry, axis, end, flat = R8_FIXTURES[name]
+    holes = _mine(fixtures_dir / name)
+    assert len(holes) == 1, [h.diameter_mm for h in holes]
+    hole = holes[0]
+    _approx(hole.diameter_mm, diameter)
+    _approx(hole.depth_mm, depth)
+    _approx_vec(hole.entry_point_mm, entry)
+    _approx_vec(hole.axis_unit, axis)
+    assert hole.end_condition is end
+    assert hole.flat_bottom is flat
+
+
+@pytest.mark.parametrize("name", sorted(R8_ROUND7))
+def test_r8_every_round7_answer_was_wrong_by_more_than_a_rounding(name):
+    """The parts are not near-misses of the old code — they are metres off.
+
+    Stated separately because "the fixture passes" and "the fixture would
+    have failed" are different claims, and only the second one makes a
+    fixture worth committing.
+    """
+    was, was_end = R8_ROUND7[name]
+    now = R8_FIXTURES[name][1]
+    assert abs(was - now) > 0.5, (name, was, now)
+    assert was_end is not R8_FIXTURES[name][4] or abs(was - now) > 0.5
+
+
+# ── N4 + N3: the undercut seat ───────────────────────────────────────────
+
+
+def _undercut_seat(nose_centre_z, bore_radius, undercut, thickness=20.0):
+    """A ball-end seat whose nose radius EXCEEDS the bore's by ``undercut``.
+
+    Built in memory from its dimensions like :func:`_ball_nose`, whose
+    ``undercut = 0`` case it contains: the seat bottoms at
+    ``nose_centre_z - (bore_radius + undercut)``.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCylinder,
+        BRepPrimAPI_MakeSphere,
+    )
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, thickness).Shape()
+    shaft = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(20.0, 20.0, nose_centre_z), gp_Dir(0, 0, 1)),
+        bore_radius,
+        thickness + 10.0,
+    ).Shape()
+    nose = BRepPrimAPI_MakeSphere(
+        gp_Pnt(20.0, 20.0, nose_centre_z), bore_radius + undercut
+    ).Shape()
+    return BRepAlgoAPI_Cut(BRepAlgoAPI_Cut(block, shaft).Shape(), nose).Shape()
+
+
+def _seat_verdicts(radii, undercuts, nose_centre_z=13.2):
+    out = {}
+    for radius in radii:
+        for undercut in undercuts:
+            holes = [
+                hole
+                for hole in mine_cylindrical_holes(
+                    _undercut_seat(nose_centre_z, radius, undercut)
+                )
+                if abs(hole.diameter_mm - 2.0 * radius) < TOL
+            ]
+            out[(radius, undercut)] = (
+                (holes[0].depth_mm, holes[0].end_condition)
+                if len(holes) == 1
+                else None
+            )
+    return out
+
+
+#: The undercuts the defect was found across. 0 is the exact tangency the
+#: round-7 band already handled; 4e-7 is where the band stopped being wide
+#: enough; 0.5 is a seat half a millimetre proud of its bore. Six decades.
+R8_UNDERCUTS = (0.0, 1e-7, 3e-7, 4e-7, 1e-6, 1e-4, 1e-2, 0.5)
+R8_SEAT_RADII = (1.5, 3.0, 4.0, 6.0)
+
+
+def test_r8_the_undercut_seat_reads_its_full_depth():
+    """N4, across the family rather than at one undercut.
+
+    The whole point is that the answer must not depend on HOW undercut
+    the seat is. Round 7 was right below 4e-7 mm and wrong above it,
+    because the tangency band — correctly derived, for the question it was
+    derived for — was standing in for a rule that has nothing to do with
+    tangency. Every cutter at every undercut must come back at its full
+    depth and BLIND.
+    """
+    verdicts = _seat_verdicts(R8_SEAT_RADII, R8_UNDERCUTS)
+    wrong = {
+        key: got
+        for key, got in verdicts.items()
+        if got is None
+        or abs(got[0] - (20.0 - 13.2 + key[0] + key[1])) > TOL
+        or got[1] is not HoleEndCondition.BLIND
+    }
+    assert not wrong, f"{len(wrong)}/{len(verdicts)} seats mis-mined: {wrong}"
+
+
+def test_r8_the_undercut_seat_was_short_and_through_before():
+    """...and the family really did break, by the pole's own signature.
+
+    Remove the outward filter and every one of these must read to the
+    sphere's INWARD pole instead: a depth short by ``2R``, and THROUGH,
+    because the cavity's outward normal up there points back down the
+    bore. Both halves are asserted, so a fix that merely moved the number
+    could not pass.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    original = holes_mod._root_for_end
+    try:
+        holes_mod._root_for_end = (
+            lambda roots, t_edge, at_low, radius, t_inward=None: min(
+                roots, key=lambda root: abs(root[0] - t_edge)
+            )
+        )
+        verdicts = _seat_verdicts(R8_SEAT_RADII, (1e-6, 1e-4, 1e-2))
+    finally:
+        holes_mod._root_for_end = original
+
+    for (radius, undercut), got in verdicts.items():
+        nose = radius + undercut
+        assert got is not None, (radius, undercut)
+        assert abs(got[0] - (20.0 - 13.2 + nose - 2.0 * nose)) <= TOL, (
+            radius, undercut, got
+        )
+        assert got[1] is HoleEndCondition.THROUGH, (radius, undercut, got)
+
+
+def test_r8_the_undercut_seat_is_never_dropped():
+    """N3 — the same defect where it costs the whole feature.
+
+    A silent under-COUNT, not a wrong number. Where the phantom inward
+    pole happens to land on the bore's own far end the span collapses to
+    zero, and a zero-deep bore is dropped: a Ø16 seat at a nose centre of
+    12.0 in a 20 mm plate returned NO HOLES at all for an undercut of
+    4e-7 or 1e-6 mm.
+
+    Swept over the nose depth because the trigger is a coincidence
+    between two independent numbers, and pinning it at the one depth where
+    the coincidence fires would pin the coincidence rather than the rule.
+    """
+    depths = [8.0 + 0.5 * k for k in range(13)]  # 8.0 .. 14.0
+    missing = []
+    for nose_centre_z in depths:
+        for undercut in (4e-7, 1e-6, 1e-4):
+            holes = [
+                hole
+                for hole in mine_cylindrical_holes(
+                    _undercut_seat(nose_centre_z, 8.0, undercut)
+                )
+                if abs(hole.diameter_mm - 16.0) < TOL
+            ]
+            want = 20.0 - nose_centre_z + 8.0 + undercut
+            if len(holes) != 1 or abs(holes[0].depth_mm - want) > TOL:
+                missing.append(
+                    (nose_centre_z, undercut, [h.depth_mm for h in holes])
+                )
+    assert not missing, missing
+
+
+def test_r8_the_inward_bound_is_the_mouths_REACH_not_its_mean():
+    """Why :func:`_edge_axial_extent` exists, stated as a part.
+
+    The filter disqualifies a root inward of the MOUTH, and a mouth cut
+    across a slope straddles its own average — so measuring it by
+    :func:`_edge_axial_mean` disqualifies roots the mouth really does
+    reach. On a bore under a conical boss the cone's mouth runs from
+    z=14.9 to z=21.9 while its mean sits above the true crossing at 20.5,
+    and the mean-bounded filter threw the crossing away and took the
+    mirror cone's, 7 mm above the apex.
+
+    Pinned by making the extent degenerate to the mean and requiring the
+    boss family to break: this guard has to fail loudly, because its
+    failure direction is an OVER-quote and those are the ones that get
+    argued away.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    parts = [_boss_part(10.0, 10.0, h, 38.5, 22.0, 4.0) for h in (14.0, 16.0, 18.0)]
+    wants = [
+        _boss_cone_over_axis(10.0, 10.0, h, 38.5, 22.0, 4.0) for h in (14.0, 16.0, 18.0)
+    ]
+    for part, want in zip(parts, wants):
+        holes = mine_cylindrical_holes(part)
+        assert len(holes) == 1
+        _approx(holes[0].depth_mm, want)
+
+    original = holes_mod._edge_axial_extent
+    try:
+        holes_mod._edge_axial_extent = lambda edge, origin, direction: (
+            lambda m: None if m is None else (m, m)
+        )(holes_mod._edge_axial_mean(edge, origin, direction))
+        broken = [
+            (want, [h.depth_mm for h in mine_cylindrical_holes(part)])
+            for part, want in zip(parts, wants)
+        ]
+    finally:
+        holes_mod._edge_axial_extent = original
+
+    assert any(
+        len(got) != 1 or abs(got[0] - want) > TOL for want, got in broken
+    ), f"the mouth's REACH must be load-bearing; nothing moved: {broken}"
+
+
+# ── the zero-caps boss-overhang band ─────────────────────────────────────
+
+#: The region the defect covers: cone heights 14..20 crossed with bore
+#: offsets 37.0..38.5, which is where the adversarial sweep found a
+#: CONTIGUOUS band rather than scattered misses. Configurations whose cone
+#: does not clear the plate top over the axis are not in the region.
+R8_BAND_HEIGHTS = tuple(14.0 + 0.5 * k for k in range(13))
+R8_BAND_OFFSETS = tuple(37.0 + 0.25 * k for k in range(7))
+
+
+def _band_configs():
+    for height in R8_BAND_HEIGHTS:
+        for bore_x in R8_BAND_OFFSETS:
+            want = _boss_cone_over_axis(10.0, 10.0, height, bore_x, 22.0, 4.0)
+            if want > 20.0 + TOL:
+                yield height, bore_x, want
+
+
+def test_r8_the_zero_caps_boss_band_is_closed():
+    """The band, swept. 69 of its 81 configurations were short.
+
+    A contiguous region, not a scatter — roughly 42% of the local space —
+    under-reporting by 0.04 to 3.98 mm. It is a BARRIER-SET defect and no
+    ray count reaches it: the cone's whole share of the mouth is on the
+    far side of the phantom the seam lays down, so there is nothing for a
+    finer ladder to find.
+
+    The committed ``bore_beside_a_conical_boss`` sits in the band's one
+    correct corner, which is why a whole adversarial round did not see
+    this: at a boss height of 20 the barrier march runs out of reach two
+    millimetres before it would have blocked the last ray.
+    """
+    wrong = []
+    for height, bore_x, want in _band_configs():
+        holes = mine_cylindrical_holes(_boss_part(10.0, 10.0, height, bore_x, 22.0, 4.0))
+        if len(holes) != 1 or abs(holes[0].depth_mm - want) > TOL:
+            wrong.append((height, bore_x, want, [h.depth_mm for h in holes]))
+    assert not wrong, f"{len(wrong)} of the band mis-mined: {wrong[:5]}"
+
+
+def test_r8_a_seam_barrier_re_opens_the_whole_band():
+    """REVERT-PROOF for :func:`_is_parametric_artifact`.
+
+    Let the seam be marched again and most of the band must go back to
+    reading the plate top — SHORT, which is the under-quote direction and
+    the invisible one.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    configs = list(_band_configs())
+    original = holes_mod._is_parametric_artifact
+    try:
+        holes_mod._is_parametric_artifact = lambda edge, face, neighbours: False
+        short = []
+        for height, bore_x, want in configs:
+            holes = mine_cylindrical_holes(
+                _boss_part(10.0, 10.0, height, bore_x, 22.0, 4.0)
+            )
+            if len(holes) == 1 and holes[0].depth_mm < want - TOL:
+                short.append((height, bore_x, want, holes[0].depth_mm))
+    finally:
+        holes_mod._is_parametric_artifact = original
+
+    assert len(short) > len(configs) // 2, (
+        f"only {len(short)}/{len(configs)} of the band re-broke; the seam "
+        "barrier must be what was closing it"
+    )
+    assert all(abs(got - 20.0) <= TOL for *_rest, got in short), (
+        "every re-broken configuration must fall back to the plate top, "
+        f"which is the zero-caps signature: {short[:5]}"
+    )
+
+
+def test_r8_a_seam_survives_a_step_round_trip_only_geometrically():
+    """Why :func:`_same_carrier` is geometric and not a flag.
+
+    In memory OCCT marks the cone's seam with ``IsClosed_s`` and keeps ONE
+    face either side of it. Through STEP — which is the only input this
+    miner has — the same cone comes back as TWO faces with two different
+    ``Geom_ConicalSurface`` objects and no flag at all. A seam test built
+    on the flag would have closed the band for the in-memory sweep above
+    and left it wide open on every real part.
+
+    Both halves are asserted, because "the flag is gone" is the claim that
+    makes the geometric test necessary and it is the one that can rot.
+    """
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_CurveType, GeomAbs_SurfaceType
+
+    import aberp_cad_extract.holes as holes_mod
+
+    def seam_edges(shape):
+        faces = holes_mod._collect_faces(shape)
+        ancestors = holes_mod._EdgeFaces(faces)
+        flagged, carried = 0, 0
+        for face in faces:
+            if (
+                BRepAdaptor_Surface(face, False).GetType()
+                != GeomAbs_SurfaceType.GeomAbs_Cone
+            ):
+                continue
+            explorer = holes_mod.TopExp_Explorer(face, holes_mod.TopAbs_EDGE)
+            seen = []
+            while explorer.More():
+                edge = holes_mod.TopoDS.Edge_s(explorer.Current())
+                explorer.Next()
+                if any(edge.IsSame(other) for other in seen):
+                    continue
+                seen.append(edge)
+                if BRepAdaptor_Curve(edge).GetType() != GeomAbs_CurveType.GeomAbs_Line:
+                    continue
+                neighbours = ancestors.of(edge)
+                if len(neighbours) != 2:
+                    continue
+                if all(
+                    BRepAdaptor_Surface(other, False).GetType()
+                    == GeomAbs_SurfaceType.GeomAbs_Cone
+                    for other in neighbours
+                ):
+                    if BRep_Tool.IsClosed_s(edge, face):
+                        flagged += 1
+                    if holes_mod._is_parametric_artifact(edge, face, neighbours):
+                        carried += 1
+        return flagged, carried
+
+    in_memory = _boss_part(10.0, 10.0, 18.0, 38.5, 22.0, 4.0)
+    flagged, carried = seam_edges(in_memory)
+    assert flagged > 0, "in memory the seam must still carry OCCT's own flag"
+    assert carried >= flagged
+
+    from pathlib import Path as _Path
+
+    fixtures = _Path(__file__).parent / "fixtures"
+    with _silence_stdout_fd():
+        through_step = _load_step_shape(
+            str(fixtures / "bore_beside_a_shallower_conical_boss.step")
+        )
+    flagged_step, carried_step = seam_edges(through_step)
+    assert flagged_step == 0, (
+        "if OCCT started preserving the seam flag through STEP this test is "
+        "stale — but the geometric test must still be what closes the band"
+    )
+    assert carried_step > 0, (
+        "through STEP the seam is only findable geometrically, and "
+        "_same_carrier must be finding it"
+    )
+
+
+def test_r8_a_tangent_fillet_edge_is_still_a_barrier():
+    """The narrowing must not swallow the barriers that do real work.
+
+    `_same_carrier` is deliberately NOT a tangency test: the skin either
+    side of a tangent fillet edge is continuous and the two CARRIERS still
+    diverge, which is exactly why that edge has to keep dividing the
+    footprint. The four straddle fixtures are what that guard is made of,
+    and they are re-run here against the round-8 predicate itself rather
+    than only through their answers.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    for name in (
+        "bore_straddling_a_rounded_edge",
+        "blind_bore_straddling_a_rounded_edge",
+        "bore_straddling_a_concave_fillet",
+        "bore_through_a_domed_shoulder",
+    ):
+        with _silence_stdout_fd():
+            shape = _load_step_shape(
+                str(Path(__file__).parent / "fixtures" / f"{name}.step")
+            )
+        faces = holes_mod._collect_faces(shape)
+        ancestors = holes_mod._EdgeFaces(faces)
+        kept = 0
+        for face in faces:
+            explorer = holes_mod.TopExp_Explorer(face, holes_mod.TopAbs_EDGE)
+            while explorer.More():
+                edge = holes_mod.TopoDS.Edge_s(explorer.Current())
+                explorer.Next()
+                neighbours = ancestors.of(edge)
+                if len(neighbours) == 2 and not holes_mod._is_parametric_artifact(
+                    edge, face, neighbours
+                ):
+                    kept += 1
+        assert kept > 0, f"{name}: every edge was ruled a parametric artifact"
+
+
+# ── N2 + N1: the drill point's apex ──────────────────────────────────────
+
+
+def _drill_point(tip_z, bore_radius=4.0, point_height=2.4, thickness=20.0):
+    """A blind bore with a conical point, from its dimensions.
+
+    ``point_height`` over ``bore_radius`` gives an included angle of
+    ``2*atan(r/h)`` — 118.07 deg at the defaults, which is a jobber drill.
+    The full-diameter bore runs from ``tip_z + point_height`` to the plate
+    top; put ``tip_z`` below zero and the point breaks out of the bottom.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCone,
+        BRepPrimAPI_MakeCylinder,
+    )
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, thickness).Shape()
+    shaft = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(20.0, 20.0, tip_z + point_height), gp_Dir(0, 0, 1)),
+        bore_radius,
+        thickness + 10.0,
+    ).Shape()
+    point = BRepPrimAPI_MakeCone(
+        gp_Ax2(gp_Pnt(20.0, 20.0, tip_z), gp_Dir(0, 0, 1)),
+        0.0,
+        bore_radius,
+        point_height,
+    ).Shape()
+    return BRepAlgoAPI_Cut(block, BRepAlgoAPI_Fuse(shaft, point).Shape()).Shape()
+
+
+def _point_verdicts(tips, **kwargs):
+    out = {}
+    for tip_z in tips:
+        holes = [
+            hole
+            for hole in mine_cylindrical_holes(_drill_point(tip_z, **kwargs))
+            if abs(hole.diameter_mm - 8.0) < TOL
+        ]
+        out[round(tip_z, 6)] = (
+            (holes[0].depth_mm, holes[0].end_condition) if len(holes) == 1 else None
+        )
+    return out
+
+
+def test_r8_the_drill_point_apex_never_ends_the_bore():
+    """N2 — the apex admitted as a cap, over-quoting by the point length.
+
+    A cone's apex is a point the axis TOUCHES and carries straight through,
+    still in the same void, and :func:`_crossing_normal` was written to
+    refuse it. What it refused on was a derivative RATIO against 1e-9 —
+    about 89x tighter than the parameter ``GeomAPI_IntCS`` actually
+    resolves a degeneracy to. So the intersector reported the apex at
+    ``v = 7.9e-08`` instead of ``v = 0``, the collapsed derivative came
+    back at 6.8e-08 rather than 0, and the apex arrived looking like an
+    ordinary point with an ordinary normal.
+
+    Sporadic, which is worse than systematic: it fired on the tip depths
+    where OCCT's rounding happened to land off the apex, so a fixture
+    could pass and its neighbour fail. A hundred depths is the family.
+    """
+    verdicts = _point_verdicts(4.0 + 0.1 * k for k in range(100))
+    wrong = {
+        tip_z: got
+        for tip_z, got in verdicts.items()
+        if got is None
+        or abs(got[0] - (20.0 - (tip_z + 2.4))) > TOL
+        or got[1] is not HoleEndCondition.BLIND
+    }
+    assert not wrong, f"{len(wrong)}/{len(verdicts)} points mis-mined: {wrong}"
+
+
+def test_r8_a_breakout_point_does_not_measure_into_the_air():
+    """N1 — the same apex, where it leaves the part entirely.
+
+    When the point breaks the far face the apex is BELOW the plate, and
+    round 7 measured to it: a depth of 22.0 on a 20 mm plate, with an exit
+    coordinate two millimetres under the part. Nothing a machine can
+    reach, and it is the one member of the set that is visibly impossible
+    rather than merely wrong.
+
+    Every depth here must be the FULL-DIAMETER depth, and every one must
+    fit inside the plate.
+    """
+    verdicts = _point_verdicts(-3.0 + 0.1 * k for k in range(60))
+    for tip_z, got in verdicts.items():
+        assert got is not None, tip_z
+        shoulder = tip_z + 2.4
+        if shoulder <= 0.0:
+            # the full-diameter bore is itself through the plate
+            _approx(got[0], 20.0)
+            assert got[1] is HoleEndCondition.THROUGH, (tip_z, got)
+        else:
+            _approx(got[0], 20.0 - shoulder)
+            assert got[1] is HoleEndCondition.BLIND, (tip_z, got)
+        assert got[0] <= 20.0 + TOL, (
+            f"a bore in a 20 mm plate cannot be {got[0]} deep (tip {tip_z})"
+        )
+
+
+def test_r8_a_breakout_point_reads_BLIND_by_a_flagged_decision():
+    """FLAGGED: a breakout point is a DESIGN decision, not a math one.
+
+    The plate is holed — the point went through and left a small opening
+    in the far face — but the FULL-DIAMETER bore is blind, and the two
+    facts want different end conditions. Nothing in the geometry settles
+    which one a drilling cycle should be priced from.
+
+    Taken conservatively, in the module's own established direction: BLIND
+    at the full-diameter depth. A blind cycle pecks, dwells and evacuates
+    chips against a closed bottom, so it is the DEARER of the two, and the
+    posture everywhere else in this miner is that ambiguity resolves
+    towards the over-price because an over-price is visible in the
+    reasoning log and an under-price is not.
+
+    Pinned as a decision rather than buried in the sweep above so that
+    changing it is a deliberate act. If slice C ever wants to price the
+    breakout relief, this is the test to come and argue with.
+    """
+    verdicts = _point_verdicts((-2.0, -1.0, -0.5))
+    for tip_z, got in verdicts.items():
+        assert got is not None and got[1] is HoleEndCondition.BLIND, (tip_z, got)
+        _approx(got[0], 20.0 - (tip_z + 2.4))
+
+
+def test_r8_the_old_degeneracy_ratio_alone_re_breaks_the_drill_point():
+    """REVERT-PROOF for :data:`DEGENERATE_ISOLINE_CONFUSIONS`.
+
+    Take the model-space arm away — leaving round 7's ratio, exactly as it
+    shipped — and the sweep must go back to over-quoting by the point
+    length on the depths where OCCT's rounding misses the apex. That it
+    breaks on only a few of them is the defect's real shape, and the
+    reason a single fixture could never have pinned it.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    monkeyed = holes_mod.DEGENERATE_ISOLINE_CONFUSIONS
+    try:
+        holes_mod.DEGENERATE_ISOLINE_CONFUSIONS = 0.0
+        verdicts = _point_verdicts(4.0 + 0.1 * k for k in range(100))
+    finally:
+        holes_mod.DEGENERATE_ISOLINE_CONFUSIONS = monkeyed
+
+    over = {
+        tip_z: got
+        for tip_z, got in verdicts.items()
+        if got is not None and got[0] > 20.0 - (tip_z + 2.4) + TOL
+    }
+    assert over, "the ratio alone must still admit some apexes as caps"
+    for tip_z, got in over.items():
+        assert abs(got[0] - (20.0 - tip_z)) <= TOL, (
+            "an admitted apex must over-quote by exactly the point length, "
+            f"which is the signature: {tip_z} -> {got}"
+        )
+
+
+def test_r8_the_degeneracy_floor_is_not_a_tuned_epsilon():
+    """The floor may be moved by decades without moving an answer.
+
+    The two populations it separates were measured over the committed
+    corpus and the adversarial sweeps: a root sitting ON a degeneracy has
+    an isoline radius of at most 1.09e-07 mm/rad — the intersector's own
+    resolution — and the smallest at any REGULAR cap root anywhere is
+    2.5 mm/rad. Seven orders apart, so everything from 1e1 to 1e5
+    confusions gives the same numbers, and 1e3 sits in the middle of that
+    rather than at an edge of it.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    baseline = None
+    original = holes_mod.DEGENERATE_ISOLINE_CONFUSIONS
+    try:
+        for confusions in (1e1, 1e2, 1e3, 1e4, 1e5):
+            holes_mod.DEGENERATE_ISOLINE_CONFUSIONS = confusions
+            signature = repr(
+                sorted(_point_verdicts(4.0 + 0.5 * k for k in range(20)).items())
+            )
+            countersinks = [
+                _mine(Path(__file__).parent / "fixtures" / f"{name}.step")
+                for name in (
+                    "countersunk_through_bore",
+                    "countersunk_blind_bore",
+                    "countersunk_bore_120",
+                    "bore_through_spherical_dome",
+                    "bore_through_nurbs_dome",
+                )
+            ]
+            signature += repr(
+                [
+                    [(h.depth_mm, h.end_condition) for h in holes]
+                    for holes in countersinks
+                ]
+            )
+            if baseline is None:
+                baseline = signature
+            assert signature == baseline, (
+                f"an answer moved at {confusions} confusions; that would make "
+                "the floor a tuned epsilon"
+            )
+    finally:
+        holes_mod.DEGENERATE_ISOLINE_CONFUSIONS = original
+
+
+def test_r8_the_dome_pole_is_still_a_cap():
+    """The floor must not swallow the case it sits next to.
+
+    A dome's POLE is degenerate in exactly the same parametric way as a
+    cone's apex and is a genuine cap: the coplanarity test in
+    :func:`_degenerate_point_normal` is what tells them apart, and
+    widening the screen must leave that decision where it is. If it had
+    not, the spherical and NURBS domes would have lost their crowns and
+    read short at both ends.
+    """
+    for name, depth in (
+        ("bore_through_spherical_dome", 40.0),
+        ("bore_through_nurbs_dome", 40.0),
+    ):
+        holes = _mine(Path(__file__).parent / "fixtures" / f"{name}.step")
+        assert len(holes) == 1, name
+        _approx(holes[0].depth_mm, depth)
+        assert holes[0].end_condition is HoleEndCondition.THROUGH, name
