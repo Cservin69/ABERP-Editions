@@ -3196,16 +3196,26 @@ R8_FIXTURES = {
         8.0, 23.5, (38.5, 22.0, 0.0), (0.0, 0.0, 1.0),
         HoleEndCondition.THROUGH, False,
     ),
+    # 22 - 4/tan(59 deg): a TRUE 118 deg point, apex 2 mm below the plate.
+    # See the generator for why the angle cannot be rounded to a tidy 2.4
+    # point height — at 2.4 the defect does not fire and the fixture would
+    # pin nothing.
     "breakout_drill_point.step": (
-        8.0, 19.6, (20.0, 20.0, 20.0), (0.0, 0.0, -1.0),
+        8.0,
+        22.0 - 4.0 / math.tan(math.radians(59.0)),
+        (20.0, 20.0, 20.0), (0.0, 0.0, -1.0),
         HoleEndCondition.BLIND, False,
     ),
 }
 
-#: What round 7 answered on each, so the fix cannot rot into a fixture
-#: that never showed anything.
+#: What round 7 answered on each — MEASURED against the round-7 module on
+#: these exact fixture files, not recalled — so the round cannot rot into
+#: a fixture that never showed anything. The first cut of
+#: ``breakout_drill_point`` did exactly that: its point height was rounded
+#: to 2.4 and round 7 answered it CORRECTLY, which the whole-corpus
+#: base-vs-fix diff caught and this table would not have.
 R8_ROUND7 = {
-    "undercut_ball_seat.step": (2.7995, HoleEndCondition.THROUGH),
+    "undercut_ball_seat.step": (2.799, HoleEndCondition.THROUGH),
     "bore_beside_a_shallower_conical_boss.step": (20.0, HoleEndCondition.THROUGH),
     "breakout_drill_point.step": (22.0, HoleEndCondition.BLIND),
 }
@@ -3237,7 +3247,14 @@ def test_r8_every_round7_answer_was_wrong_by_more_than_a_rounding(name):
     was, was_end = R8_ROUND7[name]
     now = R8_FIXTURES[name][1]
     assert abs(was - now) > 0.5, (name, was, now)
-    assert was_end is not R8_FIXTURES[name][4] or abs(was - now) > 0.5
+    # ...and every one of them was wrong in a way a shop would feel: two
+    # UNDER-quote and the breakout OVER-quotes to a depth the plate does
+    # not have.
+    if name == "breakout_drill_point.step":
+        assert was > 20.0, (name, was)
+    else:
+        assert was < now, (name, was, now)
+    del was_end
 
 
 # ── N4 + N3: the undercut seat ───────────────────────────────────────────

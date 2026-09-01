@@ -1293,19 +1293,30 @@ def breakout_drill_point():
     `GeomAPI_IntCS`'s own parametric resolution, so the apex arrived
     looking like an ordinary point (round 8, N1/N2).
 
-    Point cone: radius 4 over a height of 2.4, an included angle of
-    118.07 deg, apex at z=-2.0 — so the full-diameter bore runs from
-    z=0.4 to the plate top.
+    Point cone: a TRUE 118 deg jobber point on a Ø8 drill, so its height
+    is ``4 / tan(59 deg)`` exactly, with the apex at z=-2.0. The
+    full-diameter bore therefore runs from z = 2.4034425 - 2.0 to the
+    plate top.
 
-    Expected: 1 hole, Ø8.0, depth 19.6, entry (20, 20, 20), axis
-    (0, 0, -1), BLIND, and NOT a flat bottom. Round 7: 22.0, exiting at
-    z=-2.0. See `test_r8_a_breakout_point_is_a_design_decision` for why
+    The angle is not decoration and 2.4 will not do. The defect is
+    SPORADIC — it fires on the tip geometries where ``GeomAPI_IntCS``
+    happens to land a whisker off the apex rather than on it — and a
+    cone of height 2.4 is one of the geometries where it does NOT fire.
+    Swept at the true angle, 23 of 60 breakout depths are wrong at round
+    7 and none is with the fix; swept at 2.4, none is wrong either way.
+    A fixture that never showed the defect would pin nothing at all.
+
+    Expected: 1 hole, Ø8.0, depth 22 - 4/tan(59 deg) = 19.5965575, entry
+    (20, 20, 20), axis (0, 0, -1), BLIND, and NOT a flat bottom. Round 7:
+    22.0, exiting at z=-2.0, two millimetres below the part. See
+    `test_r8_a_breakout_point_reads_BLIND_by_a_flagged_decision` for why
     BLIND is the answer and not THROUGH.
     """
+    point_height = 4.0 / math.tan(math.radians(59.0))
     block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
-    shaft = _cyl(20.0, 20.0, 0.4, 0, 0, 1, 4.0, 30.0)
+    shaft = _cyl(20.0, 20.0, point_height - 2.0, 0, 0, 1, 4.0, 30.0)
     point = BRepPrimAPI_MakeCone(
-        gp_Ax2(gp_Pnt(20.0, 20.0, -2.0), gp_Dir(0, 0, 1)), 0.0, 4.0, 2.4
+        gp_Ax2(gp_Pnt(20.0, 20.0, -2.0), gp_Dir(0, 0, 1)), 0.0, 4.0, point_height
     ).Shape()
     return BRepAlgoAPI_Cut(block, BRepAlgoAPI_Fuse(shaft, point).Shape()).Shape()
 
