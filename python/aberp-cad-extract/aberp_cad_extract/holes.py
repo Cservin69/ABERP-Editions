@@ -263,11 +263,12 @@ CORRECTED AGAIN (round 8 / backlog D-19, the five open defects). Slice C
 — drilling cycle-time pricing — was gated on these, all five PRE-EXISTING
 on the feature and four of them UNDER-quotes. Two root causes:
 
-**A root inward of the mouth is inside the bore's own void.** Round 7
-already said so, and applied it only to a TIE: two roots equidistant from
-the mouth are a tangency, the inward twin lies in the void the bore
-hollowed out, so the outward one wins. The argument never mentioned the
-tie. Confining it to one left the identical defect alive the moment the
+**The wrong root of a COAXIAL cap.** Round 7 disqualified a root inward
+of the mouth — inside the void the bore itself hollowed out — and applied
+it only to a TIE: two roots equidistant from the mouth are a tangency, the
+inward twin lies in that void, so the outward one wins. The argument never
+mentioned the tie. Confining it to one left the identical defect alive the
+moment the
 two roots were not equidistant, which is any UNDERCUT — a ball-end seat
 whose nose is wider than the bore it ends, a spherical seat, a lollipop
 cutter's relief. There the sphere meets the cylinder on a circle of the
@@ -278,8 +279,8 @@ deep against 10.8 — 74% short — and reported a plainly blind pocket as
 THROUGH, because the cavity's outward normal up there points back down the
 bore (N4). At the depths where that phantom root lands on the bore's own
 far end the span collapses to zero and a zero-deep bore is DROPPED: a Ø16
-seat returned no holes at all, a silent under-COUNT (N3). The filter is
-now unconditional, and the tangency falls out of it rather than being
+seat returned no holes at all, a silent under-COUNT (N3). The rule below
+is unconditional, and the tangency falls out of it rather than being
 special-cased.
 
 What "inward" cannot be is a DISTANCE, and two cuts of this were wrong
@@ -312,6 +313,18 @@ where the trimmed face is absent — which is the whole reason
 :func:`_cap_axis_intersections` asks the UNBOUNDED surface in the first
 place.
 
+And it is asked of a COAXIAL cap and of nothing else
+(:func:`_cap_is_coaxial`), because ROUND 4 HAD ALREADY MEASURED that an
+unrestricted on-face gate reopens its blocker 2 and pinned the measurement
+as a test. Round 4 is right. A Ø4 bore out through a torus wall meets its
+cap's carrier at x = -20, -4, 4 and 20; its own end at x=4 sits in the
+hole it cut and is NOT on the face, while x=-4 — the same inner surface on
+the far side of the donut — IS, and preferring on-face there reads 24.0
+against a true 16.0. A coaxial cap is the ONE shape for which nearest
+says nothing true: the roots are that surface's own POLES and which is
+nearer is a fact about the cap's proportions, not about where the bore
+ends. Everywhere else round 2's nearest is right and is untouched.
+
 Two siblings of this family are NOT closed here and are flagged rather
 than fixed, both pre-existing and both reading the same at
 ``origin/main``: a spherical relief WIDER than the bore at its MOUTH
@@ -320,6 +333,8 @@ undercut seat deep enough to BREAK the far face reads to the phantom pole
 again, because there the true root is off the part and so on no face
 either. Neither is one of D-19's five, and the fix above leaves both
 exactly where it found them.
+
+A third is flagged on the boss side, below.
 
 **A parametric artifact is not geometry**, in two places that look
 unrelated and are the same mistake.
