@@ -439,18 +439,51 @@ corpus.
 >
 > The five turned out to be **two** root causes, not four:
 >
-> - **N4 + N3 — an inward root.** Round 7 already held that a root inward
->   of the mouth lies in the void the bore hollowed out and cannot bound
->   the solid — and applied it only to a TIE. The argument never mentioned
->   the tie; confining it to one is what left an *undercut* seat (nose
->   wider than bore, so the two roots are NOT equidistant) reading to the
->   sphere's near pole. `_root_for_end`'s filter is now unconditional and
->   the tangency falls out of it. Measured across 4 cutters x 8 undercuts
->   spanning six decades, and across 13 nose depths for the drop.
->   *Correction inside the correction:* the bound must be the mouth's
->   REACH (`_edge_axial_extent`), not its mean — a mouth cut across a
->   slope straddles its own average, and the mean-bounded first cut took
->   a conical boss's MIRROR cone, 7 mm above the apex.
+> - **N4 + N3 — the wrong root of a coaxial cap.** Round 7 already held
+>   that a root inward of the mouth lies in the void the bore hollowed out
+>   — and applied it only to a TIE. An *undercut* seat (nose wider than
+>   bore) has its two roots at unequal distances, so the tie never fired
+>   and nearest-the-mouth took the sphere's phantom near pole.
+>
+>   **Which side of the mouth a root falls on is NOT the discriminator**,
+>   and two cuts of this were wrong before the third was right — both
+>   caught by the adversarial pass, not by the suite. Bounding by the
+>   mouth's axial *mean* took a conical boss's MIRROR cone 7 mm above the
+>   apex (a mouth cut across a slope straddles its own average). Bounding
+>   by the mouth's full axial *reach* fixed that and was still wrong in
+>   general, because a **concave** cap's true root is genuinely inward: a
+>   bore leaving through a spherical dimple ends at the dimple's own floor
+>   BELOW where its wall starts, and an outward-only rule marched it to
+>   that sphere's far pole 9.6 mm above the part.
+>
+>   The discriminator is whether the root is on the part's **real
+>   boundary** — the trimmed cap face — and it is a PREFERENCE, never a
+>   bound (`_root_is_on_the_face`). It is also gated hard on
+>   **coaxiality** (`_cap_is_coaxial`), because **round 4 had already
+>   measured that an unrestricted on-face gate reopens its blocker 2** and
+>   pinned that as `test_r4_an_on_face_trim_test_would_have_re_broken_the_domes`.
+>   Round 4 is right: a Ø4 bore out through a torus wall meets its cap's
+>   carrier at x = −20, −4, 4, 20; its own end at x=4 sits in the hole it
+>   cut and is *not* on the face, while x=−4 on the far side of the donut
+>   *is*, and preferring on-face there measures 24.0 against a true 16.0.
+>   A **coaxial** cap is the one shape where distance says nothing at all
+>   — the roots are that surface's own poles — so the preference is asked
+>   there and nowhere else. Verified across 4 cutters x 8 undercuts
+>   spanning six decades, and 12 nose depths for the drop.
+>
+> **Two siblings FLAGGED, not fixed** (both pre-existing, both reading the
+> same at `origin/main`, both UNDER-reporting, neither among D-19's five;
+> pinned at their current values by
+> `test_r8_two_siblings_of_the_undercut_family_are_flagged_not_fixed` so a
+> later round must change a test on purpose):
+>
+> - a **spherical relief wider than the bore at its MOUTH** shortens the
+>   bore by about its own radius (a Ø8 through bore in a 20 mm plate reads
+>   16.0) — neither pole is on the face, so nearest applies and takes the
+>   relief's pole;
+> - an **undercut seat deep enough to BREAK the far face** puts its true
+>   pole off the part, so no root is on any face and the phantom near pole
+>   wins again.
 > - **Item 3 + N2 + N1 — a parametric artifact read as geometry.** The
 >   *seam* marched as a barrier (item 3: 69 of 81 configurations short,
 >   0.04–3.98 mm, a contiguous band; closed by `_same_carrier`), and the

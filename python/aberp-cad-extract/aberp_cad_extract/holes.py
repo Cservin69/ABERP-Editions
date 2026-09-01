@@ -282,15 +282,44 @@ seat returned no holes at all, a silent under-COUNT (N3). The filter is
 now unconditional, and the tangency falls out of it rather than being
 special-cased.
 
-One correction inside the correction, because the first cut of it was
-wrong in the other direction. "Inward of the mouth" has to be measured
-against the mouth's REACH and not its mean: a mouth cut across a slope
-straddles its own average, so the mean-bounded filter threw away the true
-crossing on a bore under a conical boss and took the MIRROR cone's, seven
-millimetres above the apex. :func:`_edge_axial_extent` is the bound, and
-it narrows without ever emptying — refuse every root and the whole field
-comes back, which is what keeps a cap that computes a bit inside its own
-mouth from being lost.
+What "inward" cannot be is a DISTANCE, and two cuts of this were wrong
+before the third was right — both caught by the adversarial pass rather
+than by the suite, which is the note worth keeping.
+
+Bounding the root by the mouth's own axial position throws away the true
+crossing wherever the mouth is not planar: a mouth cut across a slope
+straddles its own mean, so a mean-bounded filter took a conical boss's
+MIRROR cone, seven millimetres above the apex. Bounding it by the mouth's
+full axial REACH instead fixed that and still had the sign wrong in
+general, because a CONCAVE cap's true root is genuinely inward: a bore
+leaving through a spherical dimple ends at the dimple's own floor, BELOW
+where the bore's wall starts, and an outward-only rule marched it to the
+dimple sphere's far pole 9.6 mm above the part.
+
+The two cases are locally identical — same surface, same normals, same
+which-side-of-the-mouth — and what tells them apart is not local at all.
+It is whether the root is on the part's REAL BOUNDARY. An undercut seat's
+true root is on the trimmed cap face; its phantom near pole is on the
+carrier under the disc the bore removed. A dimple has NEITHER root on the
+face — the bore removed the floor around the axis — and there the round-2
+rule, nearest the mouth, is right and unchanged.
+
+So the rule is a PREFERENCE and not a bound: of a face's several roots,
+prefer one that lies on the trimmed face; where none does, keep nearest.
+:func:`_root_is_on_the_face` is the test. It can never be a requirement,
+because a bore's axis usually leaves through the very hole the bore cut,
+where the trimmed face is absent — which is the whole reason
+:func:`_cap_axis_intersections` asks the UNBOUNDED surface in the first
+place.
+
+Two siblings of this family are NOT closed here and are flagged rather
+than fixed, both pre-existing and both reading the same at
+``origin/main``: a spherical relief WIDER than the bore at its MOUTH
+reads the bore's end at the relief's own pole, ~r below the face; and an
+undercut seat deep enough to BREAK the far face reads to the phantom pole
+again, because there the true root is off the part and so on no face
+either. Neither is one of D-19's five, and the fix above leaves both
+exactly where it found them.
 
 **A parametric artifact is not geometry**, in two places that look
 unrelated and are the same mistake.
@@ -508,15 +537,18 @@ try:
     from OCP.BRep import BRep_Tool
     from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
     from OCP.BRepBndLib import BRepBndLib
+    from OCP.BRepClass import BRepClass_FaceClassifier
     from OCP.BRepTools import BRepTools
     from OCP.Geom import Geom_Line
     from OCP.GeomAbs import GeomAbs_SurfaceType
     from OCP.GeomAPI import GeomAPI_IntCS, GeomAPI_ProjectPointOnSurf
     from OCP.GeomLProp import GeomLProp_SLProps
-    from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Vec
+    from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Pnt2d, gp_Vec
     from OCP.TopAbs import (
         TopAbs_EDGE,
         TopAbs_FACE,
+        TopAbs_IN,
+        TopAbs_ON,
         TopAbs_REVERSED,
         TopAbs_VERTEX,
     )
@@ -746,18 +778,6 @@ SURFACE_CONFUSION_MM: float = 1e-7
 #: that cuts an ordinary chamfer or fillet happens within a step or two.
 BARRIER_REACH_RADII: float = 3.0
 
-#: How many points of a mouth edge :func:`_edge_axial_extent` samples to
-#: find how far that edge reaches along the bore's axis.
-#:
-#: The extent bounds :func:`_root_for_end`'s inward test, and reporting it
-#: SHORT is the direction that costs, so this is set by how well a smooth
-#: curve's extreme survives being sampled rather than by cost. A mouth
-#: edge is at most the bore's own circumference long and bends on the
-#: scale of the bore's radius, so 33 samples put the missed extreme at
-#: order ``r/1000`` of a turn squared — orders inside the tangency band
-#: the caller pads by anyway, and inside it for a bore of any size because
-#: both scale with the radius.
-EDGE_EXTENT_SAMPLES: int = 33
 
 #: The side of the square parameter grid :func:`_same_carrier` probes one
 #: face's carrier at before deciding it is the other's too.
@@ -1310,44 +1330,6 @@ def _edge_axial_mean(edge, origin, direction) -> Optional[float]:
     return total / samples
 
 
-def _edge_axial_extent(edge, origin, direction) -> Optional[Tuple[float, float]]:
-    """How far along the axis this edge REACHES, at both ends of it.
-
-    :func:`_edge_axial_mean` says roughly where an edge sits, which is all
-    that is needed to sort it to one end of the bore. This says how far it
-    spreads, and the difference matters wherever a mouth is not planar:
-    the mean of a mouth cut across a slope is a place the mouth may not
-    reach on either side of the axis, and :func:`_root_for_end` needs the
-    reach rather than the average of it.
-
-    Sampled more finely than the mean for the same reason. Reporting the
-    extent SHORT is the direction that costs — it would disqualify a root
-    the mouth really does straddle — so the sample is dense enough that a
-    smooth mouth's extreme is found to well inside the tangency band, and
-    the caller pads by that band besides.
-    """
-    try:
-        curve = BRepAdaptor_Curve(edge)
-        u0, u1 = float(curve.FirstParameter()), float(curve.LastParameter())
-    except Exception:  # noqa: BLE001 — an unreadable edge bounds nothing
-        return None
-    lo = hi = None
-    for k in range(EDGE_EXTENT_SAMPLES):
-        u = u0 + (u1 - u0) * k / (EDGE_EXTENT_SAMPLES - 1)
-        p = curve.Value(u)
-        t = _dot(
-            (
-                float(p.X()) - origin[0],
-                float(p.Y()) - origin[1],
-                float(p.Z()) - origin[2],
-            ),
-            direction,
-        )
-        lo = t if lo is None or t < lo else lo
-        hi = t if hi is None or t > hi else hi
-    return (lo, hi) if lo is not None else None
-
-
 def _edge_mid_point(edge) -> Optional[Tuple[float, float, float]]:
     """A point at the middle of this edge's parameter range.
 
@@ -1787,6 +1769,100 @@ def _crossing_normal(surface, u, v, direction) -> Optional[Tuple[float, float, f
     return normal if abs(_dot(direction, normal)) > CAP_OUTWARD_MIN_COS else None
 
 
+def _cap_is_coaxial(face, origin, direction) -> bool:
+    """Is this cap a surface of revolution about the BORE'S OWN axis?
+
+    The narrow gate on :func:`_root_is_on_the_face`, and the reason that
+    test is safe at all. A coaxial cap is the ONE shape for which
+    "the root nearest the mouth" says nothing true: the axis runs down the
+    surface's own axis of revolution, so the roots it meets are that
+    surface's POLES, the mouth is a circle concentric with both of them,
+    and which pole is nearer is a fact about the cap's proportions rather
+    than about where the bore ends. A ball-end seat undercut by half a
+    micron has its phantom pole nearer; the same seat undercut by half a
+    millimetre still does.
+
+    Everywhere else nearest is right and stays untouched. A cross-drilled
+    shaft's OD, a torus wall, a dome the bore misses the centre of — those
+    meet the axis at points that are not poles, the near one is this end's
+    and the far one is the other end's, and round 2 settled them.
+
+    Which matters because the torus wall is where an unrestricted on-face
+    preference goes wrong, and ROUND 4 ALREADY MEASURED THAT. A Ø4 bore
+    out through a torus wall meets its cap's carrier at x = -20, -4, 4 and
+    20. The bore's own end is x=4, in the middle of the hole it cut, so it
+    is NOT on the trimmed face; x=-4 is the same inner surface on the far
+    side of the donut and IS. Preferring on-face there measured 24.0
+    against a true 16.0. The torus is not coaxial with the bore, so this
+    gate keeps it on nearest, and
+    ``test_r4_an_on_face_trim_test_would_have_re_broken_the_domes`` — which
+    is round 4's own design note, pinned as a measurement — stays green.
+
+    Asked of the analytic descriptors because coaxiality is exactly what
+    they carry. A SPHERE is a surface of revolution about any axis through
+    its centre, so it is coaxial when its centre is ON the bore's axis; a
+    cylinder, cone or torus when its own axis is that line. Anything else
+    — a B-spline, an imported skin — cannot be shown coaxial cheaply and
+    is not assumed to be, which leaves it on round 2's rule.
+    """
+    try:
+        adaptor = _adaptor(face)
+        kind = adaptor.GetType()
+        if kind == GeomAbs_SurfaceType.GeomAbs_Sphere:
+            centre = adaptor.Sphere().Location()
+            return (
+                _axis_line_distance(
+                    origin, direction, (centre.X(), centre.Y(), centre.Z())
+                )
+                <= AXIS_POSITIONAL_TOL_MM
+            )
+        if kind == GeomAbs_SurfaceType.GeomAbs_Cylinder:
+            axis = adaptor.Cylinder().Axis()
+        elif kind == GeomAbs_SurfaceType.GeomAbs_Cone:
+            axis = adaptor.Cone().Axis()
+        elif kind == GeomAbs_SurfaceType.GeomAbs_Torus:
+            axis = adaptor.Torus().Axis()
+        else:
+            return False
+        loc, d = axis.Location(), axis.Direction()
+        return _axes_parallel(
+            (d.X(), d.Y(), d.Z()), direction
+        ) and _axis_line_distance(
+            origin, direction, (loc.X(), loc.Y(), loc.Z())
+        ) <= AXIS_POSITIONAL_TOL_MM
+    except Exception:  # noqa: BLE001 — a surface that will not answer is not coaxial
+        return False
+
+
+def _root_is_on_the_face(face, u, v) -> bool:
+    """Does the root at ``(u, v)`` lie on the TRIMMED face — the part's
+    real boundary — rather than only on the carrier under it?
+
+    :func:`_cap_axis_intersections` deliberately asks the UNBOUNDED
+    surface, because a bore's axis usually exits through the very hole the
+    bore cut in its cap, where the trimmed face is absent. So this can
+    never be a REQUIREMENT anywhere, and it is only asked at all of a
+    COAXIAL cap (:func:`_cap_is_coaxial`), where distance has nothing to
+    say. Even there it is a preference: a spherical DIMPLE the bore leaves
+    through has neither pole on its face — the bore removed the floor
+    around the axis, and the sphere's other half is outside the part — and
+    there nearest is right and is what stands.
+
+    A 2-D question, asked in the face's own parameter space with
+    ``BRepClass_FaceClassifier``. Note what it is NOT: the point-in-SOLID
+    query the module docstring says is gone. That one indexed the whole
+    shell and was asked 36 times a bore; this walks one face's wires and
+    is reached only by a coaxial cap that offered this end more than one
+    root — which on an ordinary plate is no face at all.
+    """
+    try:
+        classifier = BRepClass_FaceClassifier(face, gp_Pnt2d(u, v), SURFACE_CONFUSION_MM)
+        state = classifier.State()
+    except Exception:  # noqa: BLE001 — an unclassifiable root simply proves nothing
+        return False
+    return state == TopAbs_IN or state == TopAbs_ON
+
+
 def _cap_axis_intersections(
     face, origin, direction
 ) -> List[Tuple[float, Tuple[float, float, float]]]:
@@ -1829,7 +1905,10 @@ def _cap_axis_intersections(
     """
     planar = _plane_axis_intersection(face, origin, direction)
     if planar is not None:
-        return [planar]
+        # A plane meets a line once, so there is nothing to choose between
+        # and the flag is never read. False, not a classification nobody
+        # asked for: the analytic path stays exactly as cheap as it was.
+        return [(planar[0], planar[1], False)]
     if _adaptor(face).GetType() == GeomAbs_SurfaceType.GeomAbs_Plane:
         # Planar but grazing — the analytic path already refused it, and
         # handing the same grazing case to the general intersector would
@@ -1848,7 +1927,10 @@ def _cap_axis_intersections(
     intersector = GeomAPI_IntCS(line, surface)
     if not intersector.IsDone():
         return []
-    roots: List[Tuple[float, Tuple[float, float, float]]] = []
+    # The on-face preference is only ever consulted on a coaxial cap with
+    # something to choose between; everywhere else it is not even asked.
+    many = intersector.NbPoints() > 1 and _cap_is_coaxial(face, origin, direction)
+    roots: List[Tuple[float, Tuple[float, float, float], bool]] = []
     for i in range(1, intersector.NbPoints() + 1):
         u, v, _w = intersector.Parameters(i)
         normal = _crossing_normal(surface, u, v, direction)
@@ -1871,6 +1953,9 @@ def _cap_axis_intersections(
                     direction,
                 ),
                 normal,
+                # Only worth asking where there is something to choose
+                # between. One root is this end's whatever it classifies as.
+                many and _root_is_on_the_face(face, u, v),
             )
         )
     return roots
@@ -2881,12 +2966,11 @@ def _tangency_band(radius: float) -> float:
 
 
 def _root_for_end(
-    roots: Sequence[Tuple[float, Tuple[float, float, float]]],
+    roots: Sequence[Tuple[float, Tuple[float, float, float], bool]],
     t_edge: float,
     at_low: bool,
     radius: float,
-    t_inward: Optional[float] = None,
-) -> Tuple[float, Tuple[float, float, float]]:
+) -> Tuple[float, Tuple[float, float, float], bool]:
     """Which crossing of ONE cap face belongs to THIS end of the bore.
 
     The crossing NEAREST the edge that led to the face, which is what
@@ -2948,11 +3032,8 @@ def _root_for_end(
     answer. Requiring the straddle is why every one of the 43 committed
     fixtures stays bit-identical rather than 42 of them.
     """
-    sign = -1.0 if at_low else 1.0
-    band = _tangency_band(radius)
-    bound = t_edge if t_inward is None else t_inward
-    outward = [root for root in roots if sign * (root[0] - bound) >= -band]
-    field = outward or list(roots)
+    on_face = [root for root in roots if root[2]]
+    field = on_face or list(roots)
     return min(field, key=lambda root: abs(root[0] - t_edge))
 
 
@@ -3030,28 +3111,6 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
                     continue
                 at_low = t_edge < mid
                 end = low if at_low else high
-                # How far INWARD this mouth edge itself reaches. A root
-                # further in than that is inside the void the bore
-                # hollowed out — see :func:`_root_for_end`. Measured on
-                # the edge's REACH rather than its mean, because a mouth
-                # cut across a slope straddles its own mean.
-                #
-                # Computed at most ONCE per edge, and only for a face that
-                # offers this end more than one root — which is the only
-                # case that has anything to choose between, and is a small
-                # minority of a plate's caps. A plane offers one root and
-                # never pays for the walk.
-                inward: List[Optional[float]] = []
-
-                def reach_inward(_at_low=at_low, _edge=edge) -> Optional[float]:
-                    if not inward:
-                        extent = _edge_axial_extent(_edge, origin, direction)
-                        inward.append(
-                            None
-                            if extent is None
-                            else (extent[1] if _at_low else extent[0])
-                        )
-                    return inward[0]
                 # The far bound for THIS end: a low-end cap may lie as far
                 # below the bore as its own curvature carries it, but not
                 # above the high end.
@@ -3072,12 +3131,8 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
                     ]
                     if not roots:
                         continue
-                    t_cap, normal = _root_for_end(
-                        roots,
-                        t_edge,
-                        at_low,
-                        group.radius,
-                        reach_inward() if len(roots) > 1 else None,
+                    t_cap, normal, _on_face = _root_for_end(
+                        roots, t_edge, at_low, group.radius
                     )
                     end.caps.append(
                         (

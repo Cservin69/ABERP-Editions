@@ -2340,7 +2340,7 @@ def test_r6_nearest_root_alone_re_breaks_the_ball_nose(
     monkeypatch.setattr(
         holes_mod,
         "_root_for_end",
-        lambda roots, t_edge, at_low, radius, t_inward=None: min(
+        lambda roots, t_edge, at_low, radius: min(
             roots, key=lambda root: abs(root[0] - t_edge)
         ),
     )
@@ -2732,7 +2732,7 @@ def test_r7_a_bare_nearest_pick_re_breaks_the_whole_sweep(monkeypatch):
     monkeypatch.setattr(
         holes_mod,
         "_root_for_end",
-        lambda roots, t_edge, at_low, radius, t_inward=None: min(
+        lambda roots, t_edge, at_low, radius: min(
             roots, key=lambda root: abs(root[0] - t_edge)
         ),
     )
@@ -2846,11 +2846,11 @@ def test_r7_the_untied_caps_stay_far_outside_the_band(fixtures_dir: Path):
     seen = []
     original = holes_mod._root_for_end
 
-    def spy(roots, t_edge, at_low, radius, t_inward=None):
+    def spy(roots, t_edge, at_low, radius):
         reaches = sorted(abs(root[0] - t_edge) for root in roots)
         if len(reaches) > 1:
             seen.append((reaches[1] - reaches[0], holes_mod._tangency_band(radius)))
-        return original(roots, t_edge, at_low, radius, t_inward)
+        return original(roots, t_edge, at_low, radius)
 
     holes_mod._root_for_end = spy
     try:
@@ -3331,7 +3331,7 @@ def test_r8_the_undercut_seat_was_short_and_through_before():
     original = holes_mod._root_for_end
     try:
         holes_mod._root_for_end = (
-            lambda roots, t_edge, at_low, radius, t_inward=None: min(
+            lambda roots, t_edge, at_low, radius: min(
                 roots, key=lambda root: abs(root[0] - t_edge)
             )
         )
@@ -3361,7 +3361,11 @@ def test_r8_the_undercut_seat_is_never_dropped():
     between two independent numbers, and pinning it at the one depth where
     the coincidence fires would pin the coincidence rather than the rule.
     """
-    depths = [8.0 + 0.5 * k for k in range(13)]  # 8.0 .. 14.0
+    # From 8.5, because a Ø16 seat at 8.0 with any undercut bottoms BELOW
+    # the plate: that is a seat that BREAKS the far face, a different
+    # feature and a different (still open, pre-existing) defect — see
+    # `test_r8_two_siblings_of_the_undercut_family_are_flagged_not_fixed`.
+    depths = [8.5 + 0.5 * k for k in range(12)]  # 8.5 .. 14.0
     missing = []
     for nose_centre_z in depths:
         for undercut in (4e-7, 1e-6, 1e-4):
@@ -3380,48 +3384,155 @@ def test_r8_the_undercut_seat_is_never_dropped():
     assert not missing, missing
 
 
-def test_r8_the_inward_bound_is_the_mouths_REACH_not_its_mean():
-    """Why :func:`_edge_axial_extent` exists, stated as a part.
+def test_r8_the_on_face_preference_is_gated_on_COAXIALITY():
+    """The narrow gate, and why it has to be narrow.
 
-    The filter disqualifies a root inward of the MOUTH, and a mouth cut
-    across a slope straddles its own average — so measuring it by
-    :func:`_edge_axial_mean` disqualifies roots the mouth really does
-    reach. On a bore under a conical boss the cone's mouth runs from
-    z=14.9 to z=21.9 while its mean sits above the true crossing at 20.5,
-    and the mean-bounded filter threw the crossing away and took the
-    mirror cone's, 7 mm above the apex.
+    ROUND 4 ALREADY MEASURED that an unrestricted on-face gate reopens its
+    blocker 2, and pinned it as
+    :func:`test_r4_an_on_face_trim_test_would_have_re_broken_the_domes`.
+    It is right: a Ø4 bore out through a torus wall meets its cap's
+    carrier at x = -20, -4, 4 and 20. Its own end is x=4, in the middle of
+    the hole it cut, so it is NOT on the trimmed face; x=-4 is the same
+    inner surface on the far side of the donut and IS. Prefer on-face
+    there and the bore measures 24.0 against a true 16.0.
 
-    Pinned by making the extent degenerate to the mean and requiring the
-    boss family to break: this guard has to fail loudly, because its
-    failure direction is an OVER-quote and those are the ones that get
-    argued away.
+    A coaxial cap is the one shape where distance says nothing — the roots
+    are the surface's own POLES and which is nearer is a fact about the
+    cap's proportions. The torus is not coaxial with this bore, so it
+    keeps nearest. This pins both halves: remove the gate and the torus
+    breaks; keep it and every fixture stands.
     """
     import aberp_cad_extract.holes as holes_mod
 
-    parts = [_boss_part(10.0, 10.0, h, 38.5, 22.0, 4.0) for h in (14.0, 16.0, 18.0)]
-    wants = [
-        _boss_cone_over_axis(10.0, 10.0, h, 38.5, 22.0, 4.0) for h in (14.0, 16.0, 18.0)
-    ]
-    for part, want in zip(parts, wants):
-        holes = mine_cylindrical_holes(part)
-        assert len(holes) == 1
-        _approx(holes[0].depth_mm, want)
+    fixtures = Path(__file__).parent / "fixtures"
+    holes = _mine(fixtures / "bore_through_torus_wall.step")
+    assert len(holes) == 1
+    _approx(holes[0].depth_mm, 16.0)
 
-    original = holes_mod._edge_axial_extent
+    original = holes_mod._cap_is_coaxial
     try:
-        holes_mod._edge_axial_extent = lambda edge, origin, direction: (
-            lambda m: None if m is None else (m, m)
-        )(holes_mod._edge_axial_mean(edge, origin, direction))
-        broken = [
-            (want, [h.depth_mm for h in mine_cylindrical_holes(part)])
-            for part, want in zip(parts, wants)
-        ]
+        holes_mod._cap_is_coaxial = lambda face, origin, direction: True
+        ungated = _mine(fixtures / "bore_through_torus_wall.step")
     finally:
-        holes_mod._edge_axial_extent = original
+        holes_mod._cap_is_coaxial = original
 
-    assert any(
-        len(got) != 1 or abs(got[0] - want) > TOL for want, got in broken
-    ), f"the mouth's REACH must be load-bearing; nothing moved: {broken}"
+    assert len(ungated) == 1
+    assert abs(ungated[0].depth_mm - 16.0) > TOL, (
+        "with the coaxiality gate removed the torus wall must go back to "
+        f"round 4's measured 24.0; got {ungated[0].depth_mm}"
+    )
+
+
+def test_r8_a_concave_seat_at_the_MOUTH_keeps_nearest():
+    """The other half: on-face is a PREFERENCE, never a requirement.
+
+    A bore leaving through a spherical DIMPLE is coaxial, so the gate lets
+    the question be asked — and NEITHER pole is on the face. The bore
+    removed the dimple's floor around the axis, and the sphere's other
+    half is outside the part altogether. There round 2's nearest-the-mouth
+    is right, and it is what stands.
+
+    This is the case an outward-only rule got wrong, and it is why the
+    filter that closes N4 is not a bound on which SIDE of the mouth a root
+    may lie. Both attempts at such a bound marched this bore to the
+    dimple sphere's far pole, 9.6 mm above a plate 20 mm thick.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCylinder,
+        BRepPrimAPI_MakeSphere,
+    )
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    for dimple_r in (6.0, 8.0, 12.0):
+        centre_z = 20.0 + 0.6 * dimple_r
+        block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+        dimpled = BRepAlgoAPI_Cut(
+            block,
+            BRepPrimAPI_MakeSphere(gp_Pnt(20.0, 20.0, centre_z), dimple_r).Shape(),
+        ).Shape()
+        part = BRepAlgoAPI_Cut(
+            dimpled,
+            BRepPrimAPI_MakeCylinder(
+                gp_Ax2(gp_Pnt(20.0, 20.0, -5.0), gp_Dir(0, 0, 1)), 4.0, 40.0
+            ).Shape(),
+        ).Shape()
+        holes = [h for h in mine_cylindrical_holes(part) if abs(h.diameter_mm - 8.0) < TOL]
+        assert len(holes) == 1, dimple_r
+        # the dimple's own floor on the axis, which is where a drill first
+        # reaches the part — NOT the sphere's far pole above it
+        _approx(holes[0].depth_mm, centre_z - dimple_r)
+        assert holes[0].depth_mm < 20.0, (
+            f"a bore in a 20 mm plate cannot be {holes[0].depth_mm} deep"
+        )
+
+
+def test_r8_two_siblings_of_the_undercut_family_are_flagged_not_fixed():
+    """FLAGGED, and pinned at the value `origin/main` already gave.
+
+    Two neighbours of N4 are NOT closed by this round, are not among
+    D-19's five, and read here exactly as they read before it. Pinned so
+    that "we did not fix these" is a fact in the suite rather than a claim
+    in a commit message, and so that a later round that DOES fix them has
+    to come and change a test on purpose.
+
+    1. A spherical relief WIDER than the bore at its MOUTH. Neither pole
+       is on the face — the relief's retained skin is a thin annulus
+       outside the bore — so nearest applies and takes the relief's own
+       pole, about one bore radius below the part's face. A Ø8 through
+       bore in a 20 mm plate reads 16.0.
+    2. An undercut seat deep enough to BREAK the far face. The true pole
+       is then off the part and so on no face either, and the phantom near
+       pole wins again.
+
+    Both UNDER-report, which is the expensive direction, so they are worth
+    a backlog line rather than a shrug.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCylinder,
+        BRepPrimAPI_MakeSphere,
+    )
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    def plate_with(*tools, thickness=20.0):
+        shape = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, thickness).Shape()
+        for tool in tools:
+            shape = BRepAlgoAPI_Cut(shape, tool).Shape()
+        return shape
+
+    bore = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(20.0, 20.0, -5.0), gp_Dir(0, 0, 1)), 4.0, 40.0
+    ).Shape()
+
+    # 1 — a spherical relief at the mouth of a through bore
+    for undercut, expected in ((1e-4, 15.9999), (0.3, 15.7)):
+        part = plate_with(
+            bore, BRepPrimAPI_MakeSphere(gp_Pnt(20.0, 20.0, 20.0), 4.0 + undercut).Shape()
+        )
+        holes = [h for h in mine_cylindrical_holes(part) if abs(h.diameter_mm - 8.0) < TOL]
+        assert len(holes) == 1, undercut
+        assert holes[0].depth_mm == pytest.approx(expected, abs=1e-3), (
+            "OPEN, pre-existing: a mouth relief still shortens the bore by "
+            f"about its own radius; got {holes[0].depth_mm}"
+        )
+        assert holes[0].depth_mm < 20.0 - TOL, "and it under-reports"
+
+    # 2 — an undercut seat that breaks the far face
+    part = plate_with(
+        BRepPrimAPI_MakeCylinder(
+            gp_Ax2(gp_Pnt(20.0, 20.0, 8.0), gp_Dir(0, 0, 1)), 8.0, 30.0
+        ).Shape(),
+        BRepPrimAPI_MakeSphere(gp_Pnt(20.0, 20.0, 8.0), 8.0 + 1e-4).Shape(),
+    )
+    holes = [h for h in mine_cylindrical_holes(part) if abs(h.diameter_mm - 16.0) < TOL]
+    assert len(holes) == 1
+    assert holes[0].depth_mm < 20.0 - TOL, (
+        "OPEN, pre-existing: a seat that breaks the far face puts its true "
+        f"pole off the part, so no root is on any face; got {holes[0].depth_mm}"
+    )
 
 
 # ── the zero-caps boss-overhang band ─────────────────────────────────────
