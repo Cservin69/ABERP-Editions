@@ -115,6 +115,21 @@ pub enum Command {
     /// incrementally as the Svelte shell asks for them.
     Serve(ServeArgs),
 
+    /// **Demo/dev only.** Seed the bundled `demo` tenant with one coherent
+    /// aerospace job — CAD-derived quotes, approved vendors, purchase orders
+    /// (one of which trips the auto-NCR path), work orders with per-unit
+    /// UIDs, heat-lot inventory with Mill Test Reports, QC inspection plans
+    /// and measurements, a non-conformance, and drafted dispatches — so the
+    /// Defense screens have something to render in a demo.
+    ///
+    /// Refuses every tenant but `demo`, and no-ops on a tenant that already
+    /// carries data. It writes into the edition-locked
+    /// `~/.aberp-<edition>/demo/` root only; it cannot reach another
+    /// tenant's or another edition's database. The `demo` registry row it
+    /// writes is NAV-**off**, so a Defense (`--features production`) binary
+    /// running as `demo` still cannot submit to real NAV.
+    DemoSeed(DemoSeedArgs),
+
     /// Issue a storno (cancellation invoice) against a previously-
     /// finalized base invoice per ADR-0009 §6 / ADR-0023 (PR-10).
     ///
@@ -1029,6 +1044,18 @@ pub struct ServeArgs {
     /// raced), but it means a green boot-check also tells you serve is stopped.
     #[arg(long, default_value_t = false)]
     pub boot_check: bool,
+}
+
+/// Arguments for the demo seed. The DB path is deliberately NOT an
+/// argument: it is *derived* from the slug through the edition-locked
+/// resolver (FOUNDATION §5), so no launcher string can point this command
+/// at a real tenant.
+#[derive(Debug, Parser)]
+pub struct DemoSeedArgs {
+    /// Tenant slug to seed. Only the bundled `demo` tenant is accepted;
+    /// anything else is refused loud.
+    #[arg(long, default_value = "demo")]
+    pub tenant: String,
 }
 
 #[derive(Debug, Parser)]
