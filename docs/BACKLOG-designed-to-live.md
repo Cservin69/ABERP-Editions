@@ -483,7 +483,19 @@ corpus.
 >   relief's pole;
 > - an **undercut seat deep enough to BREAK the far face** puts its true
 >   pole off the part, so no root is on any face and the phantom near pole
->   wins again.
+>   wins again;
+> - and, on the boss side, the family **outside** item 3's named region.
+>   The named band (cone heights 14–20 × offsets 37.0–38.5) is closed to
+>   the bit; widen the sweep and a randomised 108-part family goes from
+>   **18 wrong to 10**, every remaining one already wrong at
+>   `origin/main`. The residual is a different mechanism —
+>   `_barrier_track` reconstructs a cut part edge by marching its
+>   *untrimmed* curve past the vertex, which assumes the BORE is what cut
+>   it; where a fused boss also swallowed part of that edge the curve is
+>   laid back down across ground it never covered, and a bore whose whole
+>   share of the cone's mouth lies beyond the plate's edge then has no
+>   unobstructed ray at all. Same shape of error as the seam, one level
+>   down: an edge asserted where the topology has none.
 > - **Item 3 + N2 + N1 — a parametric artifact read as geometry.** The
 >   *seam* marched as a barrier (item 3: 69 of 81 configurations short,
 >   0.04–3.98 mm, a contiguous band; closed by `_same_carrier`), and the

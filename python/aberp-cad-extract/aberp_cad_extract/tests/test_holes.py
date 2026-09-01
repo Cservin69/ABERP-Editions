@@ -3592,6 +3592,73 @@ def test_r8_the_zero_caps_boss_band_is_closed():
     assert not wrong, f"{len(wrong)} of the band mis-mined: {wrong[:5]}"
 
 
+def test_r8_the_boss_family_OUTSIDE_the_band_is_improved_not_closed():
+    """FLAGGED, measured, and not closed: the wider boss family.
+
+    D-19's item 3 names a region — cone heights 14..20 crossed with bore
+    offsets 37.0..38.5 — and that region is closed to the bit by the test
+    above. Widen the sweep past it and a residual remains, on a randomised
+    108-part family with every dimension untidy: **18 wrong before this
+    round, 10 after**. Every one of the 10 was already wrong at
+    ``origin/main``; the round introduces none and closes eight.
+
+    The residual is a DIFFERENT mechanism, which is why it is flagged
+    rather than folded in. :func:`_barrier_track` reconstructs a cut part
+    edge by marching its UNTRIMMED curve out past the vertex the bore cut
+    it at, and that reconstruction assumes the BORE is what cut it. Where
+    a fused boss also swallowed part of that edge, the march lays the
+    curve back down across ground the edge never covered — and a bore
+    whose whole share of the cone's mouth lies BEYOND the plate's own edge
+    then has no unobstructed ray at all, so the cone loses an end it
+    really does own. Same shape of error as the seam, one level down: an
+    edge asserted where the topology does not have one.
+
+    Pinned as a measurement so the claim cannot rot: the named band stays
+    at zero, and the wider family stays no worse than it is here.
+    """
+    import math as _math
+
+    seed = [20260901]
+
+    def rnd(lo, hi):
+        seed[0] = (1103515245 * seed[0] + 12345) % (2**31)
+        return lo + (hi - lo) * (seed[0] / 2**31)
+
+    wrong = considered = 0
+    for _ in range(400):
+        cone_z, cone_r, cone_h = rnd(3.0, 12.0), rnd(7.0, 13.0), rnd(13.0, 27.0)
+        bore_x, bore_y, bore_r = rnd(31.0, 39.5), rnd(18.0, 26.0), rnd(2.1, 4.9)
+        offset = _math.hypot(40.0 - bore_x, 20.0 - bore_y)
+        if offset >= cone_r:
+            continue
+        want = cone_z + cone_h * (1.0 - offset / cone_r)
+        if want <= 20.0 + TOL:
+            continue
+        considered += 1
+        try:
+            holes = [
+                hole
+                for hole in mine_cylindrical_holes(
+                    _boss_part(cone_z, cone_r, cone_h, bore_x, bore_y, bore_r)
+                )
+                if abs(hole.diameter_mm - 2.0 * bore_r) < TOL
+            ]
+        except Exception:  # noqa: BLE001 — a kernel refusal is not this test's subject
+            continue
+        if len(holes) != 1 or abs(holes[0].depth_mm - want) > 1e-5:
+            wrong += 1
+
+    assert considered > 80, considered
+    assert wrong <= 10, (
+        f"the wider boss family regressed: {wrong}/{considered} wrong "
+        "(round 8 measured 10, round 7 measured 18)"
+    )
+    assert wrong > 0, (
+        "if this family is now clean the flag in D-19 is stale and the "
+        "backlog entry should say so"
+    )
+
+
 def test_r8_a_seam_barrier_re_opens_the_whole_band():
     """REVERT-PROOF for :func:`_is_parametric_artifact`.
 
