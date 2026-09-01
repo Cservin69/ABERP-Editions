@@ -15,9 +15,9 @@ use anyhow::Result;
 use clap::Parser;
 
 use aberp::{
-    cli, drain_pending_retries, drain_submission_queue, export_invoice_bundle, issue_invoice,
-    issue_modification, issue_storno, mark_abandoned, observe_receiver_confirmation, poll_ack,
-    poll_annulment_ack, print_invoice, recover_from_nav, request_technical_annulment,
+    cli, demo_seed, drain_pending_retries, drain_submission_queue, export_invoice_bundle,
+    issue_invoice, issue_modification, issue_storno, mark_abandoned, observe_receiver_confirmation,
+    poll_ack, poll_annulment_ack, print_invoice, recover_from_nav, request_technical_annulment,
     retry_submission, serve, setup_nav_credentials, snapshot, submit_annulment, submit_invoice,
 };
 
@@ -33,6 +33,7 @@ fn main() -> Result<()> {
         cli::Command::RetrySubmission(a) => retry_submission::run(&a),
         cli::Command::MarkAbandoned(a) => mark_abandoned::run(&a),
         cli::Command::Serve(a) => serve::run(&a),
+        cli::Command::DemoSeed(a) => demo_seed::run(&a),
         cli::Command::IssueStorno(a) => issue_storno::run(&a),
         cli::Command::IssueModification(a) => issue_modification::run(&a),
         cli::Command::RequestTechnicalAnnulment(a) => request_technical_annulment::run(&a),

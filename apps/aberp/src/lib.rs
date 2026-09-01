@@ -43,6 +43,11 @@ pub mod email_invoice;
 // creds per [[aberp-smtp-spoc]]. Dedicated keychain entry
 // (email_relay_credentials) for independent rotation per ADR-0007 §Auth.
 pub mod daemon_tick_guard;
+// The Defense demo seed — one coherent aerospace job written into the
+// bundled `demo` tenant so the Defense screens have something to render.
+// Demo/dev artifact: reachable only through `aberp demo-seed`, which
+// refuses any tenant but `demo`.
+pub mod demo_seed;
 pub mod email_outbox_poll_daemon;
 pub mod email_relay;
 pub mod email_relay_credentials;
