@@ -775,8 +775,16 @@ DEGENERATE_PROBE_DIRECTIONS: int = 4
 #: — OCCT's own ``Precision::Confusion``, in mm, restated here so the
 #: feature-off import guard stays a pure-Python affair.
 #:
-#: Used to size :func:`_tangency_band` and
-#: :func:`_collapsed_isoline_radius`, never to compare positions.
+#: Sizes :func:`_collapsed_isoline_radius` and is the agreement
+#: :func:`_same_carrier` requires of two surfaces before calling them one,
+#: never used to compare positions.
+#:
+#: It used to size a tangency BAND as well — the tolerance round 7 needed
+#: to recognise a ball-nose bottom as a tie. Round 8 removed the band with
+#: the tie: an undercut seat is the same defect at a scale no band reaches,
+#: and the rule that closes it (:func:`_root_for_end`) has no epsilon in it
+#: at all. A tolerance that is no longer consulted is worse than none,
+#: because the tests that pin it go on passing.
 SURFACE_CONFUSION_MM: float = 1e-7
 
 
@@ -2949,45 +2957,6 @@ class _EdgeFaces:
         return self._faces.get(self._index.FindIndex(edge), ())
 
 
-def _tangency_band(radius: float) -> float:
-    """How far two root distances may differ and still be a TANGENCY.
-
-    A cap that meets the bore's wall TANGENTIALLY puts its two axis
-    crossings exactly one radius either side of the mouth, so the two
-    distances are equal — see :func:`_root_for_end` for why the inward
-    one is then not a candidate. Equal in exact arithmetic; what comes
-    back from OCCT is equal to about a ULP, and which of the two rounds
-    the shorter way is not a fact about the part.
-
-    The band is not a fudge factor, it is the tangency test restated as a
-    distance. Take a spherical cap of radius ``R`` on a bore of radius
-    ``r``: its crossings sit at ``t_c ± R`` and its mouth at
-    ``t_c ± sqrt(R² - r²)``, so the two distances differ by exactly
-    ``2·sqrt(R² - r²)``. Writing ``R = r + e`` for the amount by which
-    the cap FAILS to be tangent gives ``2·sqrt(2·r·e + e²)``, and the
-    surfaces are indistinguishable — the same surface, as far as the
-    kernel is concerned — once ``e`` drops to
-    :data:`SURFACE_CONFUSION_MM`. So
-
-        band(r) = 2·sqrt(2·r·SURFACE_CONFUSION_MM)
-
-    is exactly "the two surfaces agree to within OCCT's own confusion
-    over the whole mouth", carried into the units the caller compares in.
-
-    Note the SQUARE ROOT, which is the whole reason a band is needed at
-    all rather than an equality: near a tangency the distance difference
-    is the square root of the surface mismatch, so it is enormously more
-    sensitive than the mismatch is. On a Ø8 bore the band is 1.8e-3 mm —
-    twelve orders above the ~4e-15 mm of float noise that actually
-    separates a machined ball-nose's two roots, and four orders BELOW the
-    15.5 mm that separates the nearest genuinely untied pair in the
-    fixture set (``bore_through_torus_wall``). The answer is flat across
-    that whole band; ``test_r7_the_tangency_band_is_not_a_tuned_epsilon``
-    walks it decade by decade and pins that.
-    """
-    return 2.0 * math.sqrt(2.0 * max(radius, 0.0) * SURFACE_CONFUSION_MM)
-
-
 def _root_for_end(
     roots: Sequence[Tuple[float, Tuple[float, float, float], bool]],
     t_edge: float,
@@ -2998,62 +2967,50 @@ def _root_for_end(
 
     The crossing NEAREST the edge that led to the face, which is what
     settles a shaft's two crossings: a line meets a cylinder twice and
-    the far meeting is the other end of the bore, not this one.
+    the far meeting is the other end of the bore, not this one. That is
+    round 2's rule and it is still the rule almost everywhere.
 
-    Nearest cannot settle a TIE, and a tie here is not float noise — it
-    is a TANGENCY, and the commonest tangency in a machined part is a
-    ball-nose bottom. A ball-nose is a sphere of the cutter's radius
-    ending a bore of the same radius, so the sphere is tangent to the
-    bore, the mouth is the sphere's own EQUATOR, and the two poles sit
-    exactly one radius from it on either side. Nearest has nothing to
-    say, and whichever of the two ``GeomAPI_IntCS`` happened to list
-    first won the end: on a Ø8 ball-nose pocket 16 mm deep that is a
-    reported depth of 8 and a verdict of THROUGH — half the depth, the
-    wrong end condition, and an answer that FLIPS with the intersector's
-    list order (ADR-0112 adversarial round 6, blocker 2, and an S3
-    defect as well as a wrong number).
+    It says nothing at all about a cap that is a surface of revolution
+    about the BORE'S OWN AXIS, and that is the case round 8 is about. The
+    axis then runs down the cap's own axis, so the crossings it meets are
+    that surface's POLES, the mouth is a circle concentric with both of
+    them, and which pole is nearer is a fact about the cap's proportions
+    rather than about where the bore ends.
 
-    An exact tie is broken by taking the OUTERMOST of the tied roots,
-    and that is a fact about the bore rather than a preference. The two
-    tied roots straddle the mouth: one lies outward of it, the other
-    exactly as far INWARD — and inward of the mouth, at this end, is
-    inside the bore's own void, which the bore itself hollowed out. No
-    surface can bound the solid there, so the inward twin is not a
-    candidate for the end of anything. The outward one is where the
-    material can still be.
+    - A ball-nose bottom is the tangent member: sphere of the cutter's
+      radius ending a bore of the same radius, mouth on the sphere's own
+      EQUATOR, the two poles exactly one radius either side. Nearest is a
+      TIE, and round 6 let ``GeomAPI_IntCS``'s list order settle it — a Ø8
+      pocket 16 mm deep read 8 and THROUGH, and FLIPPED if the roots came
+      back the other way.
+    - An UNDERCUT seat is the general member, and it is the ordinary one:
+      a nose WIDER than the bore, a spherical seat, a lollipop cutter's
+      relief. The two poles are no longer equidistant, so round 7's
+      tangency band never fired, and nearest picked the pole ~2r up
+      INSIDE the bore's own void. A Ø8 seat undercut by five
+      ten-thousandths of a millimetre read 2.7995 against 10.8 — 74%
+      short — and reported a blind pocket as THROUGH (round 8, N4). Where
+      that phantom pole lands on the bore's far end the span collapses
+      and the hole is DROPPED outright (N3).
 
-    Round 6 required the tie to be EXACT — ``==`` on the two distances
-    as computed — reasoning that any looser test would re-break the cases
-    nearest exists for, since ``bore_through_torus_wall`` reads 24
-    instead of 16 the moment the far crossing of the torus is allowed to
-    win. The reasoning about the torus is right and the conclusion was
-    wrong, because a tangency does not SURVIVE being computed. The two
-    distances are equal in exact arithmetic and about a ULP apart in
-    doubles: on the committed fixture they happen to round to the same
-    double and the tie fires, and one bit of a different nose depth is
-    enough that it does not. Ø6 at z=13.2 in a 20 mm plate mined 3.8 and
-    THROUGH against a true 9.8 and BLIND — the whole of round 6's defect,
-    intact, on 74 of 240 randomly sized pockets, and PASSING on the other
-    166 only because the noise happened to fall the right way, which is
-    the same S3 flip wearing different clothes (round 7, blocker 1).
+    What separates the poles is not distance and not which SIDE of the
+    mouth they fall on — a concave cap's true root is genuinely inward,
+    and two attempts at a side rule broke a spherical dimple and a
+    conical boss respectively. It is whether the pole is on the part's
+    REAL BOUNDARY. The seat's true bottom is on the trimmed cap face; its
+    phantom is on the carrier under the disc the bore removed.
 
-    So the test is a BAND, and the band is the tangency condition itself
-    rather than a tolerance chosen to make the fixture pass — see
-    :func:`_tangency_band`, which derives it from the amount by which the
-    cap would have to fail to be tangent before OCCT called it a
-    different surface at all. It is four orders tighter than the closest
-    untied pair anywhere in the fixture set, so the torus and the dome
-    are as far outside it as they were outside equality.
+    So: prefer a root that lies on the trimmed face, and where none does
+    keep nearest. :func:`_root_is_on_the_face` is the test and
+    :func:`_cap_is_coaxial` is the gate that keeps it away from every
+    other shape — see both, and see
+    ``test_r4_an_on_face_trim_test_would_have_re_broken_the_domes``, which
+    is round 4's measurement of what an ungated one costs.
 
-    The tied roots must also STRADDLE the mouth — one outward of it, one
-    inward — which is not an extra safeguard but the same paragraph as
-    above said properly: what disqualifies the twin is lying inside the
-    bore's own void, and only a root on the INWARD side of the mouth
-    does. Roots that merely bunch on ONE side are a fitted surface
-    answering the same crossing several times, which is what
-    ``bore_through_nurbs_dome`` does, and there the nearest is still the
-    answer. Requiring the straddle is why every one of the 43 committed
-    fixtures stays bit-identical rather than 42 of them.
+    A PREFERENCE, never a requirement: a bore's axis usually leaves
+    through the very hole it cut, where the trimmed face is absent. A
+    dimple has neither pole on its face and is right to keep nearest; so
+    does a dome, and so does the torus wall.
     """
     on_face = [root for root in roots if root[2]]
     field = on_face or list(roots)

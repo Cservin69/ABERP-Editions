@@ -2755,118 +2755,6 @@ def test_r7_a_bare_nearest_pick_re_breaks_the_whole_sweep(monkeypatch):
         ) <= TOL, (radius, got)
 
 
-def test_r8_the_tangency_band_still_pads_the_outward_filter(monkeypatch):
-    """What the band is still for, now that it no longer breaks ties.
-
-    :func:`_root_for_end` admits a root that reaches BACK inside the mouth
-    by up to the band, because a cap sitting exactly ON the mouth — every
-    planar cap, and every tangency — computes its root and the mouth's own
-    reach by two different routes that agree analytically and to about a
-    ULP in doubles. Without the pad an exact cap can fall a bit inside its
-    own mouth and be refused.
-
-    The refusal is not itself an error, because the filter narrows and
-    never empties: refuse every root and the whole field comes back. So
-    this pins the property that matters — that the answers do not move
-    when the pad is taken away — rather than a breakage that does not
-    happen. It is the difference between a guard that is inert and one
-    that is not needed at ONE band value.
-    """
-    import aberp_cad_extract.holes as holes_mod
-
-    before = _ball_nose_verdicts(R7_BALL_NOSE_SIZES[:12])
-    monkeypatch.setattr(holes_mod, "_tangency_band", lambda radius: 0.0)
-    after = _ball_nose_verdicts(R7_BALL_NOSE_SIZES[:12])
-    assert before == after
-
-
-def test_r7_a_bit_exact_tie_still_passes_the_round6_fixture(
-    fixtures_dir: Path, monkeypatch
-):
-    """The other half of the same statement, on the committed part.
-
-    Round 6's fixture is exactly the pocket whose two root distances round
-    to the same double, so a bit-exact tie answers it correctly. Pinned so
-    that nobody reads the test above as "round 6 was wrong about the
-    tangency" — round 6 was right about the tangency and wrong about
-    floating point.
-    """
-    import aberp_cad_extract.holes as holes_mod
-
-    monkeypatch.setattr(holes_mod, "_tangency_band", lambda radius: 0.0)
-    holes = _mine(fixtures_dir / "ball_nose_blind_bore.step")
-    assert len(holes) == 1
-    _approx(holes[0].depth_mm, 16.0)
-    assert holes[0].end_condition is HoleEndCondition.BLIND
-
-
-def test_r7_the_tangency_band_is_not_a_tuned_epsilon():
-    """The band may be moved by decades without moving a single answer.
-
-    An epsilon tuned to make a fixture pass has an answer that changes
-    just outside it. This one does not: the noise it must swallow is
-    ~4e-15 mm and the nearest genuinely untied pair in the corpus is
-    15.5 mm away, so everything from 1e-12 to 1e-2 mm of surface
-    mismatch — twenty decades of the quantity the band is derived from —
-    gives the same numbers. :data:`SURFACE_CONFUSION_MM` sits in the
-    middle of that because it is the kernel's own figure, not because it
-    is where the fixtures pass.
-    """
-    import aberp_cad_extract.holes as holes_mod
-
-    baseline = None
-    for confusion in (1e-12, 1e-10, 1e-8, 1e-7, 1e-6, 1e-4, 1e-2):
-        band = 2.0 * math.sqrt(2.0 * 3.0 * confusion)
-        original = holes_mod._tangency_band
-        try:
-            holes_mod._tangency_band = lambda radius, _b=band: _b
-            verdicts = _ball_nose_verdicts(R7_BALL_NOSE_SIZES[:12])
-        finally:
-            holes_mod._tangency_band = original
-        signature = repr(sorted(verdicts.items()))
-        if baseline is None:
-            baseline = signature
-        assert signature == baseline, (
-            f"the answer moved when the surface-confusion figure was "
-            f"{confusion}; that would make the band a tuned epsilon"
-        )
-
-
-def test_r7_the_untied_caps_stay_far_outside_the_band(fixtures_dir: Path):
-    """The torus and the dome are not near-misses of the band.
-
-    Round 6 refused a tolerance because a loose one reads
-    ``bore_through_torus_wall`` as 24 instead of 16. The refusal was
-    sound and the margin is enormous: the closest that fixture's roots
-    come to being tied is four orders outside the band. Measured rather
-    than asserted, so the claim cannot rot.
-    """
-    import aberp_cad_extract.holes as holes_mod
-
-    seen = []
-    original = holes_mod._root_for_end
-
-    def spy(roots, t_edge, at_low, radius):
-        reaches = sorted(abs(root[0] - t_edge) for root in roots)
-        if len(reaches) > 1:
-            seen.append((reaches[1] - reaches[0], holes_mod._tangency_band(radius)))
-        return original(roots, t_edge, at_low, radius)
-
-    holes_mod._root_for_end = spy
-    try:
-        for name in ("bore_through_torus_wall", "bore_through_spherical_dome"):
-            assert len(_mine(fixtures_dir / f"{name}.step")) == 1
-    finally:
-        holes_mod._root_for_end = original
-
-    assert seen, "neither fixture presented a face with two roots"
-    untied = [(gap, band) for gap, band in seen if gap > band]
-    assert untied, "every pair read as tied; these fixtures test nothing"
-    assert min(gap / band for gap, band in untied) > 1e3, (
-        f"an untied pair came within 1000x of the band: {sorted(untied)[:3]}"
-    )
-
-
 def test_r7_the_ball_nose_sweep_does_not_depend_on_the_root_order(monkeypatch):
     """S3 over the tangency, across the family rather than one part.
 
@@ -4093,3 +3981,44 @@ def test_r8_the_root_order_does_not_reach_the_undercut_answer():
     assert before == after, {
         key: (before[key], after[key]) for key in before if before[key] != after[key]
     }
+
+
+def test_r8_the_coaxial_rule_has_no_epsilon_to_tune():
+    """What replaced the tangency band, stated as the property it has.
+
+    Round 7 recognised a ball-nose bottom by a tangency BAND — a tolerance
+    derived from the kernel's confusion, with its own not-a-tuned-epsilon
+    guard walking twenty decades. Round 8 removed the band along with the
+    tie it existed to recognise: an undercut seat is the same defect at a
+    scale no band reaches, and the rule that closes it asks a topological
+    question with no tolerance in it.
+
+    So the guard that walked decades of the band is replaced by the
+    stronger claim it was approximating — that there is nothing left to
+    walk. The undercut family's answers must be identical across six
+    decades of undercut INCLUDING exact zero, which is the tangency, and
+    the two ends of that range are the ball-nose and a seat half a
+    millimetre proud of its bore.
+
+    (A tolerance that is no longer consulted is worse than none: the tests
+    that pin it go on passing and read as coverage. `_tangency_band` is
+    deleted rather than left inert, and this is what stands in its place.)
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    assert not hasattr(holes_mod, "_tangency_band"), (
+        "the band is gone; if it came back it must come back with a caller"
+    )
+
+    verdicts = _seat_verdicts(R8_SEAT_RADII, R8_UNDERCUTS)
+    for (radius, undercut), got in verdicts.items():
+        assert got is not None, (radius, undercut)
+        assert abs(got[0] - (20.0 - 13.2 + radius + undercut)) <= TOL, (
+            radius, undercut, got
+        )
+        assert got[1] is HoleEndCondition.BLIND, (radius, undercut, got)
+
+    # ...and the exact tangency is not a special case of anything: it is
+    # the undercut = 0 member of the same family and answers the same way.
+    assert verdicts[(4.0, 0.0)][1] is HoleEndCondition.BLIND
+    assert verdicts[(4.0, 0.5)][1] is HoleEndCondition.BLIND
