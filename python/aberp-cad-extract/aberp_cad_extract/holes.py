@@ -1515,6 +1515,14 @@ def _same_carrier(face_a, face_b) -> bool:
     u0, u1, v0, v1 = BRepTools.UVBounds_s(face_a)
     if not all(math.isfinite(b) for b in (u0, u1, v0, v1)):
         return False
+    # A trimmed domain with no extent in one direction collapses the whole
+    # grid onto a curve — or onto a point — and a curve lies on any number
+    # of surfaces through it. That proves nothing, and the answer it would
+    # give is the DANGEROUS one: "same carrier" drops a barrier that may be
+    # doing real work. Unproven reads NOT the same, which leaves the edge a
+    # barrier exactly as it was before round 8.
+    if not (u1 - u0 > 0.0 and v1 - v0 > 0.0):
+        return False
     projector = GeomAPI_ProjectPointOnSurf()
     n = CARRIER_PROBE_GRID
     for i in range(n):
