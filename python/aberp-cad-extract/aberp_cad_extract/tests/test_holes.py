@@ -4030,3 +4030,66 @@ def test_r8_the_dome_pole_is_still_a_cap():
         assert len(holes) == 1, name
         _approx(holes[0].depth_mm, depth)
         assert holes[0].end_condition is HoleEndCondition.THROUGH, name
+
+
+@pytest.mark.parametrize("name", sorted(R8_FIXTURES))
+def test_r8_the_new_machinery_is_stable_under_a_reversed_walk(
+    fixtures_dir: Path, monkeypatch, name
+):
+    """S3 over round 8's three new predicates.
+
+    `_is_parametric_artifact` is asked of an edge from whichever of its
+    faces the walk reaches first, and `_same_carrier` probes THAT face's
+    trimmed domain — so if the two directions could disagree, the answer
+    would follow OCCT's explorer order. They cannot, because both faces
+    carry unbounded surfaces and a nine-point grid over a non-degenerate
+    patch of one lying on the other forces the carriers equal either way;
+    but "cannot" is an argument and this is the measurement.
+
+    `_root_is_on_the_face` and `_cap_is_coaxial` are per-root and
+    per-face and have no order to follow, and they are swept up here for
+    nothing.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    forward = _mine(fixtures_dir / name)
+    original = holes_mod._collect_faces
+    monkeypatch.setattr(
+        holes_mod, "_collect_faces", lambda shape: list(reversed(original(shape)))
+    )
+    backward = _mine(fixtures_dir / name)
+
+    assert len(forward) == 1 and len(backward) == 1
+    assert forward[0].depth_mm == backward[0].depth_mm
+    assert forward[0].entry_point_mm == backward[0].entry_point_mm
+    assert forward[0].axis_unit == backward[0].axis_unit
+    assert forward[0].end_condition is backward[0].end_condition
+    assert forward[0].flat_bottom == backward[0].flat_bottom
+    _approx(forward[0].depth_mm, R8_FIXTURES[name][1])
+
+
+def test_r8_the_root_order_does_not_reach_the_undercut_answer():
+    """S3 over the on-face preference itself.
+
+    ``GeomAPI_IntCS`` does not promise an order for its roots, and round 6
+    was bitten by exactly that on the tangency. Reverse them and the
+    undercut family must not move — which is the claim that the preference
+    is a property of the geometry rather than of the list.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    before = _seat_verdicts(R8_SEAT_RADII, R8_UNDERCUTS)
+    original = holes_mod._cap_axis_intersections
+    try:
+        holes_mod._cap_axis_intersections = (
+            lambda face, origin, direction: list(
+                reversed(original(face, origin, direction))
+            )
+        )
+        after = _seat_verdicts(R8_SEAT_RADII, R8_UNDERCUTS)
+    finally:
+        holes_mod._cap_axis_intersections = original
+
+    assert before == after, {
+        key: (before[key], after[key]) for key in before if before[key] != after[key]
+    }
