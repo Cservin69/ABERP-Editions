@@ -1,0 +1,84 @@
+# ABERP — Editions: scheduled supply-chain sweep.
+#
+# WHY THIS EXISTS, given ci.yml already runs cargo-deny.
+#
+# ci.yml's cargo-deny step runs on push/PR to main — i.e. only when someone
+# is landing. Advisories do not arrive on that schedule: RUSTSEC entries are
+# published against a Cargo.lock that has not changed, so a tree that was
+# green on Friday can be failing on Monday with no commit in between. With
+# only the on-land gate, that failure is discovered *inside a land* — the
+# required `defense · build + lint + test` check goes red on a PR that has
+# nothing to do with the advisory, and whoever is mid-land has to stop and
+# triage a supply-chain issue they did not cause.
+#
+# This workflow moves that discovery to a calendar morning. It is
+# deliberately **NOT** a required status check and gates nothing: it exists
+# so a new advisory surfaces as a failed scheduled run in the Actions tab
+# on Monday, not as a surprise mid-land on Thursday.
+#
+# It runs the SAME `cargo deny check` invocation as ci.yml, including the
+# four drift-proofing --deny lints. Keep the two in sync: if the ci.yml
+# step changes, change it here too, or this sweep starts reporting on a
+# weaker policy than the one that actually gates.
+#
+# Per ADR-0007 "Supply chain". cargo-audit was retired 2026-08-04 as
+# feature-blind; deny.toml is the single policy of record.
+
+name: supply-chain-schedule
+
+on:
+  schedule:
+    # 07:00 UTC every Monday. Weekly, not daily: advisories affecting a
+    # pinned Cargo.lock do not arrive fast enough to justify seven runs,
+    # and a weekly cadence keeps the signal worth reading. Cron is UTC —
+    # this is 08:00 or 09:00 Budapest depending on DST.
+    - cron: '0 7 * * 1'
+  # BREAK GLASS — run it right now, without waiting for Monday:
+  #
+  #   gh workflow run supply-chain-schedule.yml --ref main
+  #
+  # (then `gh run watch` to follow it, or read it in the Actions tab).
+  # Use after a Cargo.lock bump, or when RUSTSEC publishes something that
+  # sounds relevant and you want the answer before the next land.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-schedule
+  cancel-in-progress: false
+
+jobs:
+  cargo-deny:
+    name: cargo-deny sweep (main, non-gating)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v5
+        with:
+          # Pin to main explicitly. A scheduled run already defaults to the
+          # default branch, but naming it makes the intent legible and keeps
+          # a manual workflow_dispatch from a topic branch honest about what
+          # it swept.
+          ref: main
+
+      - name: Install Rust stable (matches rust-toolchain.toml channel pin)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # Identical to ci.yml's "cargo-deny check" step — see the long comment
+      # there for why each --deny lint is present and why a blanket
+      # `-D warnings` is deliberately NOT used.
+      - name: cargo-deny check (advisories, licenses, bans, sources)
+        run: |
+          cargo deny check \
+            --deny advisory-not-detected \
+            --deny license-not-encountered \
+            --deny license-exception-not-encountered \
+            --deny unmatched-skip
