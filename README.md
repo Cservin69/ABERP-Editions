@@ -29,7 +29,7 @@ hash-chained ledger you can inspect and verify.
 
 | | **Portable** | **Defense (HU production)** |
 |---|---|---|
-| Latest | `PROD_Portable_v0.1.2` (2026-06-16) | `PROD_Defense_v0.2.1` (2026-06-16) |
+| Latest | `PROD_Portable_v1.0.0` (2026-07-21) | `PROD_Defense_v0.6.4` (2026-08-30) |
 | For | Anyone, anywhere — evaluating, or running outside Hungary | Hungarian manufacturing shops with NAV obligations + defense / aerospace compliance needs |
 | Tax filing | **Off by default** — invoices stay local (LocalOnly) | Live NAV Online Számla 3.0 e-invoicing |
 | First boot | Demo company pre-seeded — data to explore immediately | Your own seller profile + real NAV credentials |
@@ -64,15 +64,15 @@ run for real money.
 On a Mac, from a terminal:
 
 ```bash
-git clone https://github.com/Cservin69/ABERP.git ABERP-Portable
+git clone https://github.com/Cservin69/ABERP-Editions.git ABERP-Portable
 cd ABERP-Portable
-git fetch origin --tags
-./run/upgrade_portable.sh PROD_Portable_v0.1.2
+git fetch origin
+./run/upgrade_portable.sh PROD_Portable_v1.0.0
 ```
 
 That last command does everything for you, in order:
 
-1. Confirms the `PROD_Portable_v0.1.2` release exists on GitHub.
+1. Confirms the `PROD_Portable_v1.0.0` release exists on GitHub.
 2. Snapshots any existing tenant data first (skipped on a fresh install —
    nothing to roll back to yet).
 3. Resets your checkout cleanly to the release.
@@ -118,10 +118,10 @@ to the real NAV Online Számla endpoint, and files invoices for real. Don't
 run it unless that's what you want — Portable above is the safe sandbox.
 
 ```bash
-git clone https://github.com/Cservin69/ABERP.git ABERP-Defense
+git clone https://github.com/Cservin69/ABERP-Editions.git ABERP-Defense
 cd ABERP-Defense
-git fetch origin --tags
-./run/upgrade_defense.sh PROD_Defense_v0.2.1
+git fetch origin
+./run/upgrade_defense.sh PROD_Defense_v0.6.4
 ```
 
 `upgrade_defense.sh` mirrors the Portable upgrade — confirm the release,
@@ -244,11 +244,22 @@ example.
 ### The event surface
 
 Every audited action becomes one entry with a typed JSON payload and a
-namespaced `domain.event_name` kind. **187 kinds are defined**: **170 are
-Live**, **17 are Designed** — defined, documented, round-trip validated,
-and handled by the classifier and the verifier, but with no firing site
-yet. Kind strings are stable identifiers — the audit screen, the export
-bundle, and `aberp-verify` all key off them.
+namespaced `domain.event_name` kind. **197 kinds are defined.** That
+number is not prose — it is pinned by `all_kinds_count_is_pinned` in
+`crates/audit-ledger/src/entry/event_kind.rs`, so a new variant that
+forgets to update it fails the build. Kind strings are stable identifiers
+— the audit screen, the export bundle, and `aberp-verify` all key off them.
+
+> **⚠ The Live / Designed split below is STALE and UNAUDITED.** It reads
+> "170 Live, 17 Designed", which summed to the **187** kinds that existed
+> when it was written. The tree now defines **197**. Nobody has re-derived
+> which of the 197 actually have a firing site, so the per-domain `Live`
+> column and the "17 Designed" table below are carried forward *unchanged*
+> and describe the 187-kind tree, not this one. Re-deriving the split means
+> auditing firing sites across all 197 kinds — a real piece of work, not a
+> count fix, and deliberately **not** done in this pass rather than
+> guessed at. **Do not quote the Live/Designed numbers to a customer until
+> that audit exists.** The 197 total is safe to quote.
 
 | Domain | What it records | Live |
 |---|---|---|
@@ -276,9 +287,13 @@ bundle, and `aberp-verify` all key off them.
 | `cui.*`, `personnel.*`, `incident.*` | — | 0 / 7 |
 
 The table accounts for 186 kinds; the 187th is `test`, written only by the
-chain-conformance suite.
+chain-conformance suite. **It has not been extended to the 10 kinds added
+since** (the ADR-0199 `qcr.*` family and the ADR-0116 `snapshot.*` family
+are among them) — see the warning above.
 
 ### Designed — the 17 kinds awaiting a firing site
+
+*As of the 187-kind tree. Unaudited since — see the warning above.*
 
 Each of these parses, round-trips through storage form, carries a
 documented payload schema, and is handled exhaustively by the bundle
@@ -547,17 +562,25 @@ A few things under the hood that engineers tend to enjoy:
 
 ## Status
 
-- **Current Portable stable: `PROD_Portable_v0.1.2`** (cut 2026-06-16) —
-  the edition the Quick Start above installs. Dev-profile build, NAV off,
-  demo tenant seeded. `./run/upgrade_portable.sh PROD_Portable_v0.1.2`.
-- **Current Defense stable: `PROD_Defense_v0.2.1`** (cut 2026-06-16) — the
-  HU-production build with live NAV plus the defense/aerospace compliance
-  stack (AVL, purchasing, heat/lot, part UID, NCR/CAPA, QC inspection).
-  `./run/upgrade_defense.sh PROD_Defense_v0.2.1`.
+- **Current Portable stable: `PROD_Portable_v1.0.0`** (branch head dated
+  2026-07-21) — the edition the Quick Start above installs. Dev-profile
+  build, NAV off, demo tenant seeded.
+  `./run/upgrade_portable.sh PROD_Portable_v1.0.0`.
+- **Latest Defense cut: `PROD_Defense_v0.6.4`** (branch head dated
+  2026-08-30) — the HU-production build with live NAV plus the
+  defense/aerospace compliance stack (AVL, purchasing, heat/lot, part UID,
+  NCR/CAPA, QC inspection). `./run/upgrade_defense.sh PROD_Defense_v0.6.4`.
+  **"Latest cut" is not "what is running."** This repository cannot observe
+  the pilot machine; the full cut history and how to ask a box what it is
+  actually on are in
+  [`docs/DEPLOY-STATUS.md`](docs/DEPLOY-STATUS.md).
 - **Legacy unified `PROD_v2.27.76` — frozen.** The last release before the
-  Portable / Defense split. Still installable via
-  `./run/upgrade_prod.sh PROD_v2.27.76` for existing operators (see the
-  [runbook](docs/CUTOVER_RUNBOOK.md)), but no longer the path forward — new
+  Portable / Defense split. It lives in the **separate**
+  `Cservin69/ABERP` repository (as both a branch and a tag) together with
+  the `run_prod.sh` / `upgrade_prod.sh` launchers — **neither script exists
+  in this repository**, so the legacy commands in the cookbook below only
+  run inside an old `ABERP` checkout. See the
+  [runbook](docs/CUTOVER_RUNBOOK.md). No longer the path forward — new
   releases ship on the two lines above.
 
 The test NAV path is the default for any build that does not pass
@@ -578,7 +601,7 @@ update workflow — lives in:
 Short version, on the prod machine:
 
 ```bash
-git clone --branch PROD_Defense_v0.2.1 https://github.com/Cservin69/ABERP.git ABERP-Defense
+git clone --branch PROD_Defense_v0.6.4 https://github.com/Cservin69/ABERP-Editions.git ABERP-Defense
 cd ABERP-Defense
 ./run/run_defense.sh   # builds with --features production, launches the shell
 ```
@@ -587,8 +610,8 @@ To upgrade an existing Defense install, snapshot first (DuckDB storage
 upgrades are one-way), then:
 
 ```bash
-git fetch origin && git reset --hard origin/PROD_Defense_v0.2.1 && \
-  ./run/upgrade_defense.sh PROD_Defense_v0.2.1
+git fetch origin && git reset --hard origin/PROD_Defense_v0.6.4 && \
+  ./run/upgrade_defense.sh PROD_Defense_v0.6.4
 ```
 
 The versioning rules (when to bump patch vs minor vs major) are pinned in
@@ -624,9 +647,14 @@ wider view, including work with no code surface yet.
 
 ## Contributing
 
-The repo lives at **<https://github.com/Cservin69/ABERP>**. Bug reports and
-PRs are welcome — open an issue with a minimal repro. This is a
-single-maintainer project, so there is no SLA, and unsolicited large
+The repo lives at **<https://github.com/Cservin69/ABERP-Editions>** — this
+is the Editions tree, and it is where both the Portable and the Defense
+release branches are cut. (`Cservin69/ABERP` is the separate, frozen
+pre-split repository; it holds no `PROD_Defense_*` or `PROD_Portable_*`
+ref.)
+
+Bug reports and PRs are welcome — open an issue with a minimal repro. This
+is a single-maintainer project, so there is no SLA, and unsolicited large
 rewrites are unlikely to land.
 
 Be aware the bar for a green build is high — every change runs through:
@@ -685,7 +713,7 @@ terms are at <https://polyformproject.org/licenses/noncommercial/1.0.0>.
 ## Credits & contact
 
 Built in Hungary by Ervin Aben. Issues and pull requests:
-**<https://github.com/Cservin69/ABERP>**.
+**<https://github.com/Cservin69/ABERP-Editions>**.
 
 > **Hungarian invoicing law is the operator's responsibility.** When NAV
 > submission is on, ABERP files per the v3.0 spec — but the operator is the
@@ -700,10 +728,16 @@ Field-tested commands, written against the legacy `run_prod.sh` /
 `upgrade_prod.sh` launcher names with a `<VERSION>` placeholder. Swap for
 your edition:
 
-- **Portable** — `*_portable.sh` and a `PROD_Portable_v*` tag
-  (`PROD_Portable_v0.1.2` is current).
-- **Defense** — `*_defense.sh` and a `PROD_Defense_v*` tag
-  (`PROD_Defense_v0.2.1` is current).
+- **Portable** — `*_portable.sh` and a `PROD_Portable_v*` **branch**
+  (`PROD_Portable_v1.0.0` is the latest cut).
+- **Defense** — `*_defense.sh` and a `PROD_Defense_v*` **branch**
+  (`PROD_Defense_v0.6.4` is the latest cut).
+
+Release refs in this repository are **branches, not tags** — `git tag -l`
+lists no `PROD_Defense_*` or `PROD_Portable_*` at all. That is why every
+command below resets to `origin/<VERSION>` and why `upgrade_defense.sh`
+resolves `origin/${version}` as a branch. Reaching for `refs/tags/...`
+will find nothing.
 
 ### 1. Upgrade to a new release (Frissítés új verzióra)
 
@@ -752,9 +786,8 @@ cd ~/ABERP && ABERP_SKIP_GIT_CHECK=1 ./run/run_prod.sh
 Sanity-check before any `git reset --hard origin/<VERSION>`.
 
 ```bash
-git ls-remote https://github.com/Cservin69/ABERP.git \
-  refs/heads/main refs/heads/PROD_Defense_v0.2.1 \
-  refs/tags/PROD_Defense_v0.2.1
+git ls-remote https://github.com/Cservin69/ABERP-Editions.git \
+  refs/heads/main refs/heads/PROD_Defense_v0.6.4
 ```
 
 ### 6. DuckDB snapshot / restore — the panic button (DuckDB pillanatkép)
