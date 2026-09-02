@@ -205,17 +205,50 @@ jobs:
           cache: 'pip'
           cache-dependency-path: python/aberp-cad-extract/pyproject.toml
 
-      - name: Install aberp-cad-extract Python package (with [step] extra)
+      - name: Install aberp-cad-extract Python package (with [step,dev] extras)
         # The [step] extra pulls cadquery-ocp (+ proxy) + vtk. Since ADR-0112
         # Part A made the pipeline STEP-only it is required by EVERY
         # end-to-end extractor test, not just step_extract_smoke.rs — there
         # is no OCCT-free lane left. ABERP_TEST_PYTHON
         # must be ABSOLUTE (pwd-drift in the test harness kills error-path
         # tests); sys.executable is always absolute.
+        #
+        # [dev] was ADDED 2026-09-02 and is what carries `pytest` (pyproject
+        # `[project.optional-dependencies].dev`). Without it the Python suite
+        # step below cannot run at all — `[step]` alone installs the OCCT
+        # runtime, never a test runner.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e 'python/aberp-cad-extract[step]'
+          python -m pip install -e 'python/aberp-cad-extract[step,dev]'
           echo "ABERP_TEST_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+
+      # ── The Python extractor suite — previously run by NOTHING ───────────
+      # Until 2026-09-02 no workflow in this repo executed the Python tests.
+      # CI installed the package (step above) purely so the Rust wrapper
+      # tests could shell out to the CLI, and then never ran the suite that
+      # covers the extractor itself. That made the coverage story dishonest:
+      #
+      #   • aberp_cad_extract/tests/test_holes.py is 121 of the 167 collected
+      #     tests and is the ONLY real coverage of the ADR-0112 Part B
+      #     located-hole geometry (diameter, axis, depth, end condition,
+      #     through-vs-blind). The Rust-side step_extract_smoke.rs runs a
+      #     FLAT PLATE fixture, which mines zero holes — it exercises none
+      #     of that geometry and cannot substitute for this.
+      #   • The remaining 46 cover the CLI surface, the FeatureGraph schema
+      #     (incl. SCHEMA_VERSION drift), and the heuristics.
+      #
+      # Runs AFTER the install step (needs the [step] OCCT runtime — the
+      # hole tests `pytest.importorskip("OCP")` and would silently SKIP,
+      # not fail, without it) and BEFORE the Rust build, so a broken
+      # extractor is reported in ~30 s rather than after the ~20-min
+      # toolchain tail. Measured 167 passed in 31 s.
+      #
+      # `working-directory` matters: pyproject's [tool.pytest.ini_options]
+      # testpaths is the RELATIVE "aberp_cad_extract/tests", so pytest only
+      # discovers the suite when invoked from the package root.
+      - name: Python extractor test suite (pytest)
+        working-directory: python/aberp-cad-extract
+        run: python -m pytest
 
       - name: Cargo cache (per edition arm)
         uses: Swatinem/rust-cache@v2
