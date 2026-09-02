@@ -287,9 +287,10 @@ forgets to update it fails the build. Kind strings are stable identifiers
 | `cui.*`, `personnel.*`, `incident.*` | — | 0 / 7 |
 
 The table accounts for 186 kinds; the 187th is `test`, written only by the
-chain-conformance suite. **It has not been extended to the 10 kinds added
-since** (the ADR-0199 `qcr.*` family and the ADR-0116 `snapshot.*` family
-are among them) — see the warning above.
+chain-conformance suite. That was the whole tree at the time; it is not the
+whole tree now. **The table has not been re-derived for the current 197**
+— the ADR-0199 `qcr.*` family, for one, has no row here at all. Read the
+domain rows as a snapshot of the 187-kind tree, and see the warning above.
 
 ### Designed — the 17 kinds awaiting a firing site
 
