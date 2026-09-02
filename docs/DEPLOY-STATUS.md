@@ -37,27 +37,30 @@ name IS the deployed version.** The script uses this exact form itself and
 documents why: `git branch --show-current` is the only spelling that
 returns the unprefixed branch name if a same-named tag ever exists.
 
-Fuller version, if you want the SHA and whether it is even up:
+Fuller version, if you want the SHA and whether it is even up. Each field
+is labelled, because the interesting answers are the *empty* ones and
+unlabelled blank output is impossible to read:
 
 ```bash
-git -C ~/ABERP-Defense branch --show-current; \
-git -C ~/ABERP-Defense rev-parse --short HEAD; \
-git -C ~/ABERP-Defense status --porcelain | head; \
-pgrep -fl "$HOME/ABERP-Defense/target/release/aberp"
+D=~/ABERP-Defense
+echo "version: $(git -C $D branch --show-current)"
+echo "sha:     $(git -C $D rev-parse --short HEAD)"
+echo "dirty:   $(git -C $D status --porcelain | wc -l | tr -d ' ') file(s)"
+echo "running: $(pgrep -fl "$D/target/release/aberp" | wc -l | tr -d ' ') process(es)"
 ```
 
 Reading it:
 
-- **line 1** — the deployed version (e.g. `PROD_Defense_v0.6.2`). Empty
-  output means a detached HEAD: the box is not on a release branch at all,
-  and line 2's SHA is the only identity it has.
-- **line 2** — the SHA. Cross-check it against the table in §2. A SHA that
-  appears in no row means the box is on something that was never cut.
-- **line 3** — any output here means a **dirty tree**: the running code is
-  not the cut code, and the version name on line 1 is no longer a truthful
-  description of what is deployed.
-- **line 4** — the running binaries. No output means the app is down (or
-  was launched from a different checkout).
+- **`version:`** — the deployed version (e.g. `PROD_Defense_v0.6.2`).
+  **Empty means detached HEAD**: the box is not on a release branch at
+  all, and `sha:` is the only identity it has.
+- **`sha:`** — cross-check against the table in §2. A SHA appearing in no
+  row means the box is on something that was never cut.
+- **`dirty:`** — anything other than `0 file(s)` means the running code is
+  not the cut code, and the version name above has stopped being a
+  truthful description of what is deployed.
+- **`running:`** — `0 process(es)` means the app is down, or was launched
+  from a different checkout.
 
 Substitute the real checkout path if it is not `~/ABERP-Defense` — the
 README's clone step names that directory, but an older box may use `~/ABERP`.

@@ -248,7 +248,17 @@ jobs:
       # discovers the suite when invoked from the package root.
       - name: Python extractor test suite (pytest)
         working-directory: python/aberp-cad-extract
-        run: python -m pytest
+        # The `import OCP` line is a GUARD, not a smoke test, and it is the
+        # reason this step is trustworthy. test_holes.py opens with
+        # `pytest.importorskip("OCP")`, so if the [step] extra ever fails to
+        # deliver a working OCCT runtime, 121 of the 167 tests SKIP and
+        # pytest still exits 0 — a green step covering nothing. Asserting the
+        # import first converts that silent hole into a loud failure.
+        # (run/provision_pipeline_venv.sh verifies the same import for the
+        # same reason.)
+        run: |
+          python -c "import OCP"
+          python -m pytest
 
       - name: Cargo cache (per edition arm)
         uses: Swatinem/rust-cache@v2
