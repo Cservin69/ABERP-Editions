@@ -1612,6 +1612,111 @@ pub async fn list_qc_inspections(
     forward_get(&state, &path, true).await
 }
 
+// ── ADR-0199 — QC/AS9102 FAIR + Certificate-of-Conformance reports ──────
+//
+// The 7 report routes are Defense-only (registered behind
+// `qc_reporting_allowed()`); on a Portable build they are absent → the
+// forward returns a 404 the SPA renders as "unavailable in this edition".
+// The report LIFECYCLE is draft → issue (freezes the bytes + pins a
+// SHA-256) → optionally void/supersede (a voided report no longer renders).
+// Disposition is computed server-side, never sent from the UI.
+
+/// ADR-0199 — `GET /api/qc-reports?wo_id=<id>` — reports drafted against a
+/// work order, newest first. `wo_id` is required by the route.
+#[tauri::command]
+pub async fn list_qc_reports(state: State<'_, AppState>, wo_id: String) -> Result<Value, String> {
+    let path = format!("/api/qc-reports?wo_id={}", urlencode(wo_id.trim()));
+    forward_get(&state, &path, true).await
+}
+
+/// ADR-0199 — `POST /api/qc-reports` — draft a report against a work order.
+/// Body `{ wo_id, report_kind?, template?, notes? }`. NOTE the wire/storage
+/// asymmetry: to draft a Certificate of Conformance the body carries
+/// `report_kind: "coc"` (the storage token), while the report reads back with
+/// `report_kind: "certificate_of_conformance"` (the serde form). The SPA
+/// composer owns that mapping. Returns `ReportWithLines` (201).
+#[tauri::command]
+pub async fn draft_qc_report(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/qc-reports", body).await
+}
+
+/// ADR-0199 — `GET /api/qc-reports/:id` — one report plus its frozen lines
+/// (`ReportWithLines`).
+#[tauri::command]
+pub async fn get_qc_report(state: State<'_, AppState>, qcr_id: String) -> Result<Value, String> {
+    forward_get(&state, &format!("/api/qc-reports/{qcr_id}"), true).await
+}
+
+/// ADR-0199 — `POST /api/qc-reports/:id/issue` — freeze + pin the SHA-256.
+/// No body; only a drafted report can be issued (else 400). Returns the
+/// now-issued `ReportWithLines`.
+#[tauri::command]
+pub async fn issue_qc_report(state: State<'_, AppState>, qcr_id: String) -> Result<Value, String> {
+    forward_post(
+        &state,
+        &format!("/api/qc-reports/{qcr_id}/issue"),
+        Value::Object(Default::default()),
+    )
+    .await
+}
+
+/// ADR-0199 — `POST /api/qc-reports/:id/void` — void or supersede a report.
+/// Body `{ reason, superseded_by_qcr_id? }`; `reason` is required. Presence of
+/// `superseded_by_qcr_id` makes the state `superseded` rather than `voided`.
+#[tauri::command]
+pub async fn void_qc_report(
+    state: State<'_, AppState>,
+    qcr_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, &format!("/api/qc-reports/{qcr_id}/void"), body).await
+}
+
+/// ADR-0199 — `GET /api/dispatches/:id/qc-reports` — reports bound to a
+/// dispatch, in box order. (Binding happens at ship time, so this only
+/// populates for shipped dispatches.)
+#[tauri::command]
+pub async fn list_dispatch_qc_reports(
+    state: State<'_, AppState>,
+    dsp_id: String,
+) -> Result<Value, String> {
+    forward_get(
+        &state,
+        &format!("/api/dispatches/{dsp_id}/qc-reports"),
+        true,
+    )
+    .await
+}
+
+/// ADR-0199 — `POST /api/partners/:id/qc-report-template` — set (or clear,
+/// with `template: null`) a partner's report-template override. POST-only;
+/// there is no read route (the current value is not surfaced back).
+#[tauri::command]
+pub async fn set_partner_qc_report_template(
+    state: State<'_, AppState>,
+    partner_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(
+        &state,
+        &format!("/api/partners/{partner_id}/qc-report-template"),
+        body,
+    )
+    .await
+}
+
+/// ADR-0199 — `GET /api/qc-reports/:id/pdf` — render the report on demand.
+/// Binary (`application/pdf`), so it rides `forward_get_bytes`; the SPA
+/// re-wraps the `Vec<u8>` in a Blob for the browser download (same posture as
+/// `download_invoice_pdf`). A voided/superseded report → 409 (no document).
+#[tauri::command]
+pub async fn download_qc_report_pdf(
+    state: State<'_, AppState>,
+    qcr_id: String,
+) -> Result<Vec<u8>, String> {
+    forward_get_bytes(&state, &format!("/api/qc-reports/{qcr_id}/pdf")).await
+}
+
 /// S443 — `GET /api/qc-stale-calibration` (dashboard stale-probe feed).
 #[tauri::command]
 pub async fn qc_stale_calibration(state: State<'_, AppState>) -> Result<Value, String> {

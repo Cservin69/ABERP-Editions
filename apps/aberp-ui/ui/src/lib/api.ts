@@ -5832,6 +5832,209 @@ export async function listQcInspections(params?: {
   });
 }
 
+// ── ADR-0199 — QC/AS9102 FAIR + Certificate-of-Conformance reports ──────
+//
+// A report is a FROZEN snapshot: draft → issue (freezes the bytes + pins a
+// SHA-256) → optionally void/supersede. `disposition` is computed
+// server-side, never sent. Only four fields change after issuance
+// (rendered_sha256, dsp_id, state, superseded_by_qcr_id); the rest are the
+// draft-time snapshot. Routes are Defense-only — on Portable the invoke
+// rejects (edition without the report layer).
+
+/** Report kind as it reads back on `QcReport.report_kind` (serde form). */
+export type QcReportKind =
+  | "dimensional_inspection"
+  | "certificate_of_conformance"
+  | "as9102_fair";
+/** Storage token used to DRAFT a kind. Identical to the wire form EXCEPT a
+ * Certificate of Conformance is drafted as `"coc"` but reads back as
+ * `"certificate_of_conformance"`. Keep the two apart — see
+ * `lib/qc-reports.ts` for the mapping. */
+export type QcReportKindInput = "dimensional_inspection" | "coc" | "as9102_fair";
+export type QcReportTemplate = "aben_standard" | "as9102_rev_c" | "coc_only";
+export type QcReportState = "drafted" | "issued" | "superseded" | "voided";
+/** Computed by the backend. `accept` / `accept_with_ncr` permit shipment;
+ * `reject` / `incomplete` block it. */
+export type QcDisposition = "accept" | "accept_with_ncr" | "reject" | "incomplete";
+/** AS9102 characteristic accountability. A required characteristic with no
+ * measurement is a `not_measured` row and forces `incomplete`. */
+export type QcAccountability = "measured" | "not_measured" | "not_applicable";
+export type QcCharacteristicDesignator =
+  | "key"
+  | "critical"
+  | "major"
+  | "minor"
+  | "none";
+export type QcCharacteristicType =
+  | "dimensional"
+  | "material"
+  | "process"
+  | "note"
+  | "functional";
+export type QcInspectionMethod =
+  | "on_machine_probe"
+  | "cmm"
+  | "gauge"
+  | "visual"
+  | "cert_review";
+
+/** One QC report header. Mirrors the Rust `aberp_qa::qc::QcReport` serialize
+ * shape (no struct rename → snake_case field names verbatim). Everything
+ * except `rendered_sha256` / `dsp_id` / `state` / `superseded_by_qcr_id` is
+ * frozen at draft time. */
+export interface QcReport {
+  qcr_id: string;
+  /** Allocated at issue (monotonic per year); blank/empty until issued. */
+  report_number: string;
+  report_kind: QcReportKind;
+  template: QcReportTemplate;
+  state: QcReportState;
+  wo_id: string;
+  product_id: string;
+  /** Bound only at ship time; null for a drafted/issued-but-unshipped report. */
+  dsp_id: string | null;
+  partner_id: string;
+  source_quote_id: string | null;
+  drawing_number: string | null;
+  drawing_rev: string | null;
+  customer_name: string | null;
+  customer_address_line: string | null;
+  customer_purchase_order: string | null;
+  qty_reported: number;
+  serial_range: string | null;
+  heat_lot_reference: string | null;
+  mill_cert_id: string | null;
+  machine_id: string | null;
+  program_id: string | null;
+  disposition: QcDisposition;
+  characteristics_required: number;
+  characteristics_measured: number;
+  characteristics_passed: number;
+  characteristics_failed: number;
+  characteristics_unaccounted: number;
+  /** SHA-256 (lowercase hex) of the issued bytes; null until issued. */
+  rendered_sha256: string | null;
+  renderer_version: string | null;
+  issued_at_utc: string | null;
+  issued_by: string | null;
+  superseded_by_qcr_id: string | null;
+  created_at: string;
+  created_by: string;
+  notes: string | null;
+}
+
+/** One frozen report line (a characteristic on a unit). Mirrors
+ * `aberp_qa::qc::QcReportLine`. */
+export interface QcReportLine {
+  qcrl_id: string;
+  qcr_id: string;
+  line_no: number;
+  part_serial: string | null;
+  part_uid: string | null;
+  characteristic_number: string | null;
+  characteristic_name: string;
+  characteristic_designator: QcCharacteristicDesignator | null;
+  characteristic_type: QcCharacteristicType;
+  inspection_method: QcInspectionMethod | null;
+  sheet_zone: string | null;
+  nominal_value: number | null;
+  upper_tol: number | null;
+  lower_tol: number | null;
+  units: string | null;
+  actual_value: number | null;
+  deviation: number | null;
+  verdict: Verdict | null;
+  accountability: QcAccountability;
+  qci_id: string | null;
+  measured_at_utc: string | null;
+  measured_by: string | null;
+  probe_serial: string | null;
+  created_at: string;
+  required: boolean;
+}
+
+/** A report plus its frozen lines (`GET`/`POST`/`issue` payload). */
+export interface ReportWithLines {
+  report: QcReport;
+  lines: QcReportLine[];
+}
+
+/** Body for `draftQcReport`. `report_kind` uses the INPUT token set (CoC =
+ * `"coc"`). Absent `report_kind` → dimensional inspection; absent `template`
+ * → the partner's default. */
+export interface DraftQcReportBody {
+  wo_id: string;
+  report_kind?: QcReportKindInput;
+  template?: QcReportTemplate;
+  notes?: string;
+}
+
+/** Body for `voidQcReport`. `reason` is required; a `superseded_by_qcr_id`
+ * marks the report `superseded` rather than `voided`. */
+export interface VoidQcReportBody {
+  reason: string;
+  superseded_by_qcr_id?: string | null;
+}
+
+/** ADR-0199 — `GET /api/qc-reports?wo_id=` (reports for a work order). */
+export async function listQcReports(
+  woId: string,
+): Promise<{ reports: QcReport[] }> {
+  return invoke<{ reports: QcReport[] }>("list_qc_reports", { woId });
+}
+
+/** ADR-0199 — `POST /api/qc-reports` (draft against a work order). */
+export async function draftQcReport(
+  body: DraftQcReportBody,
+): Promise<ReportWithLines> {
+  return invoke<ReportWithLines>("draft_qc_report", { body });
+}
+
+/** ADR-0199 — `GET /api/qc-reports/:id`. */
+export async function getQcReport(qcrId: string): Promise<ReportWithLines> {
+  return invoke<ReportWithLines>("get_qc_report", { qcrId });
+}
+
+/** ADR-0199 — `POST /api/qc-reports/:id/issue` (freeze + pin the SHA). */
+export async function issueQcReport(qcrId: string): Promise<ReportWithLines> {
+  return invoke<ReportWithLines>("issue_qc_report", { qcrId });
+}
+
+/** ADR-0199 — `POST /api/qc-reports/:id/void`. */
+export async function voidQcReport(
+  qcrId: string,
+  body: VoidQcReportBody,
+): Promise<{ ok: true }> {
+  return invoke<{ ok: true }>("void_qc_report", { qcrId, body });
+}
+
+/** ADR-0199 — `GET /api/dispatches/:id/qc-reports` (bound at ship time). */
+export async function listDispatchQcReports(
+  dspId: string,
+): Promise<{ reports: QcReport[] }> {
+  return invoke<{ reports: QcReport[] }>("list_dispatch_qc_reports", { dspId });
+}
+
+/** ADR-0199 — `POST /api/partners/:id/qc-report-template` (set/clear the
+ * per-partner override; `template: null` clears it). */
+export async function setPartnerQcReportTemplate(
+  partnerId: string,
+  template: QcReportTemplate | null,
+): Promise<{ ok: true; template: QcReportTemplate | null }> {
+  return invoke<{ ok: true; template: QcReportTemplate | null }>(
+    "set_partner_qc_report_template",
+    { partnerId, body: { template } },
+  );
+}
+
+/** ADR-0199 — `GET /api/qc-reports/:id/pdf`. Returns a `Blob`
+ * (`application/pdf`); a voided/superseded report rejects (409 → no
+ * document). Same posture as `downloadInvoicePdf`. */
+export async function downloadQcReportPdf(qcrId: string): Promise<Blob> {
+  const bytes = await invoke<number[]>("download_qc_report_pdf", { qcrId });
+  return new Blob([new Uint8Array(bytes)], { type: "application/pdf" });
+}
+
 /** S443 — `GET /api/qc-inspections/stale-calibration` (probes whose
  * last calibration is past the per-tenant window). */
 export async function qcStaleCalibration(): Promise<{ stale: QcInspection[] }> {

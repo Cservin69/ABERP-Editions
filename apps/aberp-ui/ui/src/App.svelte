@@ -83,6 +83,7 @@
   import ProductsList from "./routes/ProductsList.svelte";
   import MachinesList from "./routes/MachinesList.svelte";
   import InspectionPlansList from "./routes/InspectionPlansList.svelte";
+  import QcReportsList from "./routes/QcReportsList.svelte";
   import MarginProfilesList from "./routes/MarginProfilesList.svelte";
   import AvlVendorsList from "./routes/AvlVendorsList.svelte";
   // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Work Orders v1.
@@ -848,6 +849,8 @@
           <MaterialTraceability />
         {:else if route === "quality-ncrs"}
           <Quality />
+        {:else if route === "qc-reports"}
+          <QcReportsList />
         {:else if route === "purchase-orders"}
           <Purchasing />
         {:else if route === "invoices-new"}

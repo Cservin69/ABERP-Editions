@@ -251,7 +251,11 @@ export const MODULES: ErpModule[] = [
     label_hu: "Minőség",
     label_en: "Quality",
     glyph: "✅",
-    routes: [{ id: "quality-ncrs", label: "NCR-ek / NCRs" }],
+    routes: [
+      { id: "quality-ncrs", label: "NCR-ek / NCRs" },
+      // ADR-0199 — AS9102 FAIR + Certificate-of-Conformance reports.
+      { id: "qc-reports", label: "QC-jelentések / QC reports" },
+    ],
   },
   // S440 (ADR-0068) — procurement: purchase orders. Operational area, after
   // Quality. AVL-gated create + receiving (auto-NCR on failed inspection).

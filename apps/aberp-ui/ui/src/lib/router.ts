@@ -94,6 +94,9 @@ export type AppRoute =
   // S439 — defense quality management. Operational area; NCR list with
   // in-page detail (transitions, linked CAPAs) + create + state transitions.
   | "quality-ncrs"
+  // ADR-0199 — QC/AS9102 FAIR + Certificate-of-Conformance reports
+  // (Operational area, Defense-only). Master-detail over deliveries.
+  | "qc-reports"
   // S440 — procurement. Operational area; PO list + create (AVL-gated) +
   // in-page detail + receiving (auto-NCR on failed inspection).
   | "purchase-orders"
@@ -199,6 +202,8 @@ export function parseRoute(hash: string): AppRoute {
       return "material-traceability";
     case "quality-ncrs":
       return "quality-ncrs";
+    case "qc-reports":
+      return "qc-reports";
     case "purchase-orders":
       return "purchase-orders";
     case "tenants":

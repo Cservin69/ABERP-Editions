@@ -220,6 +220,7 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   "material-traceability": "operational",
   // S439 — defense quality management (NCR + CAPA), operational area.
   "quality-ncrs": "operational",
+  "qc-reports": "operational",
   // S440 — procurement / purchase orders, operational area.
   "purchase-orders": "operational",
   // S433 — multi-tenant admin (maintenance area, under Settings).
