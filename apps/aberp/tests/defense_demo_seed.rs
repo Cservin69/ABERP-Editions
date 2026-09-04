@@ -237,7 +237,20 @@ fn the_narrative_joins_end_to_end() {
 #[test]
 fn the_gates_have_something_to_refuse() {
     let (fx, _) = seed_fixture();
-    let conn = fx.db.read().expect("read");
+    // Read through a FRESH tenant Handle, exactly as the running app does:
+    // `aberp demo-seed` and `serve` are separate processes, so the gate reads
+    // happen on serve's boot-time Handle, opened AFTER every seed row is
+    // committed to the file. The seed writes several tables (purchase orders,
+    // NCRs, material movements) through residual `Connection::open` openers,
+    // and a DuckDB connection opened BEFORE those writes — like the one
+    // `seed_fixture` held while seeding — is a separate instance that never
+    // sees them (aberp_db's read() is a try_clone of that persistent instance,
+    // not a re-open). Reusing the seeding-time Handle here would test an
+    // instance no real caller ever reads through. A fresh Handle sees the full
+    // committed state, which is what serve's ship-gate resolves against.
+    let read_handle = aberp::serve::open_tenant_handle(&fx.db_path, fx.tenant.clone())
+        .expect("fresh boot-time tenant handle");
+    let conn = read_handle.read().expect("read");
 
     // 1 — a SUSPENDED vendor on the AVL, so an operator can try to raise a PO
     //     against it live and watch `create_po` refuse.

@@ -261,6 +261,14 @@ pub struct PurchaseOrder {
     pub approved_by_operator: Option<String>,
     pub approved_at_utc: Option<String>,
     pub created_at_utc: String,
+    /// In-process convenience: the lines persisted by [`create_po`], returned
+    /// so a same-process caller need not re-open the DB to recover the
+    /// server-generated `pol_id`s. `#[serde(skip)]` keeps the HTTP/wire shape
+    /// byte-identical (this is never serialised, and header-only reads such as
+    /// [`list_pos`] / [`reread_po`] leave it empty). It is populated ONLY on
+    /// the `create_po` return path; every other constructor defaults it empty.
+    #[serde(skip, default)]
+    pub lines: Vec<PoLine>,
 }
 
 /// One purchase-order line.
@@ -329,6 +337,9 @@ fn row_to_po(r: &duckdb::Row) -> duckdb::Result<PurchaseOrder> {
         approved_by_operator: r.get::<_, Option<String>>(14)?,
         approved_at_utc: r.get::<_, Option<String>>(15)?,
         created_at_utc: r.get::<_, String>(16)?,
+        // Header-only read: lines are not part of this row shape. Populated
+        // only on the `create_po` return path (see the field doc-comment).
+        lines: Vec::new(),
     })
 }
 
@@ -839,7 +850,14 @@ pub fn create_po(
         )?;
     }
 
-    reread_po(db_path, tenant, &po_id)
+    // Return the header re-read from the file, but carry the just-persisted
+    // lines back in-process so a same-process caller (e.g. the demo seed)
+    // recovers the server-generated `pol_id`s without re-opening the DB —
+    // which, from a *different* DuckDB instance (a held `aberp_db::Handle`),
+    // would not see this residual opener's write until a checkpoint.
+    let mut po = reread_po(db_path, tenant, &po_id)?;
+    po.lines = lines_persisted;
+    Ok(po)
 }
 
 /// Apply an operator-driven PO transition (issue / cancel / close). Validates the

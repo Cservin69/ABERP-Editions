@@ -329,6 +329,80 @@ fn ensure_quoting_catalogues(
         t,
     )
     .context("seed the tolerance cost-rate catalogue for the demo tenant")?;
+    // Complexity rules are operator-configured tunables with NO production
+    // default (unlike the material / machine-rate / gear / tolerance
+    // catalogues above, which every tenant boots with). So the boot path
+    // leaves `quoting_complexity_rules` empty, and the demo's own
+    // FeatureGraphs (pocket / hole / thread / undercut_5axis / surface / …)
+    // would fail the real engine with `NoComplexityRuleForFeature`. Seed a
+    // demo-credible full grid here — demo-tenant-only; the shared boot path
+    // is untouched, so a real tenant still starts with an empty catalogue it
+    // configures itself.
+    seed_demo_complexity_rules(&mut guard, &ledger_meta, t)
+        .context("seed the complexity-rule catalogue for the demo tenant")?;
+    Ok(())
+}
+
+/// Insert-if-absent complexity rules covering every feature type the demo's
+/// FeatureGraphs use, across all five size buckets, so the real pricing
+/// engine has a rule for every `(feature_type, size_bucket)` it looks up.
+/// One rule per `(feature_type, size_bucket)` with `count_min = 1` /
+/// `count_max = NULL` covers every positive count. Values are demo-credible
+/// (a 5-axis undercut costs far more than a drilled hole), not researched
+/// production defaults — the point is a coherent, non-zero engine price, not
+/// a shop's real rate card. Idempotent: a pre-existing `(ft, sb, count_min)`
+/// is skipped, so a re-run (or a later boot) is a no-op.
+fn seed_demo_complexity_rules(
+    guard: &mut duckdb::Connection,
+    ledger_meta: &LedgerMeta,
+    tenant: &str,
+) -> Result<()> {
+    use crate::quoting_tunables::{
+        create_complexity_rule, ComplexityRuleInputs, TunableWriteError,
+    };
+    // (feature_type db-string, base minutes at bucket M, setup-penalty minutes).
+    const FEATURES: &[(&str, f64, f64)] = &[
+        ("pocket", 6.0, 12.0),
+        ("hole", 1.5, 4.0),
+        ("slot", 3.0, 8.0),
+        ("thread", 2.5, 6.0),
+        ("undercut_5axis", 15.0, 35.0),
+        ("thin_wall", 8.0, 18.0),
+        ("surface", 4.0, 10.0),
+        ("engraving", 2.0, 5.0),
+    ];
+    // Size scales the per-feature machining time; setup is size-independent.
+    const BUCKETS: &[(&str, f64)] = &[
+        ("XS", 0.5),
+        ("S", 0.75),
+        ("M", 1.0),
+        ("L", 1.5),
+        ("XL", 2.2),
+    ];
+    for &(ft, base_m, setup) in FEATURES {
+        for &(sb, factor) in BUCKETS {
+            let inputs = ComplexityRuleInputs {
+                feature_type: ft.to_string(),
+                size_bucket: sb.to_string(),
+                count_min: 1,
+                count_max: None,
+                base_time_minutes: base_m * factor,
+                multiplier: 1.0,
+                setup_penalty_minutes: setup,
+                notes: Some("demo seed catalogue".to_string()),
+            };
+            match create_complexity_rule(guard, ledger_meta, DEMO_OPERATOR, tenant, &inputs) {
+                Ok(_) => {}
+                // Already present (a re-run / prior boot) — insert-if-absent.
+                Err(TunableWriteError::Conflict(_)) => {}
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "create demo complexity rule ({ft}, {sb}): {e:?}"
+                    ))
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -684,13 +758,12 @@ fn seed_purchasing(
     )
     .map_err(|e| anyhow::anyhow!("issue the titanium purchase order: {e}"))?;
 
-    let ti_lines = {
-        let conn = db
-            .read()
-            .map_err(|e| anyhow::anyhow!("read the titanium PO lines: {e}"))?;
-        purchasing::list_po_lines(&conn, tenant.as_str(), &po_ti.po_id)
-            .context("list the titanium PO lines")?
-    };
+    // The persisted lines ride back on the `create_po` return (with their
+    // server-generated `pol_id`s). We must NOT re-read them through the shared
+    // `db` Handle here: `create_po` wrote them via its own residual opener, and
+    // a held Handle is a separate DuckDB instance that cannot see that write
+    // until a checkpoint (proven: fresh-open sees the line, `db.read()` sees 0).
+    let ti_lines = &po_ti.lines;
     purchasing::record_receipt(
         db_path,
         db,
@@ -752,13 +825,9 @@ fn seed_purchasing(
     )
     .map_err(|e| anyhow::anyhow!("issue the aluminium purchase order: {e}"))?;
 
-    let al_lines = {
-        let conn = db
-            .read()
-            .map_err(|e| anyhow::anyhow!("read the aluminium PO lines: {e}"))?;
-        purchasing::list_po_lines(&conn, tenant.as_str(), &po_al.po_id)
-            .context("list the aluminium PO lines")?
-    };
+    // Same as the titanium delivery: use the lines returned in-process by
+    // `create_po`, never a Handle read-back of this residual-opener write.
+    let al_lines = &po_al.lines;
     purchasing::record_receipt(
         db_path,
         db,
