@@ -144,6 +144,14 @@ impl QtyUnitKind {
             QtyUnitKind::Kg => "kg",
         }
     }
+
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "units" => Some(QtyUnitKind::Units),
+            "kg" => Some(QtyUnitKind::Kg),
+            _ => None,
+        }
+    }
 }
 
 /// Closed-vocab reservation state per ADR-0069. App-layer enforced; the
@@ -211,6 +219,24 @@ pub enum MaterialInventoryError {
         already_reserved: f64,
         already_committed: f64,
     },
+    /// D-11 — a release/consume named a `reservation_id` that does not
+    /// exist for this tenant.
+    #[error("reservation {reservation_id} not found")]
+    ReservationNotFound { reservation_id: String },
+    /// D-11 — a release/consume was attempted from a TERMINAL reservation
+    /// state (`consumed` / `released`), or a consume from a state it does
+    /// not accept. The reservation FSM (ADR-0069 §Invariant 3) only allows
+    /// `{reserved, committed} → released` and `{reserved, committed} →
+    /// consumed`; a terminal row is immutable (a correction is a new
+    /// reservation, never an edit of the old one).
+    #[error(
+        "reservation {reservation_id} cannot be {attempted}: it is already {from} (a terminal state)"
+    )]
+    IllegalTransition {
+        reservation_id: String,
+        from: &'static str,
+        attempted: &'static str,
+    },
 }
 
 impl MaterialInventoryError {
@@ -219,6 +245,8 @@ impl MaterialInventoryError {
     pub fn machine_code(&self) -> &'static str {
         match self {
             MaterialInventoryError::InsufficientMaterial { .. } => "insufficient_material",
+            MaterialInventoryError::ReservationNotFound { .. } => "reservation_not_found",
+            MaterialInventoryError::IllegalTransition { .. } => "illegal_reservation_transition",
         }
     }
 }
@@ -707,6 +735,471 @@ pub fn append_material_committed_in_tx(
     Ok(())
 }
 
+// ── D-11 — reserve / release / consume state transitions ─────────────────
+//
+// These complete the shipped material-side balance model: `commit` (above,
+// DEAL-driven) was the only live writer, leaving `reserved_qty`,
+// `consumed_qty`, and three of the four `inventory.*` audit kinds dead. The
+// three transitions here make them live, quantity-conservingly:
+//
+//   available = on_hand − reserved − committed   (invariant ≥ 0)
+//
+//   reserve   (∅ → reserved)          reserved += qty      (guard available ≥ qty)
+//   release   ({reserved,committed} → released)   earmark −= qty
+//   consume   ({reserved,committed} → consumed)   on_hand −= qty, earmark −= qty, consumed += qty
+//
+// A terminal row (`consumed` / `released`) is immutable — a correction is a
+// NEW reservation, never an edit (ADR-0069 §Invariant 3). release/consume
+// accept EITHER a `reserved` or a `committed` earmark: the shipped model
+// treats the two as parallel holds on set-aside material (a soft indicative
+// reserve vs a firm DEAL commit), and both are physically drawable-down. That
+// is a deliberate, documented liberalisation of ADR-0069's committed-only
+// consume — flagged because it diverges from that (product-side) design,
+// which this material-side model already departed from at S273.
+//
+// Every write here rides the SAME `Transaction` the caller opened on the
+// shared `aberp_db::Handle` writer (ADR-0099) — no independent opener, so the
+// opener census stays flat.
+
+/// One reservation row, resolved by id for a transition.
+struct ReservationRow {
+    quote_id: String,
+    material_grade: String,
+    qty: f64,
+    state: ReservationState,
+    qty_unit_kind: QtyUnitKind,
+}
+
+fn read_reservation_in_tx(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    reservation_id: &str,
+) -> Result<Option<ReservationRow>> {
+    tx.execute_batch(INVENTORY_BALANCES_SCHEMA_SQL)
+        .context("ensure inventory schema for reservation read")?;
+    let mut stmt = tx
+        .prepare(
+            "SELECT quote_id, material_grade, qty, state, qty_unit_kind
+               FROM inventory_reservations
+              WHERE reservation_id = ?1 AND tenant_id = ?2",
+        )
+        .context("prepare reservation read")?;
+    let mut rows = stmt
+        .query(params![reservation_id, tenant])
+        .context("query reservation")?;
+    let Some(row) = rows.next().context("read reservation row")? else {
+        return Ok(None);
+    };
+    let state_str: String = row.get(3).context("read reservation.state")?;
+    let state = ReservationState::from_db_str(&state_str).ok_or_else(|| {
+        anyhow::anyhow!("reservation {reservation_id} has unknown state {state_str:?} (corrupt)")
+    })?;
+    let unit_str: Option<String> = row.get(4).context("read reservation.qty_unit_kind")?;
+    let qty_unit_kind = unit_str
+        .as_deref()
+        .and_then(QtyUnitKind::from_db_str)
+        .unwrap_or_else(default_qty_unit_kind);
+    Ok(Some(ReservationRow {
+        quote_id: row.get(0).context("read reservation.quote_id")?,
+        material_grade: row.get(1).context("read reservation.material_grade")?,
+        qty: row.get(2).context("read reservation.qty")?,
+        state,
+        qty_unit_kind,
+    }))
+}
+
+/// Outcome of a reserve / release / consume transition. `previous_state`
+/// is `None` for a fresh reserve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaterialReservationOutcome {
+    pub reservation_id: String,
+    /// The quote the reservation is held against — the caller's quote on a
+    /// fresh reserve, or the reservation row's own quote on release/consume.
+    pub quote_id: String,
+    pub material_grade: String,
+    pub qty: f64,
+    pub qty_unit_kind: QtyUnitKind,
+    pub previous_state: Option<ReservationState>,
+    pub new_state: ReservationState,
+    pub balance_after: Balance,
+}
+
+fn now_iso() -> Result<String> {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .context("format now for inventory writes")
+}
+
+/// Reserve `qty` of `material_grade` against `quote_id`: a soft earmark on
+/// available stock. Increments `reserved_qty` (guarded so the reserve fits
+/// in `available`) and inserts a new `reserved` reservation row. Mirrors
+/// [`commit_material_in_tx`] but for the reserved column.
+pub fn reserve_material_in_tx(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    quote_id: &str,
+    material_grade: &str,
+    qty: f64,
+    qty_unit_kind: QtyUnitKind,
+) -> Result<MaterialReservationOutcome> {
+    tx.execute_batch(INVENTORY_BALANCES_SCHEMA_SQL)
+        .context("ensure inventory schema for reserve")?;
+    let now = now_iso()?;
+    tx.execute(
+        "INSERT INTO inventory_balances (
+            tenant_id, material_grade,
+            on_hand_qty, reserved_qty, committed_qty, consumed_qty,
+            unit_of_measure, last_updated
+         ) VALUES (?1, ?2, 0, 0, 0, 0, ?3, ?4)
+         ON CONFLICT (tenant_id, material_grade) DO NOTHING",
+        params![tenant, material_grade, DEFAULT_UOM, &now],
+    )
+    .context("upsert inventory_balances at zeros (reserve)")?;
+
+    let before = read_balance_in_tx_inner(tx, tenant, material_grade)
+        .context("read inventory_balances before reserve")?
+        .ok_or_else(|| anyhow::anyhow!("balance row missing after upsert (impossible)"))?;
+    if before.on_hand_qty - before.reserved_qty - before.committed_qty - qty < 0.0 {
+        return Err(anyhow::Error::new(
+            MaterialInventoryError::InsufficientMaterial {
+                material_grade: material_grade.to_string(),
+                requested: qty,
+                on_hand: before.on_hand_qty,
+                already_reserved: before.reserved_qty,
+                already_committed: before.committed_qty,
+            },
+        ));
+    }
+
+    let n = tx
+        .execute(
+            "UPDATE inventory_balances
+                SET reserved_qty = reserved_qty + ?1, last_updated = ?2
+              WHERE tenant_id = ?3 AND material_grade = ?4",
+            params![qty, &now, tenant, material_grade],
+        )
+        .context("UPDATE inventory_balances reserved_qty")?;
+    if n != 1 {
+        anyhow::bail!("inventory_balances reserve UPDATE touched {n} rows (expected 1)");
+    }
+
+    let reservation_id = format!("res_{}", Ulid::new());
+    tx.execute(
+        "INSERT INTO inventory_reservations (
+            reservation_id, tenant_id, quote_id, material_grade,
+            qty, state, created_at, transitioned_at, qty_unit_kind
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+        params![
+            &reservation_id,
+            tenant,
+            quote_id,
+            material_grade,
+            qty,
+            ReservationState::Reserved.as_db_str(),
+            &now,
+            qty_unit_kind.as_db_str(),
+        ],
+    )
+    .context("INSERT inventory_reservations (reserved)")?;
+
+    let after = read_balance_in_tx_inner(tx, tenant, material_grade)
+        .context("re-read inventory_balances post-reserve")?
+        .ok_or_else(|| anyhow::anyhow!("balance row missing post-reserve (impossible)"))?;
+    if after.available_qty < 0.0 {
+        anyhow::bail!(
+            "post-reserve invariant breach: material {material_grade} available_qty = {} < 0",
+            after.available_qty
+        );
+    }
+    Ok(MaterialReservationOutcome {
+        reservation_id,
+        quote_id: quote_id.to_string(),
+        material_grade: material_grade.to_string(),
+        qty,
+        qty_unit_kind,
+        previous_state: None,
+        new_state: ReservationState::Reserved,
+        balance_after: after,
+    })
+}
+
+/// Release a `reserved` or `committed` reservation: return its earmark to
+/// the available pool and flip the row to `released`. Rejects a terminal
+/// (`consumed` / `released`) row.
+pub fn release_reservation_in_tx(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    reservation_id: &str,
+) -> Result<MaterialReservationOutcome> {
+    let row = read_reservation_in_tx(tx, tenant, reservation_id)?.ok_or_else(|| {
+        anyhow::Error::new(MaterialInventoryError::ReservationNotFound {
+            reservation_id: reservation_id.to_string(),
+        })
+    })?;
+    let column = match row.state {
+        ReservationState::Reserved => "reserved_qty",
+        ReservationState::Committed => "committed_qty",
+        terminal @ (ReservationState::Consumed | ReservationState::Released) => {
+            return Err(anyhow::Error::new(
+                MaterialInventoryError::IllegalTransition {
+                    reservation_id: reservation_id.to_string(),
+                    from: terminal.as_db_str(),
+                    attempted: "released",
+                },
+            ));
+        }
+    };
+    let now = now_iso()?;
+    // The earmark column holds at least this row's qty (the reservation put
+    // it there); guard against an underflow anyway (defense-in-depth).
+    let n = tx
+        .execute(
+            &format!(
+                "UPDATE inventory_balances
+                    SET {column} = {column} - ?1, last_updated = ?2
+                  WHERE tenant_id = ?3 AND material_grade = ?4 AND {column} >= ?1"
+            ),
+            params![row.qty, &now, tenant, &row.material_grade],
+        )
+        .context("UPDATE inventory_balances (release)")?;
+    if n != 1 {
+        anyhow::bail!(
+            "release of {reservation_id} touched {n} rows (expected 1) — earmark underflow?"
+        );
+    }
+    tx.execute(
+        "UPDATE inventory_reservations
+            SET state = ?1, transitioned_at = ?2
+          WHERE reservation_id = ?3 AND tenant_id = ?4",
+        params![
+            ReservationState::Released.as_db_str(),
+            &now,
+            reservation_id,
+            tenant
+        ],
+    )
+    .context("flip reservation to released")?;
+
+    let after = read_balance_in_tx_inner(tx, tenant, &row.material_grade)
+        .context("re-read inventory_balances post-release")?
+        .ok_or_else(|| anyhow::anyhow!("balance row missing post-release (impossible)"))?;
+    Ok(MaterialReservationOutcome {
+        reservation_id: reservation_id.to_string(),
+        quote_id: row.quote_id,
+        material_grade: row.material_grade,
+        qty: row.qty,
+        qty_unit_kind: row.qty_unit_kind,
+        previous_state: Some(row.state),
+        new_state: ReservationState::Released,
+        balance_after: after,
+    })
+}
+
+/// Consume a `reserved` or `committed` reservation: physically draw the
+/// material off the shelf. Debits `on_hand_qty` AND the earmark column, and
+/// credits `consumed_qty`; flips the row to `consumed`. Rejects a terminal
+/// row. `available_qty` is unchanged (the material was already earmarked out
+/// of the available pool).
+pub fn consume_reservation_in_tx(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    reservation_id: &str,
+) -> Result<MaterialReservationOutcome> {
+    let row = read_reservation_in_tx(tx, tenant, reservation_id)?.ok_or_else(|| {
+        anyhow::Error::new(MaterialInventoryError::ReservationNotFound {
+            reservation_id: reservation_id.to_string(),
+        })
+    })?;
+    let earmark = match row.state {
+        ReservationState::Reserved => "reserved_qty",
+        ReservationState::Committed => "committed_qty",
+        terminal @ (ReservationState::Consumed | ReservationState::Released) => {
+            return Err(anyhow::Error::new(
+                MaterialInventoryError::IllegalTransition {
+                    reservation_id: reservation_id.to_string(),
+                    from: terminal.as_db_str(),
+                    attempted: "consumed",
+                },
+            ));
+        }
+    };
+    let now = now_iso()?;
+    let n = tx
+        .execute(
+            &format!(
+                "UPDATE inventory_balances
+                    SET on_hand_qty = on_hand_qty - ?1,
+                        {earmark} = {earmark} - ?1,
+                        consumed_qty = consumed_qty + ?1,
+                        last_updated = ?2
+                  WHERE tenant_id = ?3 AND material_grade = ?4
+                    AND on_hand_qty >= ?1 AND {earmark} >= ?1"
+            ),
+            params![row.qty, &now, tenant, &row.material_grade],
+        )
+        .context("UPDATE inventory_balances (consume)")?;
+    if n != 1 {
+        anyhow::bail!(
+            "consume of {reservation_id} touched {n} rows (expected 1) — on_hand/earmark underflow?"
+        );
+    }
+    tx.execute(
+        "UPDATE inventory_reservations
+            SET state = ?1, transitioned_at = ?2
+          WHERE reservation_id = ?3 AND tenant_id = ?4",
+        params![
+            ReservationState::Consumed.as_db_str(),
+            &now,
+            reservation_id,
+            tenant
+        ],
+    )
+    .context("flip reservation to consumed")?;
+
+    let after = read_balance_in_tx_inner(tx, tenant, &row.material_grade)
+        .context("re-read inventory_balances post-consume")?
+        .ok_or_else(|| anyhow::anyhow!("balance row missing post-consume (impossible)"))?;
+    if after.available_qty < 0.0 {
+        anyhow::bail!(
+            "post-consume invariant breach: material {} available_qty = {} < 0",
+            row.material_grade,
+            after.available_qty
+        );
+    }
+    Ok(MaterialReservationOutcome {
+        reservation_id: reservation_id.to_string(),
+        quote_id: row.quote_id,
+        material_grade: row.material_grade,
+        qty: row.qty,
+        qty_unit_kind: row.qty_unit_kind,
+        previous_state: Some(row.state),
+        new_state: ReservationState::Consumed,
+        balance_after: after,
+    })
+}
+
+/// Shared forensic-walk payload for the reserve / release / consume audit
+/// entries — the same post-transition-snapshot shape as
+/// [`MaterialCommittedPayload`], plus the FSM edge (`previous_state` →
+/// `new_state`) and an optional `reason` (release only).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MaterialReservationPayload {
+    pub reservation_id: String,
+    pub tenant_id: String,
+    pub quote_id: String,
+    pub material_grade: String,
+    pub qty: f64,
+    #[serde(default = "default_qty_unit_kind")]
+    pub qty_unit_kind: QtyUnitKind,
+    pub actor: String,
+    pub created_at: String,
+    /// `null` for a fresh reserve; the prior FSM state for release/consume.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_state: Option<String>,
+    pub new_state: String,
+    /// Operator-typed release reason (release entries only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub balance_after_on_hand: f64,
+    pub balance_after_reserved: f64,
+    pub balance_after_committed: f64,
+    pub balance_after_consumed: f64,
+}
+
+impl MaterialReservationPayload {
+    /// Build from a transition outcome. `reason` is set by the release
+    /// caller only.
+    pub fn from_outcome(
+        tenant: &str,
+        actor: &str,
+        created_at: &str,
+        outcome: &MaterialReservationOutcome,
+        reason: Option<String>,
+    ) -> Self {
+        let b = &outcome.balance_after;
+        Self {
+            reservation_id: outcome.reservation_id.clone(),
+            tenant_id: tenant.to_string(),
+            quote_id: outcome.quote_id.clone(),
+            material_grade: outcome.material_grade.clone(),
+            qty: outcome.qty,
+            qty_unit_kind: outcome.qty_unit_kind,
+            actor: actor.to_string(),
+            created_at: created_at.to_string(),
+            previous_state: outcome.previous_state.map(|s| s.as_db_str().to_string()),
+            new_state: outcome.new_state.as_db_str().to_string(),
+            reason,
+            balance_after_on_hand: b.on_hand_qty,
+            balance_after_reserved: b.reserved_qty,
+            balance_after_committed: b.committed_qty,
+            balance_after_consumed: b.consumed_qty,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialize MaterialReservationPayload")
+    }
+}
+
+/// Append the `inventory.material_reserved` audit entry inside the caller's
+/// tx. Idempotency key `material_reserve:<reservation_id>` (the res id is
+/// minted fresh per reserve, so this dedupes a double-fire).
+pub fn append_material_reserved_in_tx(
+    tx: &Transaction<'_>,
+    ledger_meta: &LedgerMeta,
+    ledger_actor: Actor,
+    payload: &MaterialReservationPayload,
+) -> Result<()> {
+    append_in_tx(
+        tx,
+        ledger_meta,
+        EventKind::MaterialReserved,
+        payload.to_bytes(),
+        ledger_actor,
+        Some(format!("material_reserve:{}", payload.reservation_id)),
+    )
+    .context("audit append MaterialReserved")?;
+    Ok(())
+}
+
+/// Append the `inventory.material_released` audit entry inside the caller's tx.
+pub fn append_material_released_in_tx(
+    tx: &Transaction<'_>,
+    ledger_meta: &LedgerMeta,
+    ledger_actor: Actor,
+    payload: &MaterialReservationPayload,
+) -> Result<()> {
+    append_in_tx(
+        tx,
+        ledger_meta,
+        EventKind::MaterialReleased,
+        payload.to_bytes(),
+        ledger_actor,
+        Some(format!("material_release:{}", payload.reservation_id)),
+    )
+    .context("audit append MaterialReleased")?;
+    Ok(())
+}
+
+/// Append the `inventory.material_consumed` audit entry inside the caller's tx.
+pub fn append_material_consumed_in_tx(
+    tx: &Transaction<'_>,
+    ledger_meta: &LedgerMeta,
+    ledger_actor: Actor,
+    payload: &MaterialReservationPayload,
+) -> Result<()> {
+    append_in_tx(
+        tx,
+        ledger_meta,
+        EventKind::MaterialConsumed,
+        payload.to_bytes(),
+        ledger_actor,
+        Some(format!("material_consume:{}", payload.reservation_id)),
+    )
+    .context("audit append MaterialConsumed")?;
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // S432 (ADR-0085) — heat-lot traceability assignment.
 //
@@ -953,6 +1446,211 @@ mod tests {
             .is_empty());
     }
 
+    // ── D-11 reserve / release / consume state machine ──────────────────
+
+    fn seed_on_hand(conn: &Connection, grade: &str, on_hand: f64) {
+        conn.execute(
+            "INSERT INTO inventory_balances (
+                tenant_id, material_grade, on_hand_qty, reserved_qty,
+                committed_qty, consumed_qty, unit_of_measure, last_updated
+             ) VALUES ('t', ?1, ?2, 0, 0, 0, 'kg', '2026-06-06T00:00:00Z')",
+            params![grade, on_hand],
+        )
+        .unwrap();
+    }
+
+    fn balance_of(conn: &Connection, grade: &str) -> Balance {
+        read_balance(conn, "t", grade)
+            .unwrap()
+            .expect("balance row")
+    }
+
+    fn count_kind(conn: &Connection, kind: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM audit_ledger WHERE kind = ?1",
+            params![kind],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn machine_code_of(err: &anyhow::Error) -> &'static str {
+        err.downcast_ref::<MaterialInventoryError>()
+            .expect("typed material error")
+            .machine_code()
+    }
+
+    #[test]
+    fn reserve_increments_reserved_and_drops_available() {
+        let mut conn = open_conn();
+        seed_on_hand(&conn, "6061-T6", 100.0);
+        let tx = conn.transaction().unwrap();
+        let out = reserve_material_in_tx(&tx, "t", "q1", "6061-T6", 30.0, QtyUnitKind::Kg).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(out.new_state, ReservationState::Reserved);
+        assert_eq!(out.previous_state, None);
+        let b = balance_of(&conn, "6061-T6");
+        assert_eq!(b.on_hand_qty, 100.0);
+        assert_eq!(b.reserved_qty, 30.0);
+        assert_eq!(b.available_qty, 70.0);
+    }
+
+    #[test]
+    fn reserve_beyond_available_is_insufficient() {
+        let mut conn = open_conn();
+        seed_on_hand(&conn, "g", 10.0);
+        let tx = conn.transaction().unwrap();
+        let err = reserve_material_in_tx(&tx, "t", "q", "g", 11.0, QtyUnitKind::Kg).unwrap_err();
+        assert_eq!(machine_code_of(&err), "insufficient_material");
+    }
+
+    #[test]
+    fn release_from_reserved_restores_available() {
+        let mut conn = open_conn();
+        seed_on_hand(&conn, "g", 100.0);
+        let tx = conn.transaction().unwrap();
+        let r = reserve_material_in_tx(&tx, "t", "q", "g", 40.0, QtyUnitKind::Kg).unwrap();
+        let rel = release_reservation_in_tx(&tx, "t", &r.reservation_id).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(rel.previous_state, Some(ReservationState::Reserved));
+        assert_eq!(rel.new_state, ReservationState::Released);
+        let b = balance_of(&conn, "g");
+        assert_eq!(b.reserved_qty, 0.0);
+        assert_eq!(b.available_qty, 100.0);
+    }
+
+    #[test]
+    fn release_from_committed_restores_available() {
+        let mut conn = open_conn();
+        seed_on_hand(&conn, "g", 100.0);
+        let tx = conn.transaction().unwrap();
+        let c = commit_material_in_tx(&tx, "t", "q", "g", 25.0, QtyUnitKind::Kg).unwrap();
+        let rel = release_reservation_in_tx(&tx, "t", &c.reservation_id).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(rel.previous_state, Some(ReservationState::Committed));
+        let b = balance_of(&conn, "g");
+        assert_eq!(b.committed_qty, 0.0);
+        assert_eq!(b.available_qty, 100.0);
+    }
+
+    #[test]
+    fn release_of_terminal_row_is_illegal() {
+        let mut conn = open_conn();
+        seed_on_hand(&conn, "g", 100.0);
+        let tx = conn.transaction().unwrap();
+        let r = reserve_material_in_tx(&tx, "t", "q", "g", 10.0, QtyUnitKind::Kg).unwrap();
+        release_reservation_in_tx(&tx, "t", &r.reservation_id).unwrap();
+        let err = release_reservation_in_tx(&tx, "t", &r.reservation_id).unwrap_err();
+        assert_eq!(machine_code_of(&err), "illegal_reservation_transition");
+    }
+
+    #[test]
+    fn release_of_unknown_reservation_is_not_found() {
+        let mut conn = open_conn();
+        seed_on_hand(&conn, "g", 100.0);
+        let tx = conn.transaction().unwrap();
+        let err = release_reservation_in_tx(&tx, "t", "res_nope").unwrap_err();
+        assert_eq!(machine_code_of(&err), "reservation_not_found");
+    }
+
+    #[test]
+    fn consume_from_committed_draws_down_on_hand_and_conserves_available() {
+        let mut conn = open_conn();
+        seed_on_hand(&conn, "g", 100.0);
+        let tx = conn.transaction().unwrap();
+        let c = commit_material_in_tx(&tx, "t", "q", "g", 20.0, QtyUnitKind::Kg).unwrap();
+        let con = consume_reservation_in_tx(&tx, "t", &c.reservation_id).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(con.previous_state, Some(ReservationState::Committed));
+        assert_eq!(con.new_state, ReservationState::Consumed);
+        let b = balance_of(&conn, "g");
+        assert_eq!(b.on_hand_qty, 80.0);
+        assert_eq!(b.committed_qty, 0.0);
+        assert_eq!(b.consumed_qty, 20.0);
+        // available was 80 (100 − 20 committed) and stays 80 after consume.
+        assert_eq!(b.available_qty, 80.0);
+    }
+
+    #[test]
+    fn consume_from_reserved_draws_down_on_hand() {
+        let mut conn = open_conn();
+        seed_on_hand(&conn, "g", 50.0);
+        let tx = conn.transaction().unwrap();
+        let r = reserve_material_in_tx(&tx, "t", "q", "g", 15.0, QtyUnitKind::Kg).unwrap();
+        consume_reservation_in_tx(&tx, "t", &r.reservation_id).unwrap();
+        tx.commit().unwrap();
+        let b = balance_of(&conn, "g");
+        assert_eq!(b.on_hand_qty, 35.0);
+        assert_eq!(b.reserved_qty, 0.0);
+        assert_eq!(b.consumed_qty, 15.0);
+        assert_eq!(b.available_qty, 35.0);
+    }
+
+    #[test]
+    fn consume_of_terminal_row_is_illegal() {
+        let mut conn = open_conn();
+        seed_on_hand(&conn, "g", 100.0);
+        let tx = conn.transaction().unwrap();
+        let r = reserve_material_in_tx(&tx, "t", "q", "g", 10.0, QtyUnitKind::Kg).unwrap();
+        consume_reservation_in_tx(&tx, "t", &r.reservation_id).unwrap();
+        let err = consume_reservation_in_tx(&tx, "t", &r.reservation_id).unwrap_err();
+        assert_eq!(machine_code_of(&err), "illegal_reservation_transition");
+    }
+
+    #[test]
+    fn transitions_emit_their_audit_kinds() {
+        let mut conn = open_conn();
+        seed_on_hand(&conn, "g", 100.0);
+        let meta = ledger_meta();
+        let now = now_iso().unwrap();
+        let tx = conn.transaction().unwrap();
+
+        let r = reserve_material_in_tx(&tx, "t", "q1", "g", 30.0, QtyUnitKind::Kg).unwrap();
+        let rp = MaterialReservationPayload::from_outcome("t", "op", &now, &r, None);
+        append_material_reserved_in_tx(
+            &tx,
+            &meta,
+            Actor::from_local_cli(Ulid::new().to_string(), "op"),
+            &rp,
+        )
+        .unwrap();
+
+        let c = commit_material_in_tx(&tx, "t", "q1", "g", 20.0, QtyUnitKind::Kg).unwrap();
+        let con = consume_reservation_in_tx(&tx, "t", &c.reservation_id).unwrap();
+        let cp = MaterialReservationPayload::from_outcome("t", "op", &now, &con, None);
+        append_material_consumed_in_tx(
+            &tx,
+            &meta,
+            Actor::from_local_cli(Ulid::new().to_string(), "op"),
+            &cp,
+        )
+        .unwrap();
+
+        let rel = release_reservation_in_tx(&tx, "t", &r.reservation_id).unwrap();
+        let relp = MaterialReservationPayload::from_outcome(
+            "t",
+            "op",
+            &now,
+            &rel,
+            Some("superseded".to_string()),
+        );
+        append_material_released_in_tx(
+            &tx,
+            &meta,
+            Actor::from_local_cli(Ulid::new().to_string(), "op"),
+            &relp,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(count_kind(&conn, "inventory.material_reserved"), 1);
+        assert_eq!(count_kind(&conn, "inventory.material_consumed"), 1);
+        assert_eq!(count_kind(&conn, "inventory.material_released"), 1);
+        // The released payload carried the operator reason.
+        assert_eq!(relp.reason.as_deref(), Some("superseded"));
+        assert_eq!(relp.previous_state.as_deref(), Some("reserved"));
+    }
+
     /// Happy path: first DEAL against a material with positive on_hand
     /// upserts a balance row, increments committed_qty, and inserts a
     /// reservation row in `committed` state.
@@ -1023,6 +1721,7 @@ mod tests {
                 assert_eq!(already_reserved, 0.0);
                 assert_eq!(already_committed, 0.0);
             }
+            other => unreachable!("expected InsufficientMaterial, got {other:?}"),
         }
     }
 
@@ -1056,6 +1755,7 @@ mod tests {
                 assert_eq!(on_hand, 100.0);
                 assert_eq!(already_committed, 90.0);
             }
+            other => unreachable!("expected InsufficientMaterial, got {other:?}"),
         }
     }
 

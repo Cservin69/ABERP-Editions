@@ -578,6 +578,16 @@ pub fn run_deal_saga(
                                 already_reserved: *already_reserved,
                                 already_committed: *already_committed,
                             }),
+                            // The DEAL commit path only ever produces
+                            // InsufficientMaterial (it calls
+                            // commit_material_in_tx, never a reservation
+                            // transition). The reserve/release/consume
+                            // variants (D-11) are unreachable here; map them
+                            // defensively rather than widen DealSagaError.
+                            MaterialInventoryError::ReservationNotFound { .. }
+                            | MaterialInventoryError::IllegalTransition { .. } => anyhow!(
+                                "DEAL saga material commit (unexpected transition error): {inv}"
+                            ),
                         }
                     } else {
                         e.context("DEAL saga material commit")
