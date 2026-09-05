@@ -4882,6 +4882,23 @@ pub fn build_router(state: AppState) -> Router {
             "/api/inventory-balances/:grade/heat-lot",
             post(handle_assign_heat_lot),
         )
+        // D-11 — material reservation FSM + certificate capture.
+        .route(
+            "/api/inventory-balances/:grade/reserve",
+            post(handle_reserve_material),
+        )
+        .route(
+            "/api/inventory-reservations/:id/release",
+            post(handle_release_reservation),
+        )
+        .route(
+            "/api/inventory-reservations/:id/consume",
+            post(handle_consume_reservation),
+        )
+        .route(
+            "/api/inventory-balances/:grade/certs",
+            get(handle_list_material_certs).post(handle_attach_material_cert),
+        )
         .route(
             "/api/material-traceability",
             get(handle_material_traceability),
@@ -26543,6 +26560,401 @@ async fn handle_assign_heat_lot(
         Err(join_err) => internal_error(
             "assign_heat_lot:join",
             anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ── D-11 — material reservation + certificate operator routes ─────────────
+//
+// reserve / release / consume drive the material-side FSM; attach-cert files a
+// material.cert_attached record. Each opens ONE tx on the shared aberp_db
+// writer and appends its audit entry inside that tx (ADR-0099 — no independent
+// opener). Typed errors map to 409 (insufficient / illegal transition), 404
+// (unknown reservation) or 400 (bad cert kind/url).
+//
+// Each async handler is a thin wrapper: it resolves the operator, rejects a
+// bad bearer, then `spawn_blocking`s the matching synchronous `*_request` fn.
+// The request fns are the unit-of-work — a real `AppState` (real Handle, real
+// audit append) exercises them end-to-end in `tests/serve_material_routes.rs`,
+// mirroring the `serve_partners_route` convention.
+
+/// POST body for `/api/inventory-balances/:grade/reserve`.
+#[derive(Debug, Deserialize)]
+pub struct ReserveMaterialBody {
+    pub qty: f64,
+    #[serde(default)]
+    pub qty_unit_kind: Option<String>,
+    #[serde(default)]
+    pub quote_id: Option<String>,
+}
+
+/// POST body for `/api/inventory-reservations/:id/release`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ReleaseReservationBody {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// POST body for `/api/inventory-balances/:grade/certs`.
+#[derive(Debug, Deserialize)]
+pub struct AttachMaterialCertBody {
+    pub cert_kind: String,
+    pub cert_url: String,
+    #[serde(default)]
+    pub lot_id: Option<String>,
+}
+
+/// Map a `MaterialInventoryError` (wrapped in anyhow) to the right HTTP status.
+fn material_inventory_error_response(ctx: &'static str, e: anyhow::Error) -> Response {
+    use crate::material_inventory::MaterialInventoryError as E;
+    match e.downcast::<E>() {
+        Ok(err) => {
+            let status = match &err {
+                E::InsufficientMaterial { .. } | E::IllegalTransition { .. } => {
+                    StatusCode::CONFLICT
+                }
+                E::ReservationNotFound { .. } => StatusCode::NOT_FOUND,
+                E::CertKindUnknown { .. } | E::CertUrlInvalid { .. } => StatusCode::BAD_REQUEST,
+            };
+            (status, Json(error_body(err.to_string()))).into_response()
+        }
+        Err(other) => internal_error(ctx, other),
+    }
+}
+
+/// Soft-earmark `qty` of `grade`, emitting `MaterialReserved` in the same tx.
+/// Blocking; the handler runs it on the blocking pool.
+pub fn reserve_material_request(
+    state: &AppState,
+    operator: &str,
+    grade: &str,
+    body: &ReserveMaterialBody,
+) -> Result<crate::material_inventory::MaterialReservationOutcome> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
+    let unit = match body.qty_unit_kind.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => crate::material_inventory::QtyUnitKind::from_db_str(s)
+            .ok_or_else(|| anyhow!("unknown qty_unit_kind {s:?} (expected units / kg)"))?,
+        _ => crate::material_inventory::QtyUnitKind::Kg,
+    };
+    let quote_id = body
+        .quote_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("manual")
+        .to_string();
+    let ledger_meta = LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let now_iso = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format now for reserve")?;
+    let mut guard = state
+        .db
+        .write()
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tx = guard.transaction().context("begin material reserve tx")?;
+    let outcome = crate::material_inventory::reserve_material_in_tx(
+        &tx,
+        state.tenant.as_str(),
+        &quote_id,
+        grade,
+        body.qty,
+        unit,
+    )?;
+    let payload = crate::material_inventory::MaterialReservationPayload::from_outcome(
+        state.tenant.as_str(),
+        operator,
+        &now_iso,
+        &outcome,
+        None,
+    );
+    crate::material_inventory::append_material_reserved_in_tx(
+        &tx,
+        &ledger_meta,
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        &payload,
+    )?;
+    tx.commit().context("commit material reserve tx")?;
+    Ok(outcome)
+}
+
+/// Return a reservation to the pool, emitting `MaterialReleased` in the same tx.
+pub fn release_reservation_request(
+    state: &AppState,
+    operator: &str,
+    reservation_id: &str,
+    body: &ReleaseReservationBody,
+) -> Result<crate::material_inventory::MaterialReservationOutcome> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
+    let reason = body
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let ledger_meta = LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let now_iso = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format now for release")?;
+    let mut guard = state
+        .db
+        .write()
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tx = guard.transaction().context("begin material release tx")?;
+    let outcome = crate::material_inventory::release_reservation_in_tx(
+        &tx,
+        state.tenant.as_str(),
+        reservation_id,
+    )?;
+    let payload = crate::material_inventory::MaterialReservationPayload::from_outcome(
+        state.tenant.as_str(),
+        operator,
+        &now_iso,
+        &outcome,
+        reason,
+    );
+    crate::material_inventory::append_material_released_in_tx(
+        &tx,
+        &ledger_meta,
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        &payload,
+    )?;
+    tx.commit().context("commit material release tx")?;
+    Ok(outcome)
+}
+
+/// Physically draw down a reservation, emitting `MaterialConsumed` in the same tx.
+pub fn consume_reservation_request(
+    state: &AppState,
+    operator: &str,
+    reservation_id: &str,
+) -> Result<crate::material_inventory::MaterialReservationOutcome> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
+    let ledger_meta = LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let now_iso = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format now for consume")?;
+    let mut guard = state
+        .db
+        .write()
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tx = guard.transaction().context("begin material consume tx")?;
+    let outcome = crate::material_inventory::consume_reservation_in_tx(
+        &tx,
+        state.tenant.as_str(),
+        reservation_id,
+    )?;
+    let payload = crate::material_inventory::MaterialReservationPayload::from_outcome(
+        state.tenant.as_str(),
+        operator,
+        &now_iso,
+        &outcome,
+        None,
+    );
+    crate::material_inventory::append_material_consumed_in_tx(
+        &tx,
+        &ledger_meta,
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        &payload,
+    )?;
+    tx.commit().context("commit material consume tx")?;
+    Ok(outcome)
+}
+
+/// File a certificate on `grade`, emitting `MaterialCertAttached` in the same tx.
+pub fn attach_material_cert_request(
+    state: &AppState,
+    operator: &str,
+    grade: &str,
+    body: &AttachMaterialCertBody,
+) -> Result<crate::material_inventory::MaterialCertRecord> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
+    let ledger_meta = LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let now = time::OffsetDateTime::now_utc();
+    let mut guard = state
+        .db
+        .write()
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tx = guard.transaction().context("begin cert attach tx")?;
+    let record = crate::material_inventory::attach_material_cert_in_tx(
+        &tx,
+        state.tenant.as_str(),
+        grade,
+        &body.cert_kind,
+        &body.cert_url,
+        body.lot_id.as_deref(),
+        operator,
+        now,
+    )?;
+    let payload = crate::material_inventory::MaterialCertAttachedPayload::from_record(&record, now);
+    crate::material_inventory::append_material_cert_attached_in_tx(
+        &tx,
+        &ledger_meta,
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        &record.cert_id,
+        &payload,
+    )?;
+    tx.commit().context("commit cert attach tx")?;
+    Ok(record)
+}
+
+/// Read the certs filed on `grade`, newest first.
+pub fn list_material_certs_request(
+    state: &AppState,
+    grade: &str,
+) -> Result<Vec<crate::material_inventory::MaterialCertRecord>> {
+    let conn = state.db.read().context("shared read: material certs")?;
+    crate::material_inventory::list_material_certs(&conn, state.tenant.as_str(), grade)
+}
+
+/// `POST /api/inventory-balances/:grade/reserve` — soft-earmark material.
+async fn handle_reserve_material(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(grade): AxumPath<String>,
+    Json(body): Json<ReserveMaterialBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        reserve_material_request(&state_for_task, &operator, &grade, &body)
+    })
+    .await;
+    match result {
+        Ok(Ok(o)) => (StatusCode::CREATED, Json(o)).into_response(),
+        Ok(Err(e)) => material_inventory_error_response("reserve_material", e),
+        Err(je) => internal_error(
+            "reserve_material:join",
+            anyhow!("blocking task panicked: {je}"),
+        ),
+    }
+}
+
+/// `POST /api/inventory-reservations/:id/release` — return an earmark to the pool.
+async fn handle_release_reservation(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(reservation_id): AxumPath<String>,
+    Json(body): Json<ReleaseReservationBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        release_reservation_request(&state_for_task, &operator, &reservation_id, &body)
+    })
+    .await;
+    match result {
+        Ok(Ok(o)) => Json(o).into_response(),
+        Ok(Err(e)) => material_inventory_error_response("release_reservation", e),
+        Err(je) => internal_error(
+            "release_reservation:join",
+            anyhow!("blocking task panicked: {je}"),
+        ),
+    }
+}
+
+/// `POST /api/inventory-reservations/:id/consume` — physically draw down.
+async fn handle_consume_reservation(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(reservation_id): AxumPath<String>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        consume_reservation_request(&state_for_task, &operator, &reservation_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(o)) => Json(o).into_response(),
+        Ok(Err(e)) => material_inventory_error_response("consume_reservation", e),
+        Err(je) => internal_error(
+            "consume_reservation:join",
+            anyhow!("blocking task panicked: {je}"),
+        ),
+    }
+}
+
+/// `POST /api/inventory-balances/:grade/certs` — file a material certificate.
+async fn handle_attach_material_cert(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(grade): AxumPath<String>,
+    Json(body): Json<AttachMaterialCertBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        attach_material_cert_request(&state_for_task, &operator, &grade, &body)
+    })
+    .await;
+    match result {
+        Ok(Ok(r)) => (StatusCode::CREATED, Json(r)).into_response(),
+        Ok(Err(e)) => material_inventory_error_response("attach_material_cert", e),
+        Err(je) => internal_error(
+            "attach_material_cert:join",
+            anyhow!("blocking task panicked: {je}"),
+        ),
+    }
+}
+
+/// `GET /api/inventory-balances/:grade/certs` — the certs filed on a grade.
+async fn handle_list_material_certs(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(grade): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || list_material_certs_request(&state_for_task, &grade))
+            .await;
+    match result {
+        Ok(Ok(certs)) => Json(serde_json::json!({ "certs": certs })).into_response(),
+        Ok(Err(e)) => internal_error("list_material_certs", e),
+        Err(je) => internal_error(
+            "list_material_certs:join",
+            anyhow!("blocking task panicked: {je}"),
         ),
     }
 }

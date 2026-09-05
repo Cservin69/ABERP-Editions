@@ -305,6 +305,23 @@ treatment — which needs blob storage and a document-type discriminator.
 **Size.** Medium — reserve/release/consume is a real inventory state
 machine, not just three appends.
 
+**Now Live.** The material-side reservation FSM
+(`reserve` → `release` / `consume`) is implemented on the shared
+`aberp_db::Handle` with each transition emitting its audit kind
+(`inventory.material_reserved` / `_released` / `_consumed`) inside the
+same tx (`apps/aberp/src/material_inventory.rs`). Certificate capture
+(`material.cert_attached` — mill cert / CoA / heat treatment) records a
+kind + validated URL (`https` / `http` / `file`, ≤2048 chars) against a
+material grade. Operator HTTP routes are wired and exercised end-to-end
+against a real `AppState` in `apps/aberp/tests/serve_material_routes.rs`:
+`POST /api/inventory-balances/:grade/reserve`,
+`POST /api/inventory-reservations/:id/{release,consume}`, and
+`GET`/`POST /api/inventory-balances/:grade/certs`. Typed errors map to
+409 (insufficient / illegal transition), 404 (unknown reservation), 400
+(bad cert kind/url). The certs took a document-type discriminator + URL
+reference rather than in-app blob storage. Remaining increment: the SPA
+Tauri commands + `api.ts` bindings for these routes.
+
 <a id="d-12"></a>
 ### D-12 — Out-of-band quote acceptance writeback
 

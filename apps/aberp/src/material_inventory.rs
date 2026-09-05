@@ -822,7 +822,7 @@ fn read_reservation_in_tx(
 
 /// Outcome of a reserve / release / consume transition. `previous_state`
 /// is `None` for a fresh reserve.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MaterialReservationOutcome {
     pub reservation_id: String,
     /// The quote the reservation is held against — the caller's quote on a
