@@ -322,7 +322,7 @@
                     class:report-row--active={selected?.report.qcr_id === r.qcr_id}
                     onclick={() => void openReport(r.qcr_id)}
                   >
-                    <td class="mono">{r.report_number || "— (draft)"}</td>
+                    <td class="mono">{r.report_number || "—"}</td>
                     <td>{reportKindLabel(r.report_kind)}</td>
                     <td><span class={toneClass(stateTone(r.state))}>{stateLabel(r.state)}</span></td>
                     <td>

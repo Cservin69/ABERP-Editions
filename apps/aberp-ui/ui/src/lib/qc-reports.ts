@@ -51,6 +51,35 @@ export const DRAFTABLE_KINDS: ReadonlyArray<{
   { input: "coc", wire: "certificate_of_conformance", label: "Certificate of Conformance" },
 ];
 
+// ── Kind ↔ template compatibility ───────────────────────────────────────
+//
+// MIRRORS the backend `QcReportTemplate::permits(kind)`: not every template
+// produces every kind, and the backend rejects an incompatible pair at draft
+// (400 "template X does not produce a Y report"). The screen filters the
+// template picker by the chosen kind to pre-empt that. AbenStandard covers
+// the per-shipment pair (dimensional + CoC); As9102RevC covers everything; a
+// FAIR is an AS9102 artefact and needs As9102RevC.
+export function templatePermitsKind(
+  template: QcReportTemplate,
+  kind: QcReportKindInput,
+): boolean {
+  switch (template) {
+    case "aben_standard":
+      return kind === "dimensional_inspection" || kind === "coc";
+    case "as9102_rev_c":
+      return true;
+    case "coc_only":
+      return kind === "coc";
+  }
+}
+
+/** The explicit templates that can produce this kind (excludes the
+ * "customer default" option, which the caller adds separately). */
+export function templatesForKind(kind: QcReportKindInput): QcReportTemplate[] {
+  const all: QcReportTemplate[] = ["aben_standard", "as9102_rev_c", "coc_only"];
+  return all.filter((t) => templatePermitsKind(t, kind));
+}
+
 // ── Display labels (English — the certificate surface is a US/aerospace
 //    compliance artifact; the ERP chrome around it is bilingual elsewhere) ─
 

@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   draftTokenForKind,
+  templatePermitsKind,
+  templatesForKind,
   DRAFTABLE_KINDS,
   reportKindLabel,
   stateTone,
@@ -38,6 +40,32 @@ describe("CoC wire/storage token split", () => {
     for (const k of DRAFTABLE_KINDS) {
       expect(draftTokenForKind(k.wire)).toBe(k.input);
     }
+  });
+});
+
+describe("kind↔template compatibility mirrors the backend permits()", () => {
+  it("ÁBEN standard produces dimensional + CoC, but not a FAIR", () => {
+    expect(templatePermitsKind("aben_standard", "dimensional_inspection")).toBe(true);
+    expect(templatePermitsKind("aben_standard", "coc")).toBe(true);
+    expect(templatePermitsKind("aben_standard", "as9102_fair")).toBe(false);
+  });
+  it("AS9102 Rev C produces every kind; CoC-only produces only a CoC", () => {
+    expect(templatePermitsKind("as9102_rev_c", "as9102_fair")).toBe(true);
+    expect(templatePermitsKind("as9102_rev_c", "dimensional_inspection")).toBe(true);
+    expect(templatePermitsKind("coc_only", "coc")).toBe(true);
+    expect(templatePermitsKind("coc_only", "dimensional_inspection")).toBe(false);
+  });
+  it("templatesForKind lists only the compatible templates", () => {
+    expect(templatesForKind("as9102_fair")).toEqual(["as9102_rev_c"]);
+    expect(templatesForKind("dimensional_inspection")).toEqual([
+      "aben_standard",
+      "as9102_rev_c",
+    ]);
+    expect(templatesForKind("coc")).toEqual([
+      "aben_standard",
+      "as9102_rev_c",
+      "coc_only",
+    ]);
   });
 });
 

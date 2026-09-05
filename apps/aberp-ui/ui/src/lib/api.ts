@@ -5884,7 +5884,8 @@ export type QcInspectionMethod =
  * frozen at draft time. */
 export interface QcReport {
   qcr_id: string;
-  /** Allocated at issue (monotonic per year); blank/empty until issued. */
+  /** Allocated at draft/freeze (monotonic per year) and stable thereafter —
+   * a drafted report already carries its number. */
   report_number: string;
   report_kind: QcReportKind;
   template: QcReportTemplate;

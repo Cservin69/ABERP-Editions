@@ -13,6 +13,9 @@
     emptyDraftForm,
     qcErrorMessage,
     validateDraftForm,
+    templateLabel,
+    templatePermitsKind,
+    templatesForKind,
     type DraftFormState,
   } from "../lib/qc-reports";
 
@@ -37,6 +40,19 @@
   // sync it onto the form state (satisfies the reactive-capture lint).
   $effect(() => {
     form.woId = woId;
+  });
+
+  // The explicit templates that can produce the chosen kind (the backend
+  // rejects an incompatible pair). "Customer default" is offered separately.
+  let allowedTemplates = $derived(templatesForKind(form.kind));
+
+  // If the kind changes so the currently-picked explicit template no longer
+  // produces it (e.g. switching Dimensional→FAIR while on ÁBEN standard),
+  // fall back to the customer default rather than send a doomed request.
+  $effect(() => {
+    if (form.template !== "" && !templatePermitsKind(form.template, form.kind)) {
+      form.template = "";
+    }
   });
   let submitError: string | null = $state(null);
   let fieldErrors: Record<string, string> = $state({});
@@ -106,12 +122,15 @@
             .value as DraftFormState["template"])}
       >
         <option value="">Customer default</option>
-        <option value="aben_standard">ÁBEN standard</option>
-        <option value="as9102_rev_c">AS9102 Rev C</option>
-        <option value="coc_only">CoC only</option>
+        {#each allowedTemplates as t (t)}
+          <option value={t}>{templateLabel(t)}</option>
+        {/each}
       </select>
       <span class="field__hint">
-        Leave on “Customer default” to use the partner’s configured template.
+        Only templates that produce a {DRAFTABLE_KINDS.find(
+          (k) => k.input === form.kind,
+        )?.label ?? "report"} are listed. “Customer default” uses the partner’s
+        configured template (which must also produce this kind).
       </span>
     </label>
 
