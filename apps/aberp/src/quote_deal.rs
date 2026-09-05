@@ -585,7 +585,9 @@ pub fn run_deal_saga(
                             // variants (D-11) are unreachable here; map them
                             // defensively rather than widen DealSagaError.
                             MaterialInventoryError::ReservationNotFound { .. }
-                            | MaterialInventoryError::IllegalTransition { .. } => anyhow!(
+                            | MaterialInventoryError::IllegalTransition { .. }
+                            | MaterialInventoryError::CertKindUnknown { .. }
+                            | MaterialInventoryError::CertUrlInvalid { .. } => anyhow!(
                                 "DEAL saga material commit (unexpected transition error): {inv}"
                             ),
                         }

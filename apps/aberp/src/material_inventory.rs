@@ -237,6 +237,16 @@ pub enum MaterialInventoryError {
         from: &'static str,
         attempted: &'static str,
     },
+    /// D-11 — `attach_material_cert` was given a `cert_kind` outside the
+    /// closed vocab (`mill_cert` / `cofa` / `heat_treatment`).
+    #[error("unknown cert_kind `{cert_kind}` (expected mill_cert / cofa / heat_treatment)")]
+    CertKindUnknown { cert_kind: String },
+    /// D-11 — the cert retention URL is empty, over-long, or not one of the
+    /// accepted schemes (`https://` / `http://` / `file://`). The URL is a
+    /// reference to where the document is retained; the bytes are not stored
+    /// here (same posture as the MTR `file://` reference).
+    #[error("invalid cert_url: {reason}")]
+    CertUrlInvalid { reason: String },
 }
 
 impl MaterialInventoryError {
@@ -247,6 +257,8 @@ impl MaterialInventoryError {
             MaterialInventoryError::InsufficientMaterial { .. } => "insufficient_material",
             MaterialInventoryError::ReservationNotFound { .. } => "reservation_not_found",
             MaterialInventoryError::IllegalTransition { .. } => "illegal_reservation_transition",
+            MaterialInventoryError::CertKindUnknown { .. } => "cert_kind_unknown",
+            MaterialInventoryError::CertUrlInvalid { .. } => "cert_url_invalid",
         }
     }
 }
@@ -1200,6 +1212,264 @@ pub fn append_material_consumed_in_tx(
     Ok(())
 }
 
+// ── D-11 — material certificate capture (material.cert_attached) ──────────
+//
+// A RECORD event (a cert was filed), NOT a state transition (ADR-0074): a
+// grade accrues many certs over its life, each attach an append-only
+// landmark. URL-only — the bytes are NOT stored here; `cert_url` is a
+// reference to where the document is retained (same posture as the MTR
+// `file://` reference). A dedicated encrypted cert-blob store is a separate,
+// deferred item.
+
+/// The certificate-class discriminator (closed vocab, ADR-0074 payload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterialCertKind {
+    /// Mill certificate — the EN 10204 3.1 / material test report.
+    MillCert,
+    /// Certificate of Analysis.
+    Cofa,
+    /// Heat-treatment certificate.
+    HeatTreatment,
+}
+
+impl MaterialCertKind {
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            MaterialCertKind::MillCert => "mill_cert",
+            MaterialCertKind::Cofa => "cofa",
+            MaterialCertKind::HeatTreatment => "heat_treatment",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "mill_cert" => Some(MaterialCertKind::MillCert),
+            "cofa" => Some(MaterialCertKind::Cofa),
+            "heat_treatment" => Some(MaterialCertKind::HeatTreatment),
+            _ => None,
+        }
+    }
+
+    pub const ALL: [MaterialCertKind; 3] = [
+        MaterialCertKind::MillCert,
+        MaterialCertKind::Cofa,
+        MaterialCertKind::HeatTreatment,
+    ];
+}
+
+const MATERIAL_CERTIFICATES_SCHEMA_SQL: &str = "
+CREATE TABLE IF NOT EXISTS material_certificates (
+    cert_id              VARCHAR NOT NULL PRIMARY KEY,
+    tenant_id            VARCHAR NOT NULL,
+    material_grade       VARCHAR NOT NULL,
+    cert_kind            VARCHAR NOT NULL,
+    cert_url             VARCHAR NOT NULL,
+    lot_id               VARCHAR,
+    attached_at_utc      VARCHAR NOT NULL,
+    attached_by_operator VARCHAR NOT NULL
+);
+";
+
+/// Validate the cert retention URL: non-empty, length-capped, and one of the
+/// accepted schemes. The bytes are never fetched or stored — this only
+/// constrains the reference shape (mirrors `validate_mtr_url`'s posture, but
+/// admits `https`/`http` too, since a cert may live in an off-box archive).
+fn validate_cert_url(url: &str) -> std::result::Result<String, MaterialInventoryError> {
+    let u = url.trim();
+    if u.is_empty() {
+        return Err(MaterialInventoryError::CertUrlInvalid {
+            reason: "empty".to_string(),
+        });
+    }
+    if u.len() > 2048 {
+        return Err(MaterialInventoryError::CertUrlInvalid {
+            reason: format!("too long ({} chars, max 2048)", u.len()),
+        });
+    }
+    if !(u.starts_with("https://") || u.starts_with("http://") || u.starts_with("file://")) {
+        return Err(MaterialInventoryError::CertUrlInvalid {
+            reason: "must start with https:// / http:// / file://".to_string(),
+        });
+    }
+    Ok(u.to_string())
+}
+
+/// One filed material certificate row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaterialCertRecord {
+    pub cert_id: String,
+    pub material_grade: String,
+    pub cert_kind: MaterialCertKind,
+    pub cert_url: String,
+    pub lot_id: Option<String>,
+    pub attached_at_utc: String,
+    pub attached_by_operator: String,
+}
+
+/// Attach a certificate to a material grade. Validates the kind + URL, inserts
+/// an append-only `material_certificates` row, and returns it. The caller
+/// emits [`EventKind::MaterialCertAttached`] via
+/// [`append_material_cert_attached_in_tx`] inside the same tx.
+#[allow(clippy::too_many_arguments)]
+pub fn attach_material_cert_in_tx(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    material_grade: &str,
+    cert_kind: &str,
+    cert_url: &str,
+    lot_id: Option<&str>,
+    operator: &str,
+    now: OffsetDateTime,
+) -> Result<MaterialCertRecord> {
+    tx.execute_batch(MATERIAL_CERTIFICATES_SCHEMA_SQL)
+        .context("ensure material_certificates schema")?;
+    let kind = MaterialCertKind::from_db_str(cert_kind.trim()).ok_or_else(|| {
+        anyhow::Error::new(MaterialInventoryError::CertKindUnknown {
+            cert_kind: cert_kind.to_string(),
+        })
+    })?;
+    let url = validate_cert_url(cert_url).map_err(anyhow::Error::new)?;
+    let lot = lot_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let cert_id = format!("mcert_{}", Ulid::new());
+    let now_iso = now.format(&Rfc3339).context("format now for cert attach")?;
+    tx.execute(
+        "INSERT INTO material_certificates (
+            cert_id, tenant_id, material_grade, cert_kind, cert_url,
+            lot_id, attached_at_utc, attached_by_operator
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            &cert_id,
+            tenant,
+            material_grade.trim(),
+            kind.as_db_str(),
+            &url,
+            &lot,
+            &now_iso,
+            operator,
+        ],
+    )
+    .context("INSERT material_certificates")?;
+    Ok(MaterialCertRecord {
+        cert_id,
+        material_grade: material_grade.trim().to_string(),
+        cert_kind: kind,
+        cert_url: url,
+        lot_id: lot,
+        attached_at_utc: now_iso,
+        attached_by_operator: operator.to_string(),
+    })
+}
+
+/// Read the certificates filed against a material grade, newest first.
+pub fn list_material_certs(
+    conn: &Connection,
+    tenant: &str,
+    material_grade: &str,
+) -> Result<Vec<MaterialCertRecord>> {
+    // A read-only conn just queries (schema is created by a writer); a
+    // writable conn ensures the table first (ADR-0098 posture).
+    if !aberp_audit_ledger::connection_is_read_only(conn) {
+        conn.execute_batch(MATERIAL_CERTIFICATES_SCHEMA_SQL)
+            .context("ensure material_certificates schema for read")?;
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT cert_id, material_grade, cert_kind, cert_url, lot_id,
+                    attached_at_utc, attached_by_operator
+               FROM material_certificates
+              WHERE tenant_id = ?1 AND material_grade = ?2
+              ORDER BY attached_at_utc DESC, cert_id DESC",
+        )
+        .context("prepare list_material_certs")?;
+    let rows = stmt
+        .query_map(params![tenant, material_grade.trim()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })
+        .context("query list_material_certs")?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (cert_id, grade, kind_str, cert_url, lot_id, at, by) =
+            row.context("read material_certificates row")?;
+        let cert_kind = MaterialCertKind::from_db_str(&kind_str).ok_or_else(|| {
+            anyhow::anyhow!("material_certificates.cert_kind {kind_str:?} is not a known kind")
+        })?;
+        out.push(MaterialCertRecord {
+            cert_id,
+            material_grade: grade,
+            cert_kind,
+            cert_url,
+            lot_id,
+            attached_at_utc: at,
+            attached_by_operator: by,
+        });
+    }
+    Ok(out)
+}
+
+/// Payload for [`EventKind::MaterialCertAttached`] — matches the ADR-0074
+/// pinned shape. `material_id` carries the material grade the cert backs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MaterialCertAttachedPayload {
+    pub material_id: String,
+    pub cert_kind: String,
+    pub cert_url: String,
+    pub attached_at_ms: i64,
+    pub operator_user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lot_id: Option<String>,
+}
+
+impl MaterialCertAttachedPayload {
+    /// Build from a filed record + the attach instant (epoch-ms).
+    pub fn from_record(record: &MaterialCertRecord, now: OffsetDateTime) -> Self {
+        Self {
+            material_id: record.material_grade.clone(),
+            cert_kind: record.cert_kind.as_db_str().to_string(),
+            cert_url: record.cert_url.clone(),
+            attached_at_ms: (now.unix_timestamp_nanos() / 1_000_000) as i64,
+            operator_user_id: record.attached_by_operator.clone(),
+            lot_id: record.lot_id.clone(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialize MaterialCertAttachedPayload")
+    }
+}
+
+/// Append the `material.cert_attached` audit entry inside the caller's tx.
+/// Idempotency key `material_cert:<cert_id>`.
+pub fn append_material_cert_attached_in_tx(
+    tx: &Transaction<'_>,
+    ledger_meta: &LedgerMeta,
+    ledger_actor: Actor,
+    cert_id: &str,
+    payload: &MaterialCertAttachedPayload,
+) -> Result<()> {
+    append_in_tx(
+        tx,
+        ledger_meta,
+        EventKind::MaterialCertAttached,
+        payload.to_bytes(),
+        ledger_actor,
+        Some(format!("material_cert:{cert_id}")),
+    )
+    .context("audit append MaterialCertAttached")?;
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // S432 (ADR-0085) — heat-lot traceability assignment.
 //
@@ -1649,6 +1919,144 @@ mod tests {
         // The released payload carried the operator reason.
         assert_eq!(relp.reason.as_deref(), Some("superseded"));
         assert_eq!(relp.previous_state.as_deref(), Some("reserved"));
+    }
+
+    // ── D-11 material.cert_attached ─────────────────────────────────────
+
+    #[test]
+    fn cert_kind_round_trips_every_variant() {
+        for v in MaterialCertKind::ALL {
+            assert_eq!(MaterialCertKind::from_db_str(v.as_db_str()), Some(v));
+        }
+        assert!(MaterialCertKind::from_db_str("bogus").is_none());
+    }
+
+    #[test]
+    fn attach_cert_inserts_and_reads_back_newest_first() {
+        let mut conn = open_conn();
+        let now = OffsetDateTime::now_utc();
+        let tx = conn.transaction().unwrap();
+        let a = attach_material_cert_in_tx(
+            &tx,
+            "t",
+            "6061-T6",
+            "mill_cert",
+            "file:///certs/mtr-heat-9921.pdf",
+            Some("LOT-2026-0042"),
+            "op-1",
+            now,
+        )
+        .unwrap();
+        let b = attach_material_cert_in_tx(
+            &tx,
+            "t",
+            "6061-T6",
+            "cofa",
+            "https://certs.example/coa/abc.pdf",
+            None,
+            "op-1",
+            now + time::Duration::seconds(1),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(a.cert_kind, MaterialCertKind::MillCert);
+        assert_eq!(a.lot_id.as_deref(), Some("LOT-2026-0042"));
+        assert_eq!(b.lot_id, None);
+        assert!(a.cert_id.starts_with("mcert_"));
+
+        let certs = list_material_certs(&conn, "t", "6061-T6").unwrap();
+        assert_eq!(certs.len(), 2);
+        // Newest first: the CoA (later timestamp) leads.
+        assert_eq!(certs[0].cert_id, b.cert_id);
+        assert_eq!(certs[1].cert_id, a.cert_id);
+        // Grade-scoped: another grade sees none.
+        assert!(list_material_certs(&conn, "t", "316").unwrap().is_empty());
+    }
+
+    #[test]
+    fn attach_cert_rejects_unknown_kind() {
+        let mut conn = open_conn();
+        let tx = conn.transaction().unwrap();
+        let err = attach_material_cert_in_tx(
+            &tx,
+            "t",
+            "g",
+            "not_a_cert",
+            "https://x/y.pdf",
+            None,
+            "op",
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap_err();
+        assert_eq!(machine_code_of(&err), "cert_kind_unknown");
+    }
+
+    #[test]
+    fn attach_cert_rejects_bad_url() {
+        let mut conn = open_conn();
+        let tx = conn.transaction().unwrap();
+        for bad in ["", "   ", "ftp://x/y", "just-a-path.pdf"] {
+            let err = attach_material_cert_in_tx(
+                &tx,
+                "t",
+                "g",
+                "mill_cert",
+                bad,
+                None,
+                "op",
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap_err();
+            assert_eq!(machine_code_of(&err), "cert_url_invalid", "url={bad:?}");
+        }
+    }
+
+    #[test]
+    fn attach_cert_emits_material_cert_attached_with_pinned_payload_shape() {
+        let mut conn = open_conn();
+        let meta = ledger_meta();
+        let now = OffsetDateTime::now_utc();
+        let tx = conn.transaction().unwrap();
+        let rec = attach_material_cert_in_tx(
+            &tx,
+            "t",
+            "6061-T6",
+            "heat_treatment",
+            "https://certs.example/ht/xyz.pdf",
+            Some("LOT-7"),
+            "op-1",
+            now,
+        )
+        .unwrap();
+        let payload = MaterialCertAttachedPayload::from_record(&rec, now);
+        append_material_cert_attached_in_tx(
+            &tx,
+            &meta,
+            Actor::from_local_cli(Ulid::new().to_string(), "op-1"),
+            &rec.cert_id,
+            &payload,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(count_kind(&conn, "material.cert_attached"), 1);
+        // Pinned shape: material_id carries the grade; ms is epoch-ms.
+        assert_eq!(payload.material_id, "6061-T6");
+        assert_eq!(payload.cert_kind, "heat_treatment");
+        assert_eq!(payload.lot_id.as_deref(), Some("LOT-7"));
+        assert!(payload.attached_at_ms > 1_600_000_000_000);
+        let json: serde_json::Value = serde_json::from_slice(&payload.to_bytes()).unwrap();
+        for k in [
+            "material_id",
+            "cert_kind",
+            "cert_url",
+            "attached_at_ms",
+            "operator_user_id",
+            "lot_id",
+        ] {
+            assert!(json.get(k).is_some(), "payload missing {k}");
+        }
     }
 
     /// Happy path: first DEAL against a material with positive on_hand
