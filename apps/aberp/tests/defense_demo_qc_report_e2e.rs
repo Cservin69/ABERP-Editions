@@ -14,7 +14,7 @@
 
 use aberp::{demo_seed, qc_report, serve};
 use aberp_audit_ledger::{BinaryHash, TenantId};
-use aberp_qa::{QcReportKind, QcReportState, QcReportTemplate};
+use aberp_qa::{QcReportKind, QcReportState};
 use duckdb::Connection;
 use time::OffsetDateTime;
 
@@ -86,13 +86,12 @@ fn seeded_delivery_drafts_issues_and_renders_a_qc_report() {
         qc_report::DraftReportRequest {
             wo_id: wo_id.clone(),
             report_kind: QcReportKind::As9102Fair,
-            // An AS9102 FAIR requires the AS9102 Rev C template — the backend
-            // rejects the house `aben_standard` default for this kind, so the
-            // operator (and this test) must pick the compatible template. The
-            // screen surfaces that 400 inline; a demo-seed follow-up could set
-            // the aerospace partner's default template to As9102RevC so the
-            // FAIR drafts with no override.
-            template: Some(QcReportTemplate::As9102RevC),
+            // Template = None → resolve the customer's default. The seed sets
+            // the aerospace customer's default to AS9102 Rev C, which is the
+            // ONLY template that produces a FAIR — so this one-click path (no
+            // override) works. If the seed regressed that default, this draft
+            // would 400 ("aben_standard does not produce as9102_fair").
+            template: None,
             notes: None,
         },
     )
@@ -116,6 +115,17 @@ fn seeded_delivery_drafts_issues_and_renders_a_qc_report() {
         drafted.report.characteristics_required,
         "measured + unaccounted must reconcile to required (AS9102 accountability)"
     );
+    // The bracket carries a seeded drawing reference, so the FAIR names the
+    // drawing it was inspected against (a compliance document whose job is to
+    // name the revision) rather than printing a blank. Both seeded deliveries
+    // are bracket batches, so the reportable WO resolves the bracket drawing.
+    assert_eq!(
+        drafted.report.drawing_number.as_deref(),
+        Some("LG-BRKT-4412"),
+        "the seeded bracket drawing number rides onto the report"
+    );
+    assert_eq!(drafted.report.drawing_rev.as_deref(), Some("C"));
+
     // Not issued yet: no pinned hash. The report_number, however, IS
     // allocated at draft/freeze time (not at issue), so it is already set.
     assert!(drafted.report.rendered_sha256.is_none());

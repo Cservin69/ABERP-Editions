@@ -564,6 +564,36 @@ fn seed_master_data(
     .id;
     s.products += 4;
 
+    // ADR-0199 — QC-report readiness for the aerospace customer.
+    //  • Default the customer's QC-report template to AS9102 Rev C, so an
+    //    AS9102 First Article (FAIR) drafts against this delivery with NO
+    //    per-report template override (the house `aben_standard` default does
+    //    not produce a FAIR, so without this the demo would need the operator
+    //    to pick the template by hand).
+    //  • Give the bracket a drawing number + revision, so the FAIR / CoC names
+    //    the drawing it was inspected against instead of printing a blank.
+    partners::set_qc_report_template(
+        &guard,
+        t,
+        &cast.customer_partner_id,
+        Some(aberp_qa::QcReportTemplate::As9102RevC),
+    )
+    .context("set the demo customer's default QC-report template")?;
+    aberp_qa::ensure_schema(&guard)
+        .map_err(|e| anyhow::anyhow!("ensure qa/qc schema for the drawing ref: {e}"))?;
+    aberp_qa::record_drawing_ref(
+        &mut guard,
+        t,
+        aberp_qa::NewPartDrawingRef {
+            product_id: cast.bracket_product_id.clone(),
+            drawing_number: "LG-BRKT-4412".to_string(),
+            drawing_rev: "C".to_string(),
+        },
+        DEMO_OPERATOR,
+        OffsetDateTime::now_utc(),
+    )
+    .context("seed the bracket drawing reference")?;
+
     // Re-order points. `products::create_product` pre-dates the ADR-0061
     // cache columns, so the SPA's own inventory form is what normally writes
     // these; the seed writes them the same way (a plain UPDATE on the
