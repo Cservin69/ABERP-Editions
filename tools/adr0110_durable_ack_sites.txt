@@ -135,3 +135,4 @@ apps/aberp/src/observe_receiver_confirmation.rs	run	"observe-receiver-confirmati
 apps/aberp/src/recover_from_nav.rs	run	"chain reconstructed" — the LOCAL record of a submission NAV already holds
 apps/aberp/src/mark_abandoned.rs	run	"mark-abandoned OK" (terminal; the sequence is never reused)
 apps/aberp/src/request_technical_annulment.rs	run	"request-technical-annulment" — the decision to withdraw a filed submission
+apps/aberp/src/demo_seed.rs	run	demo-seed durability — a power loss between the seed and first launch still boots a seeded tenant
