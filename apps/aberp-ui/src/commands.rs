@@ -1174,6 +1174,95 @@ pub async fn material_traceability(
     forward_get(&state, &path, true).await
 }
 
+// ── D-11 — material reservation FSM + certificate capture ───────────
+//
+// Thin bridges over the operator routes: the backend re-validates every
+// input authoritatively (quantity vs on-hand, the reservation state
+// machine, the cert kind/URL) and appends the audit kind in-tx. The
+// grade / reservation id are URL-encoded into the path (a grade may
+// carry a space, e.g. "Inconel 718").
+
+/// D-11 — `POST /api/inventory-balances/:grade/reserve` — soft-earmark
+/// `qty` of a grade against a quote (defaults to `manual`). `qty_unit_kind`
+/// is `kg` when omitted.
+#[tauri::command]
+pub async fn reserve_material(
+    state: State<'_, AppState>,
+    grade: String,
+    qty: f64,
+    qty_unit_kind: Option<String>,
+    quote_id: Option<String>,
+) -> Result<Value, String> {
+    let path = format!("/api/inventory-balances/{}/reserve", urlencode(&grade));
+    let body = serde_json::json!({
+        "qty": qty,
+        "qty_unit_kind": qty_unit_kind,
+        "quote_id": quote_id,
+    });
+    forward_post(&state, &path, body).await
+}
+
+/// D-11 — `POST /api/inventory-reservations/:id/release` — return an
+/// earmark to the pool with an optional operator reason.
+#[tauri::command]
+pub async fn release_reservation(
+    state: State<'_, AppState>,
+    reservation_id: String,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let path = format!(
+        "/api/inventory-reservations/{}/release",
+        urlencode(&reservation_id)
+    );
+    let body = serde_json::json!({ "reason": reason });
+    forward_post(&state, &path, body).await
+}
+
+/// D-11 — `POST /api/inventory-reservations/:id/consume` — physically
+/// draw a reserved earmark down out of stock.
+#[tauri::command]
+pub async fn consume_reservation(
+    state: State<'_, AppState>,
+    reservation_id: String,
+) -> Result<Value, String> {
+    let path = format!(
+        "/api/inventory-reservations/{}/consume",
+        urlencode(&reservation_id)
+    );
+    forward_post(&state, &path, Value::Null).await
+}
+
+/// D-11 — `POST /api/inventory-balances/:grade/certs` — file a material
+/// certificate (`mill_cert` / `cofa` / `heat_treatment`) as a validated
+/// URL reference, optionally bound to a lot.
+#[tauri::command]
+pub async fn attach_material_cert(
+    state: State<'_, AppState>,
+    grade: String,
+    cert_kind: String,
+    cert_url: String,
+    lot_id: Option<String>,
+) -> Result<Value, String> {
+    let path = format!("/api/inventory-balances/{}/certs", urlencode(&grade));
+    let body = serde_json::json!({
+        "cert_kind": cert_kind,
+        "cert_url": cert_url,
+        "lot_id": lot_id,
+    });
+    forward_post(&state, &path, body).await
+}
+
+/// D-11 — `GET /api/inventory-balances/:grade/certs` — the certificates
+/// filed on a grade, newest first.
+#[tauri::command]
+pub async fn list_material_certs(
+    state: State<'_, AppState>,
+    grade: String,
+) -> Result<Value, String> {
+    let path = format!("/api/inventory-balances/{}/certs", urlencode(&grade));
+    forward_get(&state, &path, true).await
+}
+
 // ── PR-172 — notes-history typeahead source ─────────────────────────
 
 /// PR-172 — `GET /api/notes-history?scope=line|invoice|storno`. Used

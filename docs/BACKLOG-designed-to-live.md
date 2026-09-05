@@ -319,8 +319,13 @@ against a real `AppState` in `apps/aberp/tests/serve_material_routes.rs`:
 `GET`/`POST /api/inventory-balances/:grade/certs`. Typed errors map to
 409 (insufficient / illegal transition), 404 (unknown reservation), 400
 (bad cert kind/url). The certs took a document-type discriminator + URL
-reference rather than in-app blob storage. Remaining increment: the SPA
-Tauri commands + `api.ts` bindings for these routes.
+reference rather than in-app blob storage. The SPA bridge is wired too —
+`apps/aberp-ui/src/commands.rs` exposes `reserve_material`,
+`release_reservation`, `consume_reservation`, `attach_material_cert`, and
+`list_material_certs` (registered in `lib.rs`), with typed `api.ts`
+bindings (`reserveMaterial` / `releaseReservation` / `consumeReservation`
+/ `attachMaterialCert` / `listMaterialCerts`). Remaining (optional): an
+operator SPA screen wiring these bindings into a reservations panel.
 
 <a id="d-12"></a>
 ### D-12 — Out-of-band quote acceptance writeback

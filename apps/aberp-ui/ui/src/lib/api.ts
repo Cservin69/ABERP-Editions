@@ -2769,6 +2769,114 @@ export async function materialTraceability(params: {
   });
 }
 
+// ── D-11 — material reservation FSM + certificate capture ────────────
+
+/** D-11 — the material-reservation FSM states (serde snake_case). */
+export type ReservationState =
+  | "reserved"
+  | "committed"
+  | "consumed"
+  | "released";
+
+/** D-11 — outcome of reserve / release / consume. `previous_state` is
+ * `null` on a fresh reserve; `balance_after` is the grade's balance row
+ * as it stands after the transition committed. */
+export interface MaterialReservationOutcome {
+  reservation_id: string;
+  quote_id: string;
+  material_grade: string;
+  qty: number;
+  qty_unit_kind: "units" | "kg";
+  previous_state: ReservationState | null;
+  new_state: ReservationState;
+  balance_after: InventoryBalance;
+}
+
+/** D-11 — the kind of material certificate on file (serde snake_case). */
+export type MaterialCertKind = "mill_cert" | "cofa" | "heat_treatment";
+
+/** D-11 — one row of `material_certificates`: a validated URL reference
+ * (`https` / `http` / `file`), optionally bound to a lot. */
+export interface MaterialCertRecord {
+  cert_id: string;
+  material_grade: string;
+  cert_kind: MaterialCertKind;
+  cert_url: string;
+  lot_id: string | null;
+  attached_at_utc: string;
+  attached_by_operator: string;
+}
+
+/** D-11 — `GET /api/inventory-balances/:grade/certs` response. */
+export interface MaterialCertsResult {
+  certs: MaterialCertRecord[];
+}
+
+/** D-11 — `POST /api/inventory-balances/:grade/reserve`. Soft-earmark
+ * `qty` of a grade against a quote (`quoteId` → `manual` when omitted).
+ * `qtyUnitKind` defaults to `kg`. Backend 409 when the earmark would push
+ * available stock negative. */
+export async function reserveMaterial(
+  grade: string,
+  qty: number,
+  opts?: { qtyUnitKind?: "units" | "kg"; quoteId?: string },
+): Promise<MaterialReservationOutcome> {
+  return invoke<MaterialReservationOutcome>("reserve_material", {
+    grade,
+    qty,
+    qtyUnitKind: opts?.qtyUnitKind ?? null,
+    quoteId: opts?.quoteId ?? null,
+  });
+}
+
+/** D-11 — `POST /api/inventory-reservations/:id/release`. Return an
+ * earmark to the pool with an optional reason. Backend 404 when the
+ * reservation is unknown, 409 on an already-terminal reservation. */
+export async function releaseReservation(
+  reservationId: string,
+  reason: string | null = null,
+): Promise<MaterialReservationOutcome> {
+  return invoke<MaterialReservationOutcome>("release_reservation", {
+    reservationId,
+    reason,
+  });
+}
+
+/** D-11 — `POST /api/inventory-reservations/:id/consume`. Physically draw
+ * a reserved earmark down out of stock. Backend 404 / 409 as for release. */
+export async function consumeReservation(
+  reservationId: string,
+): Promise<MaterialReservationOutcome> {
+  return invoke<MaterialReservationOutcome>("consume_reservation", {
+    reservationId,
+  });
+}
+
+/** D-11 — `POST /api/inventory-balances/:grade/certs`. File a material
+ * certificate as a validated URL reference, optionally bound to a lot.
+ * Backend 400 on an unknown kind or a bad URL. */
+export async function attachMaterialCert(
+  grade: string,
+  certKind: MaterialCertKind,
+  certUrl: string,
+  lotId: string | null = null,
+): Promise<MaterialCertRecord> {
+  return invoke<MaterialCertRecord>("attach_material_cert", {
+    grade,
+    certKind,
+    certUrl,
+    lotId,
+  });
+}
+
+/** D-11 — `GET /api/inventory-balances/:grade/certs`. The certificates
+ * filed on a grade, newest first. */
+export async function listMaterialCerts(
+  grade: string,
+): Promise<MaterialCertsResult> {
+  return invoke<MaterialCertsResult>("list_material_certs", { grade });
+}
+
 /** S438 — one traced part with its production + customer chain resolved. */
 export interface PartTraceRow {
   part_uid: string;
