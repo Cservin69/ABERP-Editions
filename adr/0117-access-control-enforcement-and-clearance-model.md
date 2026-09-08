@@ -1,6 +1,8 @@
 # ADR-0117 — Access-control enforcement point and the operator clearance model
 
-- **Status:** Proposed
+- **Status:** Accepted — passed adversarial review 2026-09-08 (seven concerns
+  found; all closed by §8 "Security invariants" and Adversarial review #6–#11
+  below before acceptance)
 - **Date:** 2026-09-08
 - **Deciders:** Ervin Áben
 - **Related:** ADR-0070 (`DigitalIdProvider` — the source of an operator's
@@ -129,11 +131,62 @@ pilot to constrain) and per-artifact ACLs (no sharing model). See Alternatives.
    (future reasons: revocation, time-boxing, two-person-integrity refusal) so a
    later model adds a reason without breaking the pinned payloads.
 
-7. **`granted_by` (ADR-0073 two-person-integrity anchor)** is, in the
-   single-operator pilot, the operator's own identity issuer (a self-service
-   grant). True two-person integrity — a *distinct* approver — is deferred until
-   a second identity exists (Open Q1); the field stays in the payload so the
-   contract does not change when it becomes load-bearing.
+7. **`granted_by` (ADR-0073 two-person-integrity anchor)** must NOT be set to a
+   value that reads as a satisfied two-person control that did not happen. In
+   the single-operator pilot it is the literal sentinel **`"self-service"`** —
+   an honest record that the identity system, not a distinct second human,
+   authorised the access. It is never set to the operator's own
+   `operator_user_id` (which would read as "the operator approved themselves")
+   nor to a bare issuer tag that could be mistaken for an approver. A real
+   distinct approver is Open Q1; the field shape is unchanged when it lands.
+
+8. **Security invariants (the enforcement contract).** These are load-bearing;
+   an implementation that violates any of them is non-conformant, and the
+   follow-on build slices must pin each with a test.
+
+   - **8a. Scope provenance / trust boundary.** `AccessSubject.scope` is
+     populated **only** from `DigitalIdProvider::current_operator()` — the
+     issuer-asserted identity. It is **never** read from request input (no body
+     field, query param, or header may supply or override a scope or clearance).
+     In the pilot the mock issues the set; under D-07 a real backend derives it
+     from the signed CAC/eID certificate (non-forgeable). A route that accepts a
+     caller-supplied clearance is a bypass and is banned.
+   - **8b. Enforcement obligation (control, not just logging).** On
+     `AccessDecision::Denied` the calling site **must withhold the controlled
+     resource** — a **403** on a read, a refusal on an action — and return no
+     part of the controlled content. `authorize` only *decides*; the site's
+     contract is *deny ⇒ no data*. A site that logs a deny and still returns the
+     resource has logged access, not controlled it, and is non-conformant.
+   - **8c. Fail-closed on error.** Any failure resolving the operator identity
+     (`current_operator()` errors), deriving the required clearance, or running
+     the check is a **deny**, never a grant. There is no code path where an
+     error widens access.
+   - **8d. Ledger-first; a failed audit append fails the request.** The access
+     decision's audit append (`cui.access_event` /
+     `personnel.access_granted|_denied`) must be committed **before** a granted
+     resource is released. If the append fails, the request fails (500) — there
+     is **no unlogged grant** (mirrors the QC "a RELEASE writer must be
+     ledger-first" lesson). A denied request that also fails to append is still
+     denied (fail-closed).
+   - **8e. Unmarked ≠ Unclassified.** The **absence** of a `CuiMarking` on a
+     resource is *not* an access-control surface: no `authorize` call, no
+     `cui.access_event`, nothing withheld (an unmarked product reads exactly as
+     it does today). `for_cui_marking` is invoked **only** when a marking
+     exists. An explicit `Unclassified` **marking** is different: it is a
+     deliberate "reviewed, no control required" designation → empty required set
+     → grant **and** a recorded `cui.access_event` (per 32 CFR § 2002.4, every
+     decision on a marked artifact is on the trail).
+   - **8f. Closed required-clearance vocabulary.** The scope tokens the
+     derivation **emits** (`"cui"`, `"clearance:confidential"`,
+     `"clearance:secret"`, `"clearance:top-secret"`) are pinned **constants** in
+     `aberp-compliance::access`, not free strings hand-typed at call sites, so a
+     typo cannot silently flip a policy. (Operator scopes remain
+     issuer-provided strings; a token an operator lacks — whether by policy or
+     by a mis-issued cert — simply denies, fail-closed.)
+   - **8g. Audit `reason` on both arms.** On a **deny**, `reason` /
+     `denied_reason` = `"missing_clearance"` (the `DenyReason`). On a **grant**,
+     `reason` = `"cleared: lawful government purpose"` — a fixed string, so the
+     grant arm is not an empty/None field a walker must special-case.
 
 ## Consequences
 
@@ -199,6 +252,44 @@ in the surrounding tx — ADR-0099) is unchanged.
    guarding (local knowledge); the helper owns *what that resource requires*
    (one place). `authorize` owns the comparison (one place). No site owns the
    grant/deny logic.
+
+*The following seven concerns were surfaced by the 2026-09-08 adversarial pass
+and each is closed by a §8 invariant before acceptance.*
+
+6. **"`subject.scope` is forgeable — a route could accept a client-supplied
+   clearance and self-grant."** *Closed by §8a.* Scopes come **only** from the
+   issuer-asserted `current_operator()`; request input can never supply or
+   override a scope. This is the difference between an authorisation system and
+   an honour system, so it is an invariant, not a convention.
+
+7. **"The ADR logs a decision but never says a deny must WITHHOLD the
+   resource — this is access logging, not access control."** *Closed by §8b.*
+   `Denied` obliges the site to return a 403 / refuse and release no controlled
+   content. Without this the whole ADR would be theatre.
+
+8. **"What happens when `current_operator()` errors, or the audit append
+   fails? A naive impl fails open and leaks."** *Closed by §8c + §8d.* Every
+   error is fail-**closed** (deny), and a granted resource is not released until
+   its access event is committed (ledger-first, no unlogged grant) — the same
+   ordering the QC release-writer lesson forced.
+
+9. **"Does every product read now log a grant? That drowns the trail in
+   noise and mislabels uncontrolled reads."** *Closed by §8e.* An **unmarked**
+   resource is not an access-control surface — no check, no event, read
+   unchanged. Only a resource carrying a `CuiMarking` (including an explicit
+   `Unclassified` one) is on the trail.
+
+10. **"Scope tokens are free strings — a typo (`"CUI"` vs `"cui"`) silently
+    flips policy."** *Closed by §8f.* The tokens the derivation **emits** are
+    pinned constants in one module; a call site cannot hand-type a required
+    token. A mismatch on the operator side merely denies (fail-closed), never
+    grants.
+
+11. **"`granted_by` set to the issuer (or the operator) fakes a two-person
+    control that never happened."** *Closed by §7.* It is the literal
+    `"self-service"` sentinel — an honest "the identity system authorised this,
+    no second human" — never the operator's id and never a bare issuer tag a
+    reader could mistake for an approver. Real two-person integrity is Open Q1.
 
 ## Alternatives considered
 
