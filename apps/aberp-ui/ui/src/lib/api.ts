@@ -2949,6 +2949,81 @@ export async function recordCyberIncident(
   });
 }
 
+// ── D-08 — CUI marking + access-event trail (on a product) ───────────
+
+/** D-08 — classification band. `cui` requires a `category`; the others take
+ * none. */
+export type CuiBand =
+  | "unclassified"
+  | "cui"
+  | "confidential"
+  | "secret"
+  | "top_secret";
+
+/** D-08 — DoD CUI Registry category tokens (this build's starter subset). */
+export type CuiCategory =
+  | "cti"
+  | "prvcy"
+  | "expt"
+  | "crit"
+  | "lei"
+  | "ifg"
+  | "inf"
+  | "isvi"
+  | "proc"
+  | "prop";
+
+/** D-08 — limited-dissemination control tokens. */
+export type CuiDissemination = "noforn" | "fedcon" | "nocon" | "dl_only";
+
+/** D-08 — intake for `POST /api/products/:id/cui-marking`. */
+export interface CuiMarkingInput {
+  band: CuiBand;
+  category?: CuiCategory | null;
+  dissemination?: CuiDissemination[];
+}
+
+/** D-08 — the stored marking. `banner_str` is the authoritative rendered DoD
+ * banner (e.g. `"CUI//SP-CTI//NOFORN"`). */
+export interface CuiMarkingRecord {
+  entity_kind: string;
+  entity_id: string;
+  band: CuiBand;
+  category: string | null;
+  dissemination: string[];
+  banner_str: string;
+  applied_by_operator: string;
+  applied_at_utc: string;
+}
+
+/** D-08 — `POST /api/products/:id/cui-marking`. Apply a CUI/classification
+ * marking; the backend validates + renders the banner. Backend 400 on a bad
+ * band/category/dissemination, 404 when the product does not exist. */
+export async function applyProductCuiMarking(
+  productId: string,
+  input: CuiMarkingInput,
+): Promise<CuiMarkingRecord> {
+  return invoke<CuiMarkingRecord>("apply_product_cui_marking", {
+    productId,
+    band: input.band,
+    category: input.category ?? null,
+    dissemination: input.dissemination ?? [],
+  });
+}
+
+/** D-08 — `GET /api/products/:id/cui-marking`. The product's marking, or
+ * `null` when unmarked. Reading a MARKED product records a CUI access GRANT
+ * server-side. */
+export async function getProductCuiMarking(
+  productId: string,
+): Promise<CuiMarkingRecord | null> {
+  const res = await invoke<{ marking: CuiMarkingRecord | null }>(
+    "get_product_cui_marking",
+    { productId },
+  );
+  return res.marking;
+}
+
 /** S438 — one traced part with its production + customer chain resolved. */
 export interface PartTraceRow {
   part_uid: string;

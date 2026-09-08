@@ -384,6 +384,9 @@ pub fn run() {
             commands::list_material_certs,
             // D-09 — DFARS 252.204-7012 cyber-incident intake.
             commands::record_cyber_incident,
+            // D-08 — CUI marking + access-event trail on a product.
+            commands::apply_product_cui_marking,
+            commands::get_product_cui_marking,
             // S438 (ADR-0089) — per-unit part-UID marking + Part UID Lookup.
             commands::mark_parts,
             commands::part_traceability,

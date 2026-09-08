@@ -1299,6 +1299,41 @@ pub async fn record_cyber_incident(
     forward_post(&state, "/api/cyber-incidents", body).await
 }
 
+// ── D-08 — CUI marking + access-event trail (on a product) ──────────
+
+/// D-08 — `POST /api/products/:id/cui-marking` — apply a CUI/classification
+/// marking to a product. The backend re-validates the band/category/
+/// dissemination and renders the DoD banner authoritatively; a bad value is a
+/// 400, a missing product a 404.
+#[tauri::command]
+pub async fn apply_product_cui_marking(
+    state: State<'_, AppState>,
+    product_id: String,
+    band: String,
+    category: Option<String>,
+    dissemination: Vec<String>,
+) -> Result<Value, String> {
+    let path = format!("/api/products/{}/cui-marking", urlencode(&product_id));
+    let body = json!({
+        "band": band,
+        "category": category,
+        "dissemination": dissemination,
+    });
+    forward_post(&state, &path, body).await
+}
+
+/// D-08 — `GET /api/products/:id/cui-marking` — the product's marking (the
+/// backend records a CUI access GRANT when one exists). Response is
+/// `{ "marking": <record|null> }`.
+#[tauri::command]
+pub async fn get_product_cui_marking(
+    state: State<'_, AppState>,
+    product_id: String,
+) -> Result<Value, String> {
+    let path = format!("/api/products/{}/cui-marking", urlencode(&product_id));
+    forward_get(&state, &path, true).await
+}
+
 // ── PR-172 — notes-history typeahead source ─────────────────────────
 
 /// PR-172 — `GET /api/notes-history?scope=line|invoice|storno`. Used

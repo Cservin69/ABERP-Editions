@@ -245,6 +245,29 @@ the SPA banner that `to_banner_str()` exists to render.
 **Size.** Medium — it touches artifact storage and the SPA, and the
 access check needs a defined enforcement point.
 
+**Now Live (backend + bridge; SPA banner is the follow-on slice).**
+`apps/aberp/src/cui_marking.rs` stores a typed `CuiMarking` (+ limited-
+dissemination controls) against a **product** — the artifact anchor this
+slice chose (the one existing entity with a stable read route) — and
+renders the DoD banner through `CuiMarking::to_banner_str` so a free-text
+banner can never reach the ledger. `POST /api/products/:id/cui-marking`
+fires `cui.marking_applied`; the **enforcement point** decided for this
+slice is the read path: `GET /api/products/:id/cui-marking` records a
+GRANT `cui.access_event` on every read of a marked product (CUI's
+lawful-government-purpose rule makes the access trail load-bearing). Both
+appends ride the shared `aberp_db::Handle` in one tx (ADR-0099);
+`operator_user_id` is session-sourced. 9 unit + 4 end-to-end route tests
+(`apps/aberp/tests/serve_cui_marking_route.rs`, a fresh `Ledger` re-read
+proves both rows durable). Tauri commands + `api.ts` bindings
+(`applyProductCuiMarking` / `getProductCuiMarking`) are wired.
+
+**Deferred / flagged.** The **deny** path: the Defense pilot is
+single-operator-per-tenant with no clearance/role model, so a read is an
+authenticated GRANT and a denial has no input to branch on — `AccessDecision::Denied`
+is modelled but unreachable until a role model lands. The SPA banner +
+apply control on the products screen is the next slice (backend + bridge
+ship first, mirroring D-11).
+
 <a id="d-09"></a>
 ### D-09 — DFARS 252.204-7012 cyber-incident reporting
 

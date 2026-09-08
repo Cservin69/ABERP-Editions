@@ -4990,6 +4990,11 @@ pub fn build_router(state: AppState) -> Router {
                 .put(handle_update_product)
                 .delete(handle_delete_product),
         )
+        // D-08 — CUI marking + access-event trail on a product.
+        .route(
+            "/api/products/:id/cui-marking",
+            get(handle_get_product_cui_marking).post(handle_apply_product_cui_marking),
+        )
         // S231 / PR-227 / ADR-0061 — Stage 3 Phase γ Inventory v1.
         // GET lists the per-product `stock_movements` ledger
         // (descending by at_iso8601, paginated). POST appends one
@@ -27033,6 +27038,161 @@ async fn handle_record_cyber_incident(
         },
         Err(je) => internal_error(
             "record_cyber_incident:join",
+            anyhow!("blocking task panicked: {je}"),
+        ),
+    }
+}
+
+// ── D-08 — CUI marking + access-event trail (on a product) ───────────────
+//
+// Apply a typed CUI/classification marking to a product (fires
+// `cui.marking_applied`); reading the marking of a MARKED product records a
+// GRANT (`cui.access_event`) — CUI's lawful-government-purpose rule makes the
+// access trail load-bearing. Both appends ride the shared Handle in one tx
+// (ADR-0099). The deny path is deferred (no clearance model — see
+// `cui_marking` module doc). `operator_user_id` is session-sourced.
+
+/// Apply a CUI marking to a product. `Ok(None)` = the product does not exist
+/// (→ 404); `Err(CuiMarkingError)` = a bad band/category/dissemination (→ 400).
+pub fn apply_product_cui_marking_request(
+    state: &AppState,
+    operator: &str,
+    product_id: &str,
+    input: &crate::cui_marking::CuiMarkingInput,
+) -> Result<Option<crate::cui_marking::CuiMarkingRecord>> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
+    let now = time::OffsetDateTime::now_utc();
+    let now_ms = (now.unix_timestamp_nanos() / 1_000_000) as i64;
+    let ledger_meta = LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let mut guard = state
+        .db
+        .write()
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tx = guard.transaction().context("begin cui marking tx")?;
+    if crate::products::get_product(&tx, state.tenant.as_str(), product_id)
+        .context("look up product for CUI marking")?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let record = crate::cui_marking::CuiMarkingRecord::from_input(input, product_id, operator, now)
+        .map_err(anyhow::Error::new)?;
+    crate::cui_marking::store_marking_in_tx(&tx, state.tenant.as_str(), &record)?;
+    crate::cui_marking::append_cui_marking_applied_in_tx(
+        &tx,
+        &ledger_meta,
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        &record,
+        now_ms,
+    )?;
+    tx.commit().context("commit cui marking tx")?;
+    Ok(Some(record))
+}
+
+/// Read a product's CUI marking. When one exists, a GRANT `cui.access_event`
+/// is recorded in the same tx (every access to CUI is logged). `Ok(None)` =
+/// the product carries no marking (no access event — nothing controlled).
+pub fn read_product_cui_marking_request(
+    state: &AppState,
+    operator: &str,
+    product_id: &str,
+) -> Result<Option<crate::cui_marking::CuiMarkingRecord>> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
+    let now_ms = now_epoch_ms();
+    let ledger_meta = LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let mut guard = state
+        .db
+        .write()
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tx = guard.transaction().context("begin cui access tx")?;
+    let marking = crate::cui_marking::read_marking(&tx, state.tenant.as_str(), product_id)?;
+    if marking.is_some() {
+        crate::cui_marking::append_cui_access_event_in_tx(
+            &tx,
+            &ledger_meta,
+            Actor::from_local_cli(Ulid::new().to_string(), operator),
+            product_id,
+            operator,
+            crate::cui_marking::AccessDecision::Granted,
+            // Single-tenant operator, no clearance model → an authenticated
+            // read is a lawful-government-purpose grant (32 CFR § 2002.4).
+            "lawful government purpose (authenticated operator; no clearance model)",
+            now_ms,
+        )?;
+    }
+    tx.commit().context("commit cui access tx")?;
+    Ok(marking)
+}
+
+/// `POST /api/products/:id/cui-marking` — apply a CUI/classification marking.
+async fn handle_apply_product_cui_marking(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(product_id): AxumPath<String>,
+    Json(input): Json<crate::cui_marking::CuiMarkingInput>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        apply_product_cui_marking_request(&state_for_task, &operator, &product_id, &input)
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(record))) => (StatusCode::CREATED, Json(record)).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body("no such product".to_string())),
+        )
+            .into_response(),
+        Ok(Err(e)) => match e.downcast::<crate::cui_marking::CuiMarkingError>() {
+            Ok(typed) => {
+                (StatusCode::BAD_REQUEST, Json(error_body(typed.to_string()))).into_response()
+            }
+            Err(other) => internal_error("apply_product_cui_marking", other),
+        },
+        Err(je) => internal_error(
+            "apply_product_cui_marking:join",
+            anyhow!("blocking task panicked: {je}"),
+        ),
+    }
+}
+
+/// `GET /api/products/:id/cui-marking` — the product's marking (records an
+/// access GRANT when one exists). Returns `{ "marking": null }` when unmarked.
+async fn handle_get_product_cui_marking(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(product_id): AxumPath<String>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        read_product_cui_marking_request(&state_for_task, &operator, &product_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(marking)) => Json(serde_json::json!({ "marking": marking })).into_response(),
+        Ok(Err(e)) => internal_error("get_product_cui_marking", e),
+        Err(je) => internal_error(
+            "get_product_cui_marking:join",
             anyhow!("blocking task panicked: {je}"),
         ),
     }
