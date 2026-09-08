@@ -389,6 +389,8 @@ pub fn run() {
             commands::get_product_cui_marking,
             // D-10 — DPAS priority-rating assignment.
             commands::set_partner_dpas_rating,
+            // D-15 — the 21 CFR Part 11 e-signature ceremony.
+            commands::apply_signature,
             // S438 (ADR-0089) — per-unit part-UID marking + Part UID Lookup.
             commands::mark_parts,
             commands::part_traceability,

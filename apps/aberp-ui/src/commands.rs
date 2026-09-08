@@ -1351,6 +1351,25 @@ pub async fn set_partner_dpas_rating(
     forward_post(&state, &path, body).await
 }
 
+// ── D-15 — the 21 CFR Part 11 e-signature ceremony ──────────────────
+
+/// D-15 — `POST /api/e-signature` — apply an electronic signature to a record
+/// under the operator's registered digital identity. The signer id + algorithm
+/// + timestamp are produced by the DigitalIdProvider server-side, never sent
+/// from here; a bad target is a 400.
+#[tauri::command]
+pub async fn apply_signature(
+    state: State<'_, AppState>,
+    signed_record_kind: String,
+    signed_record_id: String,
+) -> Result<Value, String> {
+    let body = json!({
+        "signed_record_kind": signed_record_kind,
+        "signed_record_id": signed_record_id,
+    });
+    forward_post(&state, "/api/e-signature", body).await
+}
+
 // ── PR-172 — notes-history typeahead source ─────────────────────────
 
 /// PR-172 — `GET /api/notes-history?scope=line|invoice|storno`. Used

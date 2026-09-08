@@ -52,6 +52,9 @@ pub mod cyber_incident;
 // D-10 — DPAS priority-rating assignment: validate + render the rating, write
 // the partners.dpas_rating column, and fire `supplier.dpas_priority_set`.
 pub mod dpas_rating;
+// D-15 — the 21 CFR Part 11 e-signature ceremony: sign a record via the
+// DigitalIdProvider and fire `personnel.signature_applied`.
+pub mod e_signature;
 // The Defense demo seed — one coherent aerospace job written into the
 // bundled `demo` tenant so the Defense screens have something to render.
 // Demo/dev artifact: reachable only through `aberp demo-seed`, which

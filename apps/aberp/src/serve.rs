@@ -4907,6 +4907,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         // D-09 — DFARS 252.204-7012 cyber-incident intake.
         .route("/api/cyber-incidents", post(handle_record_cyber_incident))
+        // D-15 — the 21 CFR Part 11 e-signature ceremony.
+        .route("/api/e-signature", post(handle_apply_signature))
         .route(
             "/api/material-traceability",
             get(handle_material_traceability),
@@ -27325,6 +27327,107 @@ async fn handle_set_partner_dpas_rating(
         },
         Err(je) => internal_error(
             "set_partner_dpas_rating:join",
+            anyhow!("blocking task panicked: {je}"),
+        ),
+    }
+}
+
+// ── D-15 — the 21 CFR Part 11 e-signature ceremony ───────────────────────
+//
+// An operator applies an electronic signature to a record under their
+// registered digital identity: the DigitalIdProvider signs the canonical
+// (kind, id) bytes and the route fires `personnel.signature_applied` — the
+// §11.50 manifestation landmark. The signer id + algorithm + timestamp come
+// from the signature, NOT the request body. Mock provider today
+// (mock-hmac-sha256); a real CAC/eID backend swaps in behind the same seam.
+
+/// Apply an electronic signature to a record and fire
+/// `personnel.signature_applied`. Blocking; the handler runs it on the pool.
+pub fn apply_signature_request(
+    state: &AppState,
+    input: &crate::e_signature::SignatureCeremonyInput,
+) -> Result<crate::e_signature::SignatureCeremonyRecord> {
+    // Validate the target BEFORE signing so a bad request never mints a
+    // signature or a ledger row.
+    let kind = input.signed_record_kind.trim();
+    let id = input.signed_record_id.trim();
+    if kind.is_empty() {
+        return Err(anyhow::Error::new(
+            crate::e_signature::ESignatureError::EmptyRecordKind,
+        ));
+    }
+    if id.is_empty() {
+        return Err(anyhow::Error::new(
+            crate::e_signature::ESignatureError::EmptyRecordId,
+        ));
+    }
+
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
+
+    // The identity layer — not the client — attests who is signing.
+    let identity = state
+        .digital_id
+        .current_operator()
+        .map_err(|e| anyhow!("digital identity unavailable: {e}"))?;
+    let signed_bytes = crate::e_signature::payload_to_sign(kind, id);
+    let signature = state
+        .digital_id
+        .sign(&signed_bytes)
+        .map_err(|e| anyhow!("signature failed: {e}"))?;
+
+    let record = crate::e_signature::SignatureCeremonyRecord::assemble(
+        input,
+        &signature.signer_id,
+        &identity.display_name,
+        &signature.algorithm,
+        signature.signed_at_ms,
+    )
+    .map_err(anyhow::Error::new)?;
+
+    let ledger_meta = LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let mut guard = state
+        .db
+        .write()
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tx = guard.transaction().context("begin e-signature tx")?;
+    crate::e_signature::append_signature_applied_in_tx(
+        &tx,
+        &ledger_meta,
+        Actor::from_local_cli(Ulid::new().to_string(), &record.operator_user_id),
+        &record,
+    )?;
+    tx.commit().context("commit e-signature tx")?;
+    Ok(record)
+}
+
+/// `POST /api/e-signature` — apply an electronic signature to a record.
+async fn handle_apply_signature(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(input): Json<crate::e_signature::SignatureCeremonyInput>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || apply_signature_request(&state_for_task, &input)).await;
+    match result {
+        Ok(Ok(record)) => (StatusCode::CREATED, Json(record)).into_response(),
+        Ok(Err(e)) => match e.downcast::<crate::e_signature::ESignatureError>() {
+            Ok(typed) => {
+                (StatusCode::BAD_REQUEST, Json(error_body(typed.to_string()))).into_response()
+            }
+            Err(other) => internal_error("apply_signature", other),
+        },
+        Err(je) => internal_error(
+            "apply_signature:join",
             anyhow!("blocking task panicked: {je}"),
         ),
     }

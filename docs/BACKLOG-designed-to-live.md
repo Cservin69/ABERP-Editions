@@ -225,6 +225,28 @@ useful alongside D-07.
 
 **Size.** Medium; the ceremony UI is the bulk of it.
 
+**Sub-slice 1 Live (backend + bridge): the e-signature ceremony.**
+`apps/aberp/src/e_signature.rs` + `serve::apply_signature_request` fire
+`personnel.signature_applied` (the Part-11 §11.50 manifestation anchor):
+`POST /api/e-signature` takes a `signed_record_kind` + `signed_record_id`,
+the `DigitalIdProvider` signs the canonical `(kind, id)` bytes, and the
+payload records `operator_user_id` / `signed_record_kind` /
+`signed_record_id` / `signature_algorithm` / `signed_at_ms` — the signer id
++ algorithm coming from the signature, never the request body. Mock
+provider today (`mock-hmac-sha256`); a real CAC/eID backend swaps in behind
+the seam. The append rides the shared `aberp_db::Handle` in one tx
+(ADR-0099); an empty target is a 400. 3 unit + 2 end-to-end route tests
+(`apps/aberp/tests/serve_e_signature_route.rs`, a fresh `Ledger` re-read
+proves durability). `apply_signature` Tauri command + `applySignature`
+api.ts binding are wired.
+
+**Remaining sub-slices.** The ceremony UI (sub-slice 2), and the three
+other kinds — `personnel.id_registered` (identity registration),
+`personnel.access_granted` / `_denied` (a personnel-scoped access
+enforcement point, like D-08's). The signature value is limited against the
+mock identity until D-07 lands a real backend, but the ceremony + audit
+landmark are edition-agnostic and demoable today.
+
 <a id="d-08"></a>
 ### D-08 — CUI marking and access control
 

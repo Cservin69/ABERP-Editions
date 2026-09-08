@@ -3050,6 +3050,32 @@ export async function setPartnerDpasRating(
   });
 }
 
+// ── D-15 — the 21 CFR Part 11 e-signature ceremony ───────────────────
+
+/** D-15 — the completed signature ceremony. The signer id + algorithm +
+ * timestamp are produced by the DigitalIdProvider server-side. */
+export interface SignatureCeremonyRecord {
+  operator_user_id: string;
+  operator_display_name: string;
+  signed_record_kind: string;
+  signed_record_id: string;
+  signature_algorithm: string;
+  signed_at_ms: number;
+}
+
+/** D-15 — `POST /api/e-signature`. Apply an electronic signature to a record
+ * (identified by a kind discriminator + id) under the operator's registered
+ * digital identity. Backend 400 when the target kind/id is empty. */
+export async function applySignature(
+  signedRecordKind: string,
+  signedRecordId: string,
+): Promise<SignatureCeremonyRecord> {
+  return invoke<SignatureCeremonyRecord>("apply_signature", {
+    signedRecordKind,
+    signedRecordId,
+  });
+}
+
 /** S438 — one traced part with its production + customer chain resolved. */
 export interface PartTraceRow {
   part_uid: string;
