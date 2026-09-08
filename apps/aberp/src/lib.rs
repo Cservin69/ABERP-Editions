@@ -43,6 +43,9 @@ pub mod email_invoice;
 // creds per [[aberp-smtp-spoc]]. Dedicated keychain entry
 // (email_relay_credentials) for independent rotation per ADR-0007 §Auth.
 pub mod daemon_tick_guard;
+// D-09 — DFARS 252.204-7012 cyber-incident intake: the typed payload +
+// the validated append that fires `incident.cyber_detected`.
+pub mod cyber_incident;
 // The Defense demo seed — one coherent aerospace job written into the
 // bundled `demo` tenant so the Defense screens have something to render.
 // Demo/dev artifact: reachable only through `aberp demo-seed`, which

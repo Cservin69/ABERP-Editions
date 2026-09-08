@@ -84,6 +84,7 @@
   import MachinesList from "./routes/MachinesList.svelte";
   import InspectionPlansList from "./routes/InspectionPlansList.svelte";
   import QcReportsList from "./routes/QcReportsList.svelte";
+  import CyberIncidentView from "./routes/CyberIncidentView.svelte";
   import MarginProfilesList from "./routes/MarginProfilesList.svelte";
   import AvlVendorsList from "./routes/AvlVendorsList.svelte";
   // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Work Orders v1.
@@ -853,6 +854,8 @@
           <QcReportsList />
         {:else if route === "purchase-orders"}
           <Purchasing />
+        {:else if route === "cyber-incidents"}
+          <CyberIncidentView />
         {:else if route === "invoices-new"}
           <!-- PR-87 / session-112 — full-page issuance route. The
                IssueInvoice form was a `<dialog>` modal mounted inside

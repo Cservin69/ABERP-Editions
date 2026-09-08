@@ -42,6 +42,8 @@ export type AppRoute =
   // S431 — Approved Vendor List (Master Data area).
   | "avl-vendors"
   | "work-orders"
+  // D-09 — DFARS 252.204-7012 cyber-incident intake (Compliance area).
+  | "cyber-incidents"
   | "qa"
   | "dispatch"
   | "workshop"
@@ -204,6 +206,8 @@ export function parseRoute(hash: string): AppRoute {
       return "quality-ncrs";
     case "qc-reports":
       return "qc-reports";
+    case "cyber-incidents":
+      return "cyber-incidents";
     case "purchase-orders":
       return "purchase-orders";
     case "tenants":

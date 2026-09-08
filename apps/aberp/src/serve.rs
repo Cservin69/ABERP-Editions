@@ -4899,6 +4899,8 @@ pub fn build_router(state: AppState) -> Router {
             "/api/inventory-balances/:grade/certs",
             get(handle_list_material_certs).post(handle_attach_material_cert),
         )
+        // D-09 — DFARS 252.204-7012 cyber-incident intake.
+        .route("/api/cyber-incidents", post(handle_record_cyber_incident))
         .route(
             "/api/material-traceability",
             get(handle_material_traceability),
@@ -26954,6 +26956,83 @@ async fn handle_list_material_certs(
         Ok(Err(e)) => internal_error("list_material_certs", e),
         Err(je) => internal_error(
             "list_material_certs:join",
+            anyhow!("blocking task panicked: {je}"),
+        ),
+    }
+}
+
+// ── D-09 — DFARS 252.204-7012 cyber-incident intake ──────────────────────
+//
+// An operator declares a detected cyber incident; the route validates the
+// severity / detection source through the compliance enums, computes the
+// 72-hour DoD reporting deadline (present iff CDI or OCS is affected), and
+// appends `incident.cyber_detected` on the shared Handle in one tx. The
+// `operator_user_id` is taken from the authenticated session, never the body.
+
+/// Current epoch-milliseconds — the default incident discovery stamp.
+fn now_epoch_ms() -> i64 {
+    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
+}
+
+/// Validate + record a cyber incident, emitting `incident.cyber_detected` in
+/// the same tx. Blocking; the handler runs it on the blocking pool.
+pub fn record_cyber_incident_request(
+    state: &AppState,
+    operator: &str,
+    input: &crate::cyber_incident::CyberIncidentInput,
+) -> Result<crate::cyber_incident::CyberIncidentRecord> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
+    let record =
+        crate::cyber_incident::CyberIncidentRecord::from_input(input, operator, now_epoch_ms())
+            .map_err(anyhow::Error::new)?;
+    let ledger_meta = LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let mut guard = state
+        .db
+        .write()
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tx = guard.transaction().context("begin cyber incident tx")?;
+    crate::cyber_incident::append_cyber_incident_in_tx(
+        &tx,
+        &ledger_meta,
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        &record,
+    )?;
+    tx.commit().context("commit cyber incident tx")?;
+    Ok(record)
+}
+
+/// `POST /api/cyber-incidents` — declare a DFARS 252.204-7012 cyber incident.
+async fn handle_record_cyber_incident(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(input): Json<crate::cyber_incident::CyberIncidentInput>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        record_cyber_incident_request(&state_for_task, &operator, &input)
+    })
+    .await;
+    match result {
+        Ok(Ok(record)) => (StatusCode::CREATED, Json(record)).into_response(),
+        Ok(Err(e)) => match e.downcast::<crate::cyber_incident::CyberIncidentError>() {
+            // Every intake rejection is operator-fixable → 400.
+            Ok(typed) => {
+                (StatusCode::BAD_REQUEST, Json(error_body(typed.to_string()))).into_response()
+            }
+            Err(other) => internal_error("record_cyber_incident", other),
+        },
+        Err(je) => internal_error(
+            "record_cyber_incident:join",
             anyhow!("blocking task panicked: {je}"),
         ),
     }

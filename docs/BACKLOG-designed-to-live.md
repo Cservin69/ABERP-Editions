@@ -266,6 +266,23 @@ a decided one.
 **Size.** Small-to-medium — the types and the deadline math are done; this
 is a form, a route, and an append.
 
+**Now Live.** `apps/aberp/src/cyber_incident.rs` fires
+`incident.cyber_detected` from an operator intake. `CyberIncidentInput` is
+validated through the `aberp_compliance::incident` enums (severity,
+detection source); the 72-hour DoD reporting deadline is computed by
+`dod_72h_report_due_at_ms` and present only when CDI or OCS is affected.
+The append rides the shared `aberp_db::Handle` in one tx (ADR-0099);
+`operator_user_id` is session-sourced, never from the body; the payload
+matches the pinned S362 shape (no `incident_id` in the payload).
+`POST /api/cyber-incidents` is exercised end-to-end in
+`apps/aberp/tests/serve_cyber_incident_route.rs` (a fresh `Ledger` re-read
+proves the row is durable), with typed rejections → 400. The SPA has a
+Compliance area with a cyber-incident intake screen
+(`apps/aberp-ui/ui/src/routes/CyberIncidentView.svelte`) over the
+`record_cyber_incident` command / `recordCyberIncident` binding. Deferred
+(open design question, per above): acting on the deadline (an alert or a
+dashboard countdown) and the SPRS submission / SIEM integration.
+
 <a id="d-10"></a>
 ### D-10 — DPAS priority rating audit event
 

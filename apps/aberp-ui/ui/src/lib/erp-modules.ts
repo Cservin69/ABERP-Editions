@@ -61,6 +61,10 @@ export type ErpModuleId =
   // S440 — procurement (purchase orders). Operational area; AVL-gated PO
   // create + receiving that auto-creates NCRs on failed inspection.
   | "purchasing"
+  // D-09 — DFARS 252.204-7012 cyber-incident reporting. Operational area;
+  // the operator intake for declaring a detected cyber incident (the 72h
+  // reporting clock starts server-side when CDI or OCS is affected).
+  | "compliance"
   | "master-data"
   | "settings"
   // S267 / PR-256 — auto-quoting engine tunables. Maintenance-area
@@ -266,6 +270,18 @@ export const MODULES: ErpModule[] = [
     label_en: "Purchasing",
     glyph: "🛒",
     routes: [{ id: "purchase-orders", label: "Megrendelések / POs" }],
+  },
+  // D-09 (S362) — DFARS 252.204-7012 cyber-incident reporting. Operational
+  // area; the operator declares a detected cyber incident and the backend
+  // fires `incident.cyber_detected`, computing the 72-hour DoD reporting
+  // deadline when CDI or OCS is affected.
+  {
+    id: "compliance",
+    area: "operational",
+    label_hu: "Megfelelőség",
+    label_en: "Compliance",
+    glyph: "🛡️",
+    routes: [{ id: "cyber-incidents", label: "Kiberincidens / Cyber incident" }],
   },
   {
     id: "master-data",

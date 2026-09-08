@@ -2877,6 +2877,78 @@ export async function listMaterialCerts(
   return invoke<MaterialCertsResult>("list_material_certs", { grade });
 }
 
+// ── D-09 — DFARS 252.204-7012 cyber-incident intake ──────────────────
+
+/** D-09 — incident severity (serde snake_case). */
+export type IncidentSeverity =
+  | "informational"
+  | "low"
+  | "medium"
+  | "high"
+  | "critical";
+
+/** D-09 — how the incident was detected (serde snake_case). */
+export type DetectionSource =
+  | "siem"
+  | "user_report"
+  | "vendor_notification"
+  | "audit"
+  | "other";
+
+/** D-09 — operator intake for `POST /api/cyber-incidents`. `operatorUserId`
+ * is NOT sent — the server fills it from the session. `detectedAtMs` defaults
+ * to server-now when omitted. */
+export interface CyberIncidentInput {
+  severity: IncidentSeverity;
+  scopeDescription: string;
+  detectionSource: DetectionSource;
+  detectedAtMs?: number | null;
+  cdiAffected?: boolean;
+  cuiAffected?: boolean;
+  ocsAffected?: boolean;
+  exfiltrationSuspected?: boolean;
+  affectedSystems?: string[];
+  mitigationNotes?: string | null;
+}
+
+/** D-09 — the recorded incident. `dod_72h_report_due_at_ms` is present iff
+ * CDI or OCS is affected (the DFARS 252.204-7012(c) clock). */
+export interface CyberIncidentRecord {
+  incident_id: string;
+  detected_at_ms: number;
+  operator_user_id: string;
+  severity: IncidentSeverity;
+  scope_description: string;
+  cdi_affected: boolean;
+  cui_affected: boolean;
+  ocs_affected: boolean;
+  exfiltration_suspected: boolean;
+  affected_systems: string[];
+  detection_source: DetectionSource;
+  mitigation_notes: string | null;
+  dod_72h_report_due_at_ms: number | null;
+}
+
+/** D-09 — `POST /api/cyber-incidents`. Declare a detected cyber incident; the
+ * backend validates severity/detection source and computes the 72h deadline.
+ * Backend 400 on an unknown severity/detection source or an empty scope. */
+export async function recordCyberIncident(
+  input: CyberIncidentInput,
+): Promise<CyberIncidentRecord> {
+  return invoke<CyberIncidentRecord>("record_cyber_incident", {
+    severity: input.severity,
+    scopeDescription: input.scopeDescription,
+    detectionSource: input.detectionSource,
+    detectedAtMs: input.detectedAtMs ?? null,
+    cdiAffected: input.cdiAffected ?? false,
+    cuiAffected: input.cuiAffected ?? false,
+    ocsAffected: input.ocsAffected ?? false,
+    exfiltrationSuspected: input.exfiltrationSuspected ?? false,
+    affectedSystems: input.affectedSystems ?? [],
+    mitigationNotes: input.mitigationNotes ?? null,
+  });
+}
+
 /** S438 — one traced part with its production + customer chain resolved. */
 export interface PartTraceRow {
   part_uid: string;

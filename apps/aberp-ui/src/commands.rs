@@ -1263,6 +1263,42 @@ pub async fn list_material_certs(
     forward_get(&state, &path, true).await
 }
 
+// ── D-09 — DFARS 252.204-7012 cyber-incident intake ─────────────────
+
+/// D-09 — `POST /api/cyber-incidents` — declare a detected cyber incident.
+/// The backend re-validates `severity` / `detection_source` and computes the
+/// 72-hour DoD reporting deadline authoritatively; `operator_user_id` is taken
+/// from the session server-side, never sent from here.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn record_cyber_incident(
+    state: State<'_, AppState>,
+    severity: String,
+    scope_description: String,
+    detection_source: String,
+    detected_at_ms: Option<i64>,
+    cdi_affected: bool,
+    cui_affected: bool,
+    ocs_affected: bool,
+    exfiltration_suspected: bool,
+    affected_systems: Vec<String>,
+    mitigation_notes: Option<String>,
+) -> Result<Value, String> {
+    let body = json!({
+        "severity": severity,
+        "scope_description": scope_description,
+        "detection_source": detection_source,
+        "detected_at_ms": detected_at_ms,
+        "cdi_affected": cdi_affected,
+        "cui_affected": cui_affected,
+        "ocs_affected": ocs_affected,
+        "exfiltration_suspected": exfiltration_suspected,
+        "affected_systems": affected_systems,
+        "mitigation_notes": mitigation_notes,
+    });
+    forward_post(&state, "/api/cyber-incidents", body).await
+}
+
 // ── PR-172 — notes-history typeahead source ─────────────────────────
 
 /// PR-172 — `GET /api/notes-history?scope=line|invoice|storno`. Used

@@ -58,6 +58,8 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "qa",
   "dispatch",
   "workshop",
+  // D-09 — DFARS 252.204-7012 cyber-incident intake (Compliance module).
+  "cyber-incidents",
   "tenant",
   "nav-credentials",
   "maintenance",
@@ -156,6 +158,8 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   // S424 / session-424 — cross-domain audit-activity log (own module,
   // operational area).
   "audit-events": "audit",
+  // D-09 (S362) — DFARS cyber-incident intake, own Compliance module.
+  "cyber-incidents": "compliance",
 };
 
 // The expected area for each AppRoute. The two-area usage-frequency
@@ -223,6 +227,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   "qc-reports": "operational",
   // S440 — procurement / purchase orders, operational area.
   "purchase-orders": "operational",
+  // D-09 (S362) — DFARS cyber-incident intake, operational area.
+  "cyber-incidents": "operational",
   // S433 — multi-tenant admin (maintenance area, under Settings).
   tenants: "maintenance",
 };
@@ -434,6 +440,7 @@ describe("modulesInArea + defaultRouteForArea", () => {
     // S432 — "material-traceability" joins after calibration.
     // S439 — "quality" joins after material-traceability.
     // S440 — "purchasing" joins after quality.
+    // D-09 (S362) — "compliance" (DFARS cyber-incident) joins after purchasing.
     expect(op.map((m) => m.id)).toEqual([
       "invoicing",
       "statistics",
@@ -444,6 +451,7 @@ describe("modulesInArea + defaultRouteForArea", () => {
       "material-traceability",
       "quality",
       "purchasing",
+      "compliance",
     ]);
     // S267 / PR-256 — new `quoting` module joins maintenance after Settings.
     // S281 / PR-266 — new `email-relay` module joins after Quoting.

@@ -382,6 +382,8 @@ pub fn run() {
             commands::consume_reservation,
             commands::attach_material_cert,
             commands::list_material_certs,
+            // D-09 — DFARS 252.204-7012 cyber-incident intake.
+            commands::record_cyber_incident,
             // S438 (ADR-0089) — per-unit part-UID marking + Part UID Lookup.
             commands::mark_parts,
             commands::part_traceability,
