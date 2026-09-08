@@ -292,15 +292,18 @@ appends ride the shared `aberp_db::Handle` in one tx (ADR-0099);
 proves both rows durable). Tauri commands + `api.ts` bindings
 (`applyProductCuiMarking` / `getProductCuiMarking`) are wired.
 
-**Deferred / flagged.** The **deny** path: the Defense pilot is
-single-operator-per-tenant with no clearance/role model, so a read is an
-authenticated GRANT and a denial has no input to branch on — `AccessDecision::Denied`
-is modelled but unreachable until a role model lands. **The model is now
-decided:** ADR-0117 defines the enforcement seam
-(`aberp-compliance::access::authorize`) + a scope-set clearance model
-(`required ⊆ subject.scope`, derived from the `CuiMarking` via
-`for_cui_marking`), fail-closed for controlled markings. Wiring this deny path
-is the follow-on build slice.
+**Deny path now Live (ADR-0117).** The CUI read route enforces:
+`GET /api/products/:id/cui-marking` runs
+`aberp-compliance::access::authorize(subject, required)` where the subject's
+scopes come from the identity layer (`current_operator()`, never the request —
+§8a) and `required` derives from the marking band (`for_cui_band`). A cleared
+operator (pilot mock carries `cui`) is **granted** and the marking released; a
+scope-less operator is **denied**, the marking **withheld (403)**, and the
+denial recorded (ledger-first, §8b/§8d). An unmarked product is not an
+access-control surface (no check/no event, §8e). Proven by
+`serve_cui_marking_route.rs` (grant + a scope-less-operator **deny** test) and
+the `access` module truth-table units. Remaining: a graceful denied-operator
+SPA state (only reachable once a real under-cleared identity exists under D-07).
 
 **SPA banner shipped (slice 2).** `ProductDetail.svelte` fetches the
 marking on open (recording the access GRANT), renders the DoD banner

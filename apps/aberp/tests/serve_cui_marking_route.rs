@@ -24,7 +24,7 @@ use aberp_billing::{Currency, ProductUnit};
 
 use aberp::cui_marking::{CuiMarkingError, CuiMarkingInput};
 use aberp::products::{create_product, ProductInputs};
-use aberp::serve::{self, AppState};
+use aberp::serve::{self, AppState, CuiReadOutcome};
 
 const TEST_TENANT: &str = "serve_cui_marking_route_test";
 const TEST_HASH: BinaryHash = BinaryHash::from_bytes([0xC8; 32]);
@@ -39,7 +39,17 @@ fn test_dir(label: &str) -> PathBuf {
     dir
 }
 
-fn build_state(db_path: PathBuf) -> AppState {
+/// A CLEARED pilot operator (holds `cui`) — CUI reads grant.
+fn cleared_state(db_path: PathBuf) -> AppState {
+    build_state(db_path, vec!["operator".to_string(), "cui".to_string()])
+}
+
+/// A scope-less operator (only `operator`) — CUI reads are denied.
+fn scopeless_state(db_path: PathBuf) -> AppState {
+    build_state(db_path, vec!["operator".to_string()])
+}
+
+fn build_state(db_path: PathBuf, scopes: Vec<String>) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     AppState {
         db: aberp::serve::open_tenant_handle(&db_path, tenant.clone())
@@ -73,7 +83,7 @@ fn build_state(db_path: PathBuf) -> AppState {
         storefront_credential: aberp::storefront_credential::StorefrontCredentialHandle::dormant(),
         email_outbox_daemon: aberp::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(),
         quote_pdf_rerender_queue: aberp::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
-        digital_id: std::sync::Arc::new(aberp_digital_id::MockProvider::new()),
+        digital_id: std::sync::Arc::new(aberp_digital_id::MockProvider::with_scopes(scopes)),
     }
 }
 
@@ -109,7 +119,7 @@ fn kind_count(db_path: &PathBuf, kind: EventKind) -> usize {
 #[test]
 fn apply_marks_and_each_read_records_a_grant() {
     let db_path = test_dir("apply-read").join("tenant.duckdb");
-    let state = build_state(db_path.clone());
+    let state = cleared_state(db_path.clone());
     let product_id = seed_product(&state, "Fan blade");
 
     let applied = serve::apply_product_cui_marking_request(
@@ -128,14 +138,15 @@ fn apply_marks_and_each_read_records_a_grant() {
     assert_eq!(applied.banner_str, "CUI//SP-CTI//NOFORN");
     assert_eq!(applied.entity_id, product_id);
 
-    // Read twice — every read of a marked artifact records a GRANT.
-    let first = serve::read_product_cui_marking_request(&state, OPERATOR, &product_id)
-        .expect("read ok")
-        .expect("marking present");
-    assert_eq!(first.banner_str, "CUI//SP-CTI//NOFORN");
-    serve::read_product_cui_marking_request(&state, OPERATOR, &product_id)
-        .expect("read ok")
-        .expect("marking present");
+    // Read twice with a CLEARED operator — every read records a GRANT.
+    match serve::read_product_cui_marking_request(&state, OPERATOR, &product_id).expect("read ok") {
+        CuiReadOutcome::Granted(rec) => assert_eq!(rec.banner_str, "CUI//SP-CTI//NOFORN"),
+        other => panic!("expected Granted, got {other:?}"),
+    }
+    assert!(matches!(
+        serve::read_product_cui_marking_request(&state, OPERATOR, &product_id).expect("read ok"),
+        CuiReadOutcome::Granted(_)
+    ));
 
     drop(state);
     assert_eq!(kind_count(&db_path, EventKind::CuiMarkingApplied), 1);
@@ -145,7 +156,7 @@ fn apply_marks_and_each_read_records_a_grant() {
 #[test]
 fn apply_to_missing_product_is_none_and_appends_nothing() {
     let db_path = test_dir("missing-product").join("tenant.duckdb");
-    let state = build_state(db_path.clone());
+    let state = cleared_state(db_path.clone());
 
     let outcome = serve::apply_product_cui_marking_request(
         &state,
@@ -167,7 +178,7 @@ fn apply_to_missing_product_is_none_and_appends_nothing() {
 #[test]
 fn bad_band_is_rejected_and_appends_nothing() {
     let db_path = test_dir("bad-band").join("tenant.duckdb");
-    let state = build_state(db_path.clone());
+    let state = cleared_state(db_path.clone());
     let product_id = seed_product(&state, "Bracket");
 
     let err = serve::apply_product_cui_marking_request(
@@ -196,13 +207,56 @@ fn bad_band_is_rejected_and_appends_nothing() {
 #[test]
 fn reading_an_unmarked_product_records_no_access_event() {
     let db_path = test_dir("unmarked-read").join("tenant.duckdb");
-    let state = build_state(db_path.clone());
+    let state = cleared_state(db_path.clone());
     let product_id = seed_product(&state, "Unmarked widget");
 
-    let marking =
+    let outcome =
         serve::read_product_cui_marking_request(&state, OPERATOR, &product_id).expect("read ok");
-    assert!(marking.is_none(), "no marking → None");
+    assert!(
+        matches!(outcome, CuiReadOutcome::Unmarked),
+        "an unmarked product is not an access-control surface, got {outcome:?}"
+    );
 
     drop(state);
     assert_eq!(kind_count(&db_path, EventKind::CuiAccessEvent), 0);
+}
+
+/// ADR-0117 §8b — a scope-less operator reading a CUI-marked product is DENIED,
+/// the marking is withheld, and the denial is on the trail.
+#[test]
+fn a_scope_less_operator_is_denied_and_the_marking_is_withheld() {
+    let db_path = test_dir("deny").join("tenant.duckdb");
+    let product_id;
+    {
+        // Mark the product with a CLEARED operator, then drop that Handle so a
+        // fresh (scope-less) AppState can open the same DB.
+        let cleared = cleared_state(db_path.clone());
+        product_id = seed_product(&cleared, "Classified widget");
+        serve::apply_product_cui_marking_request(
+            &cleared,
+            OPERATOR,
+            &product_id,
+            &CuiMarkingInput {
+                band: "cui".to_string(),
+                category: Some("cti".to_string()),
+                dissemination: vec![],
+            },
+        )
+        .expect("apply ok")
+        .expect("product exists");
+    }
+
+    let scopeless = scopeless_state(db_path.clone());
+    let outcome = serve::read_product_cui_marking_request(&scopeless, OPERATOR, &product_id)
+        .expect("read ok (a denial is not an error)");
+    assert!(
+        matches!(outcome, CuiReadOutcome::Denied),
+        "a scope-less operator must be denied, got {outcome:?}"
+    );
+
+    drop(scopeless);
+    // The marking was applied once; the denied read still recorded an access
+    // event (every CUI access decision is on the trail).
+    assert_eq!(kind_count(&db_path, EventKind::CuiMarkingApplied), 1);
+    assert_eq!(kind_count(&db_path, EventKind::CuiAccessEvent), 1);
 }

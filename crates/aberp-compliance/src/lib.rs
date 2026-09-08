@@ -62,6 +62,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+// ADR-0117 — the access-control enforcement seam + scope-set clearance model.
+pub mod access;
 pub mod avl;
 pub mod cui;
 pub mod export_control;

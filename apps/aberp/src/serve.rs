@@ -4542,10 +4542,21 @@ pub struct AppState {
 ///
 /// Emits one INFO line naming the resolved provider + operator.
 fn build_digital_id_provider() -> Arc<dyn aberp_digital_id::DigitalIdProvider> {
+    // ADR-0117 §5 — the single-operator pilot's mock operator is CLEARED: it
+    // carries the clearance scopes the demo grants against (`cui`, `signer`).
+    // The deny path is real and exercised by a scope-less subject in tests; a
+    // real CAC/eID backend (D-07) derives these tokens from the signed cert.
+    let pilot_mock = || {
+        aberp_digital_id::MockProvider::with_scopes(vec![
+            "operator".to_string(),
+            aberp_compliance::access::SCOPE_CUI.to_string(),
+            "signer".to_string(),
+        ])
+    };
     let requested =
         std::env::var("ABERP_DIGITAL_ID_PROVIDER").unwrap_or_else(|_| "mock".to_string());
     let provider: Arc<dyn aberp_digital_id::DigitalIdProvider> = match requested.as_str() {
-        "mock" => Arc::new(aberp_digital_id::MockProvider::new()),
+        "mock" => Arc::new(pilot_mock()),
         "us-dod-cac" => Arc::new(aberp_digital_id::UsDodCacProvider::new()),
         unknown => {
             tracing::warn!(
@@ -4554,7 +4565,7 @@ fn build_digital_id_provider() -> Arc<dyn aberp_digital_id::DigitalIdProvider> {
                  implemented backends are `mock` and `us-dod-cac`. Falling \
                  back to the mock provider."
             );
-            Arc::new(aberp_digital_id::MockProvider::new())
+            Arc::new(pilot_mock())
         }
     };
     match provider.current_operator() {
@@ -27103,11 +27114,21 @@ pub fn apply_product_cui_marking_request(
 /// Read a product's CUI marking. When one exists, a GRANT `cui.access_event`
 /// is recorded in the same tx (every access to CUI is logged). `Ok(None)` =
 /// the product carries no marking (no access event — nothing controlled).
+/// Outcome of a CUI-marking read (ADR-0117 enforcement). `Unmarked` is not an
+/// access-control surface (no check, no event); `Granted` releases the marking;
+/// `Denied` withholds it (→ 403).
+#[derive(Debug)]
+pub enum CuiReadOutcome {
+    Unmarked,
+    Granted(crate::cui_marking::CuiMarkingRecord),
+    Denied,
+}
+
 pub fn read_product_cui_marking_request(
     state: &AppState,
     operator: &str,
     product_id: &str,
-) -> Result<Option<crate::cui_marking::CuiMarkingRecord>> {
+) -> Result<CuiReadOutcome> {
     let binary_hash = state
         .binary_hash
         .wait()
@@ -27120,22 +27141,48 @@ pub fn read_product_cui_marking_request(
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let tx = guard.transaction().context("begin cui access tx")?;
     let marking = crate::cui_marking::read_marking(&tx, state.tenant.as_str(), product_id)?;
-    if marking.is_some() {
-        crate::cui_marking::append_cui_access_event_in_tx(
-            &tx,
-            &ledger_meta,
-            Actor::from_local_cli(Ulid::new().to_string(), operator),
-            product_id,
-            operator,
-            crate::cui_marking::AccessDecision::Granted,
-            // Single-tenant operator, no clearance model → an authenticated
-            // read is a lawful-government-purpose grant (32 CFR § 2002.4).
-            "lawful government purpose (authenticated operator; no clearance model)",
-            now_ms,
-        )?;
-    }
+    // ADR-0117 §8e — an unmarked resource is not an access-control surface.
+    let Some(record) = marking else {
+        tx.commit().context("commit cui access tx (unmarked)")?;
+        return Ok(CuiReadOutcome::Unmarked);
+    };
+
+    // ADR-0117 §8a — the subject's clearances come from the identity layer,
+    // never from request input. §8c — an identity error withholds (no grant).
+    let identity = state
+        .digital_id
+        .current_operator()
+        .map_err(|e| anyhow!("digital identity unavailable: {e}"))?;
+    let subject =
+        aberp_compliance::access::AccessSubject::new(identity.id.clone(), identity.scope.clone());
+    let required = aberp_compliance::access::RequiredClearance::for_cui_band(&record.band);
+    let decision = aberp_compliance::access::authorize(&subject, &required);
+
+    let cui_decision = if decision.is_granted() {
+        crate::cui_marking::AccessDecision::Granted
+    } else {
+        crate::cui_marking::AccessDecision::Denied
+    };
+    // ADR-0117 §8d — record the decision (ledger-first) BEFORE releasing the
+    // resource; a failed append fails the request (no unlogged grant).
+    crate::cui_marking::append_cui_access_event_in_tx(
+        &tx,
+        &ledger_meta,
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        product_id,
+        &identity.id,
+        cui_decision,
+        decision.reason_str(),
+        now_ms,
+    )?;
     tx.commit().context("commit cui access tx")?;
-    Ok(marking)
+
+    // ADR-0117 §8b — deny withholds the resource.
+    if decision.is_granted() {
+        Ok(CuiReadOutcome::Granted(record))
+    } else {
+        Ok(CuiReadOutcome::Denied)
+    }
 }
 
 /// `POST /api/products/:id/cui-marking` — apply a CUI/classification marking.
@@ -27197,7 +27244,20 @@ async fn handle_get_product_cui_marking(
     })
     .await;
     match result {
-        Ok(Ok(marking)) => Json(serde_json::json!({ "marking": marking })).into_response(),
+        Ok(Ok(CuiReadOutcome::Unmarked)) => {
+            Json(serde_json::json!({ "marking": null })).into_response()
+        }
+        Ok(Ok(CuiReadOutcome::Granted(record))) => {
+            Json(serde_json::json!({ "marking": record })).into_response()
+        }
+        // ADR-0117 §8b — a denied access withholds the resource (403).
+        Ok(Ok(CuiReadOutcome::Denied)) => (
+            StatusCode::FORBIDDEN,
+            Json(error_body(
+                "access denied: operator lacks the required CUI clearance".to_string(),
+            )),
+        )
+            .into_response(),
         Ok(Err(e)) => internal_error("get_product_cui_marking", e),
         Err(je) => internal_error(
             "get_product_cui_marking:join",

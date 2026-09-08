@@ -38,13 +38,22 @@ impl MockProvider {
     /// Construct the mock. Emits a WARN — by design — so a misconfigured
     /// production boot that falls through to the mock is loud, not silent.
     pub fn new() -> Self {
+        Self::with_scopes(vec!["operator".to_string()])
+    }
+
+    /// Construct the mock operator with an explicit scope set (ADR-0117 §8a —
+    /// clearances are issuer-asserted). The bare `new()` operator carries only
+    /// `["operator"]` (no clearance); a cleared pilot operator is built with the
+    /// clearance tokens it is authorised to hold, e.g.
+    /// `with_scopes(vec!["operator".into(), "cui".into(), "signer".into()])`.
+    pub fn with_scopes(scope: Vec<String>) -> Self {
         tracing::warn!("DigitalIdProvider: MOCK — NOT FOR PRODUCTION USE");
         Self {
             identity: DigitalId {
                 id: MOCK_OPERATOR_ID.to_string(),
                 display_name: "Mock Operator".to_string(),
                 issuer: "mock".to_string(),
-                scope: vec!["operator".to_string()],
+                scope,
                 issued_at_ms: MOCK_TIMESTAMP_MS,
             },
         }
