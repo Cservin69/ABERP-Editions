@@ -330,6 +330,27 @@ the point the rating is assigned or changed.
 **Size.** Small — this is the closest entry to Live in the file. The
 value is validated and stored today; only the append is absent.
 
+**Now Live (backend + bridge).** `apps/aberp/src/dpas_rating.rs` +
+`serve::set_partner_dpas_rating_request` assign a supplier's rating:
+`POST /api/partners/:id/dpas-rating` validates + renders it through
+`aberp_compliance::avl::DpasRating` (a free-text rating can never reach the
+`partners.dpas_rating` column or the ledger), writes the column, and fires
+`supplier.dpas_priority_set` (payload: `partner_id` / `dpas_rating` /
+`operator_user_id` / `set_at_ms`) — all on the shared `aberp_db::Handle` in
+one tx (ADR-0099). A malformed rating is a 400, a missing partner a 404;
+the response echoes the previous rating for the operator. Correction to
+the surface note above: the write path did NOT exist either (the column was
+migration-only, marked "written by the firing site (later session)"), so
+this slice added it. 3 end-to-end route tests
+(`apps/aberp/tests/serve_dpas_rating_route.rs`, a fresh `Ledger` re-read
+proves durability). `set_partner_dpas_rating` Tauri command +
+`setPartnerDpasRating` api.ts binding are wired.
+
+**Remaining (small).** An SPA control on the partner screen (the assignment
+is a separate action from the `PartnerInputs` edit form), and an optional
+"clear rating" path (the payload records an unrated supplier by omitting the
+field).
+
 <a id="d-11"></a>
 ### D-11 — Material reserve / release / consume, and certificate capture
 

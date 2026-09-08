@@ -387,6 +387,8 @@ pub fn run() {
             // D-08 — CUI marking + access-event trail on a product.
             commands::apply_product_cui_marking,
             commands::get_product_cui_marking,
+            // D-10 — DPAS priority-rating assignment.
+            commands::set_partner_dpas_rating,
             // S438 (ADR-0089) — per-unit part-UID marking + Part UID Lookup.
             commands::mark_parts,
             commands::part_traceability,

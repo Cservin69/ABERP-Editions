@@ -3024,6 +3024,32 @@ export async function getProductCuiMarking(
   return res.marking;
 }
 
+// ── D-10 — DPAS priority-rating assignment ───────────────────────────
+
+/** D-10 — outcome of assigning a supplier's DPAS rating. `dpas_rating` is the
+ * canonical rendered form (e.g. `"DO-A1"`); `previous_rating` is what the
+ * supplier carried before (null when first assigned). */
+export interface DpasRatingOutcome {
+  partner_id: string;
+  dpas_rating: string;
+  previous_rating: string | null;
+}
+
+/** D-10 — `POST /api/partners/:id/dpas-rating`. Assign the 15 CFR 700 DPAS
+ * rating (`DO`/`DX` + program symbol, e.g. `"DO-A1"`) a supplier is approved
+ * to service; the backend validates + renders it and fires
+ * `supplier.dpas_priority_set`. Backend 400 on a malformed rating, 404 when the
+ * partner does not exist. */
+export async function setPartnerDpasRating(
+  partnerId: string,
+  dpasRating: string,
+): Promise<DpasRatingOutcome> {
+  return invoke<DpasRatingOutcome>("set_partner_dpas_rating", {
+    partnerId,
+    dpasRating,
+  });
+}
+
 /** S438 — one traced part with its production + customer chain resolved. */
 export interface PartTraceRow {
   part_uid: string;

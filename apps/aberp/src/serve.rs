@@ -4696,6 +4696,12 @@ pub fn build_router(state: AppState) -> Router {
                 .put(handle_update_partner)
                 .delete(handle_delete_partner),
         )
+        // D-10 — assign a supplier's DPAS priority rating (fires
+        // supplier.dpas_priority_set).
+        .route(
+            "/api/partners/:id/dpas-rating",
+            post(handle_set_partner_dpas_rating),
+        )
         // S427 — quoting_machines master data. List + create on the
         // collection; get + update + archive (soft, no hard delete) on
         // the resource. Ready-only + bearer-gated; emits mes.machine_*.
@@ -27193,6 +27199,132 @@ async fn handle_get_product_cui_marking(
         Ok(Err(e)) => internal_error("get_product_cui_marking", e),
         Err(je) => internal_error(
             "get_product_cui_marking:join",
+            anyhow!("blocking task panicked: {je}"),
+        ),
+    }
+}
+
+// ── D-10 — DPAS priority-rating assignment (on a supplier partner) ────────
+//
+// Assign the 15 CFR § 700 DPAS rating a supplier is approved to service:
+// validate + render through DpasRating, write the partners.dpas_rating column,
+// and fire `supplier.dpas_priority_set` — all on the shared Handle in one tx.
+// `operator_user_id` is session-sourced.
+
+/// Request body for `POST /api/partners/:id/dpas-rating`.
+#[derive(Debug, Deserialize)]
+pub struct SetDpasRatingBody {
+    pub dpas_rating: String,
+}
+
+/// Assign a DPAS rating to a partner. `Ok(None)` = the partner does not exist
+/// (→ 404); `Err(DpasRatingError)` = a malformed rating (→ 400).
+pub fn set_partner_dpas_rating_request(
+    state: &AppState,
+    operator: &str,
+    partner_id: &str,
+    rating_str: &str,
+) -> Result<Option<crate::dpas_rating::DpasRatingOutcome>> {
+    // Validate + render before touching the DB — a free-text rating can never
+    // reach the column or the ledger.
+    let rating = aberp_compliance::avl::DpasRating::parse(rating_str.trim()).map_err(|e| {
+        anyhow::Error::new(crate::dpas_rating::DpasRatingError::Invalid {
+            value: rating_str.to_string(),
+            reason: e.to_string(),
+        })
+    })?;
+    let rendered = rating.as_str();
+
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
+    let now = time::OffsetDateTime::now_utc();
+    let now_ms = (now.unix_timestamp_nanos() / 1_000_000) as i64;
+    let now_iso = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format now for dpas rating")?;
+    let ledger_meta = LedgerMeta::new(state.tenant.clone(), binary_hash);
+
+    let mut guard = state
+        .db
+        .write()
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tx = guard.transaction().context("begin dpas rating tx")?;
+
+    // Previous rating (for the operator's confirmation UX) + existence check.
+    let previous_rating: Option<Option<String>> = tx
+        .query_row(
+            "SELECT dpas_rating FROM partners
+              WHERE tenant_id = ?1 AND id = ?2 AND deleted_at IS NULL",
+            duckdb::params![state.tenant.as_str(), partner_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok();
+    let previous_rating = match previous_rating {
+        Some(prev) => prev,
+        None => return Ok(None), // no such (live) partner
+    };
+
+    tx.execute(
+        "UPDATE partners SET dpas_rating = ?1, updated_at = ?2
+          WHERE tenant_id = ?3 AND id = ?4 AND deleted_at IS NULL",
+        duckdb::params![rendered, &now_iso, state.tenant.as_str(), partner_id],
+    )
+    .context("UPDATE partners SET dpas_rating")?;
+
+    crate::dpas_rating::append_dpas_priority_set_in_tx(
+        &tx,
+        &ledger_meta,
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        partner_id,
+        &rendered,
+        operator,
+        now_ms,
+    )?;
+    tx.commit().context("commit dpas rating tx")?;
+
+    Ok(Some(crate::dpas_rating::DpasRatingOutcome {
+        partner_id: partner_id.to_string(),
+        dpas_rating: rendered,
+        previous_rating,
+    }))
+}
+
+/// `POST /api/partners/:id/dpas-rating` — assign a supplier's DPAS rating.
+async fn handle_set_partner_dpas_rating(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(partner_id): AxumPath<String>,
+    Json(body): Json<SetDpasRatingBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        set_partner_dpas_rating_request(&state_for_task, &operator, &partner_id, &body.dpas_rating)
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(outcome))) => (StatusCode::CREATED, Json(outcome)).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body("no such partner".to_string())),
+        )
+            .into_response(),
+        Ok(Err(e)) => match e.downcast::<crate::dpas_rating::DpasRatingError>() {
+            Ok(typed) => {
+                (StatusCode::BAD_REQUEST, Json(error_body(typed.to_string()))).into_response()
+            }
+            Err(other) => internal_error("set_partner_dpas_rating", other),
+        },
+        Err(je) => internal_error(
+            "set_partner_dpas_rating:join",
             anyhow!("blocking task panicked: {je}"),
         ),
     }

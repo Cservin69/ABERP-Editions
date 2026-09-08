@@ -49,6 +49,9 @@ pub mod cui_marking;
 // D-09 — DFARS 252.204-7012 cyber-incident intake: the typed payload +
 // the validated append that fires `incident.cyber_detected`.
 pub mod cyber_incident;
+// D-10 — DPAS priority-rating assignment: validate + render the rating, write
+// the partners.dpas_rating column, and fire `supplier.dpas_priority_set`.
+pub mod dpas_rating;
 // The Defense demo seed — one coherent aerospace job written into the
 // bundled `demo` tenant so the Defense screens have something to render.
 // Demo/dev artifact: reachable only through `aberp demo-seed`, which

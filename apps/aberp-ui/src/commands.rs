@@ -1334,6 +1334,23 @@ pub async fn get_product_cui_marking(
     forward_get(&state, &path, true).await
 }
 
+// ── D-10 — DPAS priority-rating assignment ──────────────────────────
+
+/// D-10 — `POST /api/partners/:id/dpas-rating` — assign a supplier's DPAS
+/// priority rating (e.g. `"DO-A1"`). The backend validates + renders the
+/// rating and fires `supplier.dpas_priority_set`; a bad rating is a 400, a
+/// missing partner a 404.
+#[tauri::command]
+pub async fn set_partner_dpas_rating(
+    state: State<'_, AppState>,
+    partner_id: String,
+    dpas_rating: String,
+) -> Result<Value, String> {
+    let path = format!("/api/partners/{}/dpas-rating", urlencode(&partner_id));
+    let body = json!({ "dpas_rating": dpas_rating });
+    forward_post(&state, &path, body).await
+}
+
 // ── PR-172 — notes-history typeahead source ─────────────────────────
 
 /// PR-172 — `GET /api/notes-history?scope=line|invoice|storno`. Used
