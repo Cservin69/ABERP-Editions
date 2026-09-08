@@ -247,11 +247,14 @@ signature", and the signed panel shows the signer identity, algorithm, and
 timestamp over `applySignature`.
 
 **Remaining sub-slices.** The three other kinds —
-`personnel.id_registered` (identity registration),
-`personnel.access_granted` / `_denied` (a personnel-scoped access
-enforcement point, like D-08's). The signature value is limited against the
-mock identity until D-07 lands a real backend, but the ceremony + audit
-landmark are edition-agnostic and demoable today.
+`personnel.id_registered` (identity registration), and
+`personnel.access_granted` / `_denied`. The access pair shares D-08's
+enforcement-point + clearance-model question, now **decided in ADR-0117**
+(the `aberp-compliance::access::authorize` seam + scope-set model); wiring
+the personnel access kinds through it is a follow-on build slice, and
+`id_registered` is thin against the single mock identity. The signature
+value is limited against the mock identity until D-07 lands a real backend,
+but the ceremony + audit landmark are edition-agnostic and demoable today.
 
 <a id="d-08"></a>
 ### D-08 — CUI marking and access control
@@ -292,7 +295,12 @@ proves both rows durable). Tauri commands + `api.ts` bindings
 **Deferred / flagged.** The **deny** path: the Defense pilot is
 single-operator-per-tenant with no clearance/role model, so a read is an
 authenticated GRANT and a denial has no input to branch on — `AccessDecision::Denied`
-is modelled but unreachable until a role model lands.
+is modelled but unreachable until a role model lands. **The model is now
+decided:** ADR-0117 defines the enforcement seam
+(`aberp-compliance::access::authorize`) + a scope-set clearance model
+(`required ⊆ subject.scope`, derived from the `CuiMarking` via
+`for_cui_marking`), fail-closed for controlled markings. Wiring this deny path
+is the follow-on build slice.
 
 **SPA banner shipped (slice 2).** `ProductDetail.svelte` fetches the
 marking on open (recording the access GRANT), renders the DoD banner
