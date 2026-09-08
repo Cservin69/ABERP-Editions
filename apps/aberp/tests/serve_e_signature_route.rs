@@ -19,7 +19,7 @@ use aberp_audit_ledger::{BinaryHash, EventKind, Ledger, TenantId};
 use aberp_digital_id::{MOCK_ALGORITHM, MOCK_OPERATOR_ID};
 
 use aberp::e_signature::{ESignatureError, SignatureCeremonyInput};
-use aberp::serve::{self, AppState};
+use aberp::serve::{self, AppState, SignatureOutcome};
 
 const TEST_TENANT: &str = "serve_e_signature_route_test";
 const TEST_HASH: BinaryHash = BinaryHash::from_bytes([0xE5; 32]);
@@ -33,7 +33,17 @@ fn test_dir(label: &str) -> PathBuf {
     dir
 }
 
-fn build_state(db_path: PathBuf) -> AppState {
+/// An operator authorised to sign (holds `signer`).
+fn signer_state(db_path: PathBuf) -> AppState {
+    build_state(db_path, vec!["operator".to_string(), "signer".to_string()])
+}
+
+/// A scope-less operator (no `signer`) — the ceremony denies.
+fn scopeless_state(db_path: PathBuf) -> AppState {
+    build_state(db_path, vec!["operator".to_string()])
+}
+
+fn build_state(db_path: PathBuf, scopes: Vec<String>) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     AppState {
         db: aberp::serve::open_tenant_handle(&db_path, tenant.clone())
@@ -67,27 +77,27 @@ fn build_state(db_path: PathBuf) -> AppState {
         storefront_credential: aberp::storefront_credential::StorefrontCredentialHandle::dormant(),
         email_outbox_daemon: aberp::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(),
         quote_pdf_rerender_queue: aberp::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
-        digital_id: std::sync::Arc::new(aberp_digital_id::MockProvider::new()),
+        digital_id: std::sync::Arc::new(aberp_digital_id::MockProvider::with_scopes(scopes)),
     }
 }
 
-fn signature_rows(db_path: &PathBuf) -> usize {
+fn kind_count(db_path: &PathBuf, kind: EventKind) -> usize {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     let ledger = Ledger::open(db_path, tenant, TEST_HASH).expect("open ledger");
     ledger
         .entries()
         .expect("read entries")
         .into_iter()
-        .filter(|e| e.kind == EventKind::PersonnelSignatureApplied)
+        .filter(|e| e.kind == kind)
         .count()
 }
 
 #[test]
-fn applying_a_signature_fires_the_ceremony_event() {
+fn a_cleared_signer_applies_the_signature_and_a_grant() {
     let db_path = test_dir("sign").join("tenant.duckdb");
-    let state = build_state(db_path.clone());
+    let state = signer_state(db_path.clone());
 
-    let record = serve::apply_signature_request(
+    let outcome = serve::apply_signature_request(
         &state,
         &SignatureCeremonyInput {
             signed_record_kind: "work_order".to_string(),
@@ -96,20 +106,59 @@ fn applying_a_signature_fires_the_ceremony_event() {
     )
     .expect("signing must succeed");
 
-    // Signer id + algorithm come from the provider, not the request.
-    assert_eq!(record.operator_user_id, MOCK_OPERATOR_ID);
-    assert_eq!(record.signature_algorithm, MOCK_ALGORITHM);
-    assert_eq!(record.signed_record_kind, "work_order");
-    assert_eq!(record.signed_record_id, "wo_123");
+    match outcome {
+        SignatureOutcome::Signed(record) => {
+            // Signer id + algorithm come from the provider, not the request.
+            assert_eq!(record.operator_user_id, MOCK_OPERATOR_ID);
+            assert_eq!(record.signature_algorithm, MOCK_ALGORITHM);
+            assert_eq!(record.signed_record_kind, "work_order");
+            assert_eq!(record.signed_record_id, "wo_123");
+        }
+        SignatureOutcome::Denied => panic!("a cleared signer must not be denied"),
+    }
 
     drop(state);
-    assert_eq!(signature_rows(&db_path), 1);
+    assert_eq!(
+        kind_count(&db_path, EventKind::PersonnelSignatureApplied),
+        1
+    );
+    assert_eq!(kind_count(&db_path, EventKind::PersonnelAccessGranted), 1);
+    assert_eq!(kind_count(&db_path, EventKind::PersonnelAccessDenied), 0);
+}
+
+/// ADR-0117 §8b — a scope-less operator is DENIED, signs nothing, and the
+/// denial is on the trail.
+#[test]
+fn a_scope_less_operator_is_denied_and_signs_nothing() {
+    let db_path = test_dir("deny").join("tenant.duckdb");
+    let state = scopeless_state(db_path.clone());
+
+    let outcome = serve::apply_signature_request(
+        &state,
+        &SignatureCeremonyInput {
+            signed_record_kind: "work_order".to_string(),
+            signed_record_id: "wo_9".to_string(),
+        },
+    )
+    .expect("a denial is not an error");
+    assert!(
+        matches!(outcome, SignatureOutcome::Denied),
+        "a scope-less operator must be denied, got {outcome:?}"
+    );
+
+    drop(state);
+    assert_eq!(
+        kind_count(&db_path, EventKind::PersonnelSignatureApplied),
+        0
+    );
+    assert_eq!(kind_count(&db_path, EventKind::PersonnelAccessGranted), 0);
+    assert_eq!(kind_count(&db_path, EventKind::PersonnelAccessDenied), 1);
 }
 
 #[test]
 fn an_empty_target_is_rejected_and_appends_nothing() {
     let db_path = test_dir("empty-target").join("tenant.duckdb");
-    let state = build_state(db_path.clone());
+    let state = signer_state(db_path.clone());
 
     let err = serve::apply_signature_request(
         &state,
@@ -128,5 +177,8 @@ fn an_empty_target_is_rejected_and_appends_nothing() {
     );
 
     drop(state);
-    assert_eq!(signature_rows(&db_path), 0);
+    assert_eq!(
+        kind_count(&db_path, EventKind::PersonnelSignatureApplied),
+        0
+    );
 }

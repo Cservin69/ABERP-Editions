@@ -246,15 +246,19 @@ kind (invoice / work order / inspection / quote / other) + id, "Apply
 signature", and the signed panel shows the signer identity, algorithm, and
 timestamp over `applySignature`.
 
-**Remaining sub-slices.** The three other kinds —
-`personnel.id_registered` (identity registration), and
-`personnel.access_granted` / `_denied`. The access pair shares D-08's
-enforcement-point + clearance-model question, now **decided in ADR-0117**
-(the `aberp-compliance::access::authorize` seam + scope-set model); wiring
-the personnel access kinds through it is a follow-on build slice, and
-`id_registered` is thin against the single mock identity. The signature
-value is limited against the mock identity until D-07 lands a real backend,
-but the ceremony + audit landmark are edition-agnostic and demoable today.
+**Access pair now Live (ADR-0117).** The e-signature ceremony is gated on a
+`signer` clearance: `POST /api/e-signature` runs
+`aberp-compliance::access::authorize` against `RequiredClearance::of([SCOPE_SIGNER])`
+with the subject's scopes from `current_operator()` (§8a). A cleared signer
+(pilot mock holds `signer`) fires `personnel.access_granted` then signs
+(`personnel.signature_applied`); a scope-less operator fires
+`personnel.access_denied`, **signs nothing, and gets a 403** (§8b, ledger-first
+§8d). Proven by `serve_e_signature_route.rs` (grant + a scope-less-operator
+**deny** test). `SignatureOutcome{Signed,Denied}` drives the 201/403.
+
+**Remaining sub-slice.** Only `personnel.id_registered` (identity
+registration) — thin against the single mock identity; most useful once D-07
+lands a real backend that mints per-operator identities.
 
 <a id="d-08"></a>
 ### D-08 — CUI marking and access control

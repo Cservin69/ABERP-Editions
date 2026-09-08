@@ -20,6 +20,8 @@ use crate::cui::CuiMarking;
 
 /// Controlled Unclassified Information clearance.
 pub const SCOPE_CUI: &str = "cui";
+/// Authorisation to apply an electronic signature (D-15 ceremony gate).
+pub const SCOPE_SIGNER: &str = "signer";
 /// National-security classification clearances (graded, but NOT a lattice —
 /// ADR-0117 Open Q2: `top-secret` does not imply `secret`; a graded operator is
 /// issued each token explicitly).

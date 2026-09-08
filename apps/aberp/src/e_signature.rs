@@ -117,6 +117,73 @@ pub fn append_signature_applied_in_tx(
     Ok(())
 }
 
+/// The `granted_by` sentinel for a self-service authorisation (ADR-0117 §7 —
+/// the identity system authorised it; no distinct second human).
+pub const SELF_SERVICE: &str = "self-service";
+
+/// Append `personnel.access_granted` — the operator was authorised to sign the
+/// named record (ADR-0073 payload).
+pub fn append_access_granted_in_tx(
+    tx: &Transaction<'_>,
+    ledger_meta: &LedgerMeta,
+    ledger_actor: Actor,
+    operator_user_id: &str,
+    resource_kind: &str,
+    resource_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let payload = serde_json::json!({
+        "operator_user_id": operator_user_id,
+        "resource_kind": resource_kind,
+        "resource_id": resource_id,
+        "granted_by": SELF_SERVICE,
+        "reason": reason,
+    });
+    append_in_tx(
+        tx,
+        ledger_meta,
+        EventKind::PersonnelAccessGranted,
+        serde_json::to_vec(&payload).expect("serialize personnel.access_granted"),
+        ledger_actor,
+        Some(format!(
+            "personnel_access_granted:{resource_kind}:{resource_id}"
+        )),
+    )
+    .context("audit append PersonnelAccessGranted")?;
+    Ok(())
+}
+
+/// Append `personnel.access_denied` — the operator was refused access to sign
+/// the named record (ADR-0073 payload).
+pub fn append_access_denied_in_tx(
+    tx: &Transaction<'_>,
+    ledger_meta: &LedgerMeta,
+    ledger_actor: Actor,
+    operator_user_id: &str,
+    resource_kind: &str,
+    resource_id: &str,
+    denied_reason: &str,
+) -> Result<()> {
+    let payload = serde_json::json!({
+        "operator_user_id": operator_user_id,
+        "resource_kind": resource_kind,
+        "resource_id": resource_id,
+        "denied_reason": denied_reason,
+    });
+    append_in_tx(
+        tx,
+        ledger_meta,
+        EventKind::PersonnelAccessDenied,
+        serde_json::to_vec(&payload).expect("serialize personnel.access_denied"),
+        ledger_actor,
+        Some(format!(
+            "personnel_access_denied:{resource_kind}:{resource_id}"
+        )),
+    )
+    .context("audit append PersonnelAccessDenied")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

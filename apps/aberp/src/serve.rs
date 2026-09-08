@@ -27403,10 +27403,18 @@ async fn handle_set_partner_dpas_rating(
 
 /// Apply an electronic signature to a record and fire
 /// `personnel.signature_applied`. Blocking; the handler runs it on the pool.
+/// Outcome of the e-signature ceremony (ADR-0117 gate). `Signed` released the
+/// signature; `Denied` withheld it (operator lacks the `signer` clearance → 403).
+#[derive(Debug)]
+pub enum SignatureOutcome {
+    Signed(crate::e_signature::SignatureCeremonyRecord),
+    Denied,
+}
+
 pub fn apply_signature_request(
     state: &AppState,
     input: &crate::e_signature::SignatureCeremonyInput,
-) -> Result<crate::e_signature::SignatureCeremonyRecord> {
+) -> Result<SignatureOutcome> {
     // Validate the target BEFORE signing so a bad request never mints a
     // signature or a ledger row.
     let kind = input.signed_record_kind.trim();
@@ -27432,12 +27440,52 @@ pub fn apply_signature_request(
         .digital_id
         .current_operator()
         .map_err(|e| anyhow!("digital identity unavailable: {e}"))?;
+    // ADR-0117 — gate the ceremony on the `signer` clearance. The subject's
+    // scopes come from the identity (§8a); a denied operator signs nothing (§8b).
+    let subject =
+        aberp_compliance::access::AccessSubject::new(identity.id.clone(), identity.scope.clone());
+    let required =
+        aberp_compliance::access::RequiredClearance::of(&[aberp_compliance::access::SCOPE_SIGNER]);
+    let decision = aberp_compliance::access::authorize(&subject, &required);
+
+    let ledger_meta = LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let mut guard = state
+        .db
+        .write()
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tx = guard.transaction().context("begin e-signature tx")?;
+
+    if !decision.is_granted() {
+        // §8b/§8d — record the denial (ledger-first), sign nothing, release nothing.
+        crate::e_signature::append_access_denied_in_tx(
+            &tx,
+            &ledger_meta,
+            Actor::from_local_cli(Ulid::new().to_string(), &identity.id),
+            &identity.id,
+            kind,
+            id,
+            decision.reason_str(),
+        )?;
+        tx.commit().context("commit e-signature deny tx")?;
+        return Ok(SignatureOutcome::Denied);
+    }
+
+    // Granted — record the access grant, then sign and record the §11.50
+    // manifestation, all in the one tx.
+    crate::e_signature::append_access_granted_in_tx(
+        &tx,
+        &ledger_meta,
+        Actor::from_local_cli(Ulid::new().to_string(), &identity.id),
+        &identity.id,
+        kind,
+        id,
+        decision.reason_str(),
+    )?;
     let signed_bytes = crate::e_signature::payload_to_sign(kind, id);
     let signature = state
         .digital_id
         .sign(&signed_bytes)
         .map_err(|e| anyhow!("signature failed: {e}"))?;
-
     let record = crate::e_signature::SignatureCeremonyRecord::assemble(
         input,
         &signature.signer_id,
@@ -27446,13 +27494,6 @@ pub fn apply_signature_request(
         signature.signed_at_ms,
     )
     .map_err(anyhow::Error::new)?;
-
-    let ledger_meta = LedgerMeta::new(state.tenant.clone(), binary_hash);
-    let mut guard = state
-        .db
-        .write()
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    let tx = guard.transaction().context("begin e-signature tx")?;
     crate::e_signature::append_signature_applied_in_tx(
         &tx,
         &ledger_meta,
@@ -27460,7 +27501,7 @@ pub fn apply_signature_request(
         &record,
     )?;
     tx.commit().context("commit e-signature tx")?;
-    Ok(record)
+    Ok(SignatureOutcome::Signed(record))
 }
 
 /// `POST /api/e-signature` — apply an electronic signature to a record.
@@ -27479,7 +27520,17 @@ async fn handle_apply_signature(
     let result =
         tokio::task::spawn_blocking(move || apply_signature_request(&state_for_task, &input)).await;
     match result {
-        Ok(Ok(record)) => (StatusCode::CREATED, Json(record)).into_response(),
+        Ok(Ok(SignatureOutcome::Signed(record))) => {
+            (StatusCode::CREATED, Json(record)).into_response()
+        }
+        // ADR-0117 §8b — a denied operator signs nothing (403).
+        Ok(Ok(SignatureOutcome::Denied)) => (
+            StatusCode::FORBIDDEN,
+            Json(error_body(
+                "access denied: operator lacks the signer clearance".to_string(),
+            )),
+        )
+            .into_response(),
         Ok(Err(e)) => match e.downcast::<crate::e_signature::ESignatureError>() {
             Ok(typed) => {
                 (StatusCode::BAD_REQUEST, Json(error_body(typed.to_string()))).into_response()
