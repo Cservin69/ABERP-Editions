@@ -15,13 +15,19 @@
   import { onMount } from "svelte";
 
   import {
+    applyProductCuiMarking,
     createStockMovement,
     getProduct,
     getProductBom,
+    getProductCuiMarking,
     listProducts,
     listStockMovements,
     putProductBom,
     type BomLine,
+    type CuiBand,
+    type CuiCategory,
+    type CuiDissemination,
+    type CuiMarkingRecord,
     type Product,
     type StockMovement,
   } from "../lib/api";
@@ -61,7 +67,62 @@
   // is the operator's daily driver — adding a recipe is a per-product
   // setup task). The active tab is local SPA state; the modal closing
   // resets to default on the next open via this var's declaration.
-  let activeTab: "stock" | "bom" = $state("stock");
+  let activeTab: "stock" | "bom" | "cui" = $state("stock");
+
+  // D-08 — CUI marking. `cuiMarking` is the product's current marking (null
+  // when unmarked); the read on load records a CUI access GRANT server-side
+  // when a marking exists. The form band/category/dissemination compose an
+  // apply request; the backend re-validates + renders the banner.
+  let cuiMarking = $state<CuiMarkingRecord | null>(null);
+  let cuiBand = $state<CuiBand>("cui");
+  let cuiCategory = $state<CuiCategory>("cti");
+  let cuiDissem = $state<CuiDissemination[]>([]);
+  let cuiSubmitting = $state(false);
+  let cuiError = $state<string | null>(null);
+
+  const CUI_BANDS: { value: CuiBand; label: string }[] = [
+    { value: "unclassified", label: "Unclassified" },
+    { value: "cui", label: "CUI" },
+    { value: "confidential", label: "Confidential" },
+    { value: "secret", label: "Secret" },
+    { value: "top_secret", label: "Top Secret" },
+  ];
+  const CUI_CATEGORIES: CuiCategory[] = [
+    "cti",
+    "prvcy",
+    "expt",
+    "crit",
+    "lei",
+    "ifg",
+    "inf",
+    "isvi",
+    "proc",
+    "prop",
+  ];
+  const CUI_DISSEM: CuiDissemination[] = ["noforn", "fedcon", "nocon", "dl_only"];
+
+  function toggleDissem(d: CuiDissemination) {
+    cuiDissem = cuiDissem.includes(d)
+      ? cuiDissem.filter((x) => x !== d)
+      : [...cuiDissem, d];
+  }
+
+  async function applyCuiMarking() {
+    if (productId === null) return;
+    cuiError = null;
+    cuiSubmitting = true;
+    try {
+      cuiMarking = await applyProductCuiMarking(productId, {
+        band: cuiBand,
+        category: cuiBand === "cui" ? cuiCategory : null,
+        dissemination: cuiDissem,
+      });
+    } catch (err: unknown) {
+      cuiError = err instanceof Error ? err.message : String(err);
+    } finally {
+      cuiSubmitting = false;
+    }
+  }
 
   // S232 — BOM authoring tab state.
   // - `bomLines` mirrors the GET /api/products/:id/bom response (the
@@ -120,9 +181,15 @@
     loadState = "loading";
     loadError = null;
     try {
-      const [p, m] = await Promise.all([getProduct(id), listStockMovements(id)]);
+      const [p, m, cui] = await Promise.all([
+        getProduct(id),
+        listStockMovements(id),
+        // Reading a MARKED product's marking records a CUI access GRANT.
+        getProductCuiMarking(id),
+      ]);
       product = p;
       movements = m;
+      cuiMarking = cui;
       loadState = "loaded";
     } catch (err: unknown) {
       loadState = "error";
@@ -226,6 +293,14 @@
     <button type="button" class="quiet-button" onclick={onClose}>Close</button>
   </header>
 
+  <!-- D-08 — CUI/classification banner. Rendered at the top of the record
+       (DoD marking convention) whenever the product carries a marking. -->
+  {#if cuiMarking !== null}
+    <div class="cui-banner" role="note" aria-label="Control marking">
+      {cuiMarking.banner_str}
+    </div>
+  {/if}
+
   {#if loadState === "loading"}
     <p class="product-detail__muted">Loading…</p>
   {:else if loadState === "error"}
@@ -290,6 +365,18 @@
       >
         <span class="product-detail__tab-label">Receptúra</span>
         <span class="product-detail__tab-sub">BOM</span>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        class="product-detail__tab"
+        class:product-detail__tab--active={activeTab === "cui"}
+        aria-selected={activeTab === "cui"}
+        onclick={() => (activeTab = "cui")}
+        data-testid="product-detail-tab-cui"
+      >
+        <span class="product-detail__tab-label">Jelölés</span>
+        <span class="product-detail__tab-sub">CUI</span>
       </button>
     </div>
 
@@ -512,10 +599,126 @@
         {/if}
       </section>
     {/if}
+
+    {#if activeTab === "cui"}
+      <section class="product-detail__form cui-panel" aria-label="CUI marking">
+        <h3>CUI / classification marking</h3>
+        {#if cuiMarking !== null}
+          <p class="cui-current">
+            Current: <strong class="mono">{cuiMarking.banner_str}</strong>
+            <span class="product-detail__muted">
+              (applied {cuiMarking.applied_at_utc})
+            </span>
+          </p>
+        {:else}
+          <p class="product-detail__muted">No marking applied.</p>
+        {/if}
+
+        {#if cuiError}
+          <p class="product-detail__error" role="alert">{cuiError}</p>
+        {/if}
+
+        <div class="cui-form">
+          <label>
+            <span>Band</span>
+            <select bind:value={cuiBand}>
+              {#each CUI_BANDS as b (b.value)}
+                <option value={b.value}>{b.label}</option>
+              {/each}
+            </select>
+          </label>
+
+          {#if cuiBand === "cui"}
+            <label>
+              <span>Category</span>
+              <select bind:value={cuiCategory}>
+                {#each CUI_CATEGORIES as c (c)}
+                  <option value={c}>{c.toUpperCase()}</option>
+                {/each}
+              </select>
+            </label>
+          {/if}
+
+          <fieldset>
+            <legend>Limited dissemination</legend>
+            {#each CUI_DISSEM as d (d)}
+              <label class="cui-check">
+                <input
+                  type="checkbox"
+                  checked={cuiDissem.includes(d)}
+                  onchange={() => toggleDissem(d)}
+                />
+                <span>{d.toUpperCase().replace("_", " ")}</span>
+              </label>
+            {/each}
+          </fieldset>
+
+          <button
+            type="button"
+            class="page__primary"
+            disabled={cuiSubmitting}
+            onclick={applyCuiMarking}
+          >
+            {cuiSubmitting ? "Applying…" : "Apply marking"}
+          </button>
+        </div>
+      </section>
+    {/if}
   {/if}
 </dialog>
 
 <style>
+  /* D-08 — CUI/classification banner + marking form. The banner follows the
+     DoD convention: centred, bold, high-contrast, spanning the record. */
+  .cui-banner {
+    margin: 0.5rem 0 0.75rem;
+    padding: 0.4rem 0.75rem;
+    text-align: center;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    background: #4a0d0d;
+    color: #fff;
+    border-radius: 4px;
+  }
+  .cui-panel .cui-current {
+    margin: 0 0 0.75rem;
+  }
+  .cui-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+  .cui-form label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    font-weight: 600;
+  }
+  .cui-form select {
+    font: inherit;
+    padding: 0.4rem 0.5rem;
+  }
+  .cui-form fieldset {
+    border: 1px solid var(--border, #d5d5d5);
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem 0.75rem;
+  }
+  .cui-form legend {
+    font-weight: 600;
+    padding: 0 0.3rem;
+  }
+  .cui-check {
+    flex-direction: row !important;
+    align-items: center;
+    gap: 0.4rem;
+    font-weight: 500 !important;
+    margin-top: 0.3rem;
+  }
+  .cui-check input {
+    width: auto;
+  }
+
   .product-detail {
     width: min(900px, 90vw);
     max-height: 90vh;

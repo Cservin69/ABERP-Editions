@@ -264,9 +264,15 @@ proves both rows durable). Tauri commands + `api.ts` bindings
 **Deferred / flagged.** The **deny** path: the Defense pilot is
 single-operator-per-tenant with no clearance/role model, so a read is an
 authenticated GRANT and a denial has no input to branch on — `AccessDecision::Denied`
-is modelled but unreachable until a role model lands. The SPA banner +
-apply control on the products screen is the next slice (backend + bridge
-ship first, mirroring D-11).
+is modelled but unreachable until a role model lands.
+
+**SPA banner shipped (slice 2).** `ProductDetail.svelte` fetches the
+marking on open (recording the access GRANT), renders the DoD banner
+(centred, bold, high-contrast) at the top of the product record when
+marked, and adds a **CUI** tab with the apply form (band → category when
+`cui` → limited-dissemination checkboxes) over `applyProductCuiMarking`.
+D-08 is now Live end-to-end; only the deferred deny/clearance path
+remains.
 
 <a id="d-09"></a>
 ### D-09 — DFARS 252.204-7012 cyber-incident reporting
