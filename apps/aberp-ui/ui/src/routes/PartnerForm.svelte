@@ -15,7 +15,13 @@
   // mandatory fields are starred in the label; the validation error
   // surfaces under the field on the next round-trip.
 
-  import { createPartner, updatePartner, type Partner } from "../lib/api";
+  import {
+    createPartner,
+    setPartnerDpasRating,
+    updatePartner,
+    type DpasRatingOutcome,
+    type Partner,
+  } from "../lib/api";
   import {
     composePartnerInputs,
     CUSTOMER_TYPE_OPTIONS,
@@ -46,6 +52,37 @@
   let submitting = $state(false);
   let submitError: string | null = $state(null);
   let fieldErrors: Record<string, string> = $state({});
+
+  // D-10 — DPAS priority-rating assignment (edit mode only; the rating is a
+  // separate audited action from the partner-field save). The backend
+  // validates the `DO`/`DX` + program symbol and fires
+  // `supplier.dpas_priority_set`.
+  let dpasPriority = $state<"DO" | "DX">("DO");
+  let dpasSymbol = $state("");
+  let dpasSubmitting = $state(false);
+  let dpasError = $state<string | null>(null);
+  let dpasResult = $state<DpasRatingOutcome | null>(null);
+
+  async function assignDpasRating() {
+    if (partner === null) return;
+    const symbol = dpasSymbol.trim();
+    if (symbol.length === 0) {
+      dpasError = "Program symbol is required (e.g. A1).";
+      return;
+    }
+    dpasError = null;
+    dpasSubmitting = true;
+    try {
+      dpasResult = await setPartnerDpasRating(
+        partner.id,
+        `${dpasPriority}-${symbol}`,
+      );
+    } catch (err: unknown) {
+      dpasError = err instanceof Error ? err.message : String(err);
+    } finally {
+      dpasSubmitting = false;
+    }
+  }
 
   // Initialise the form from the partner prop on first paint. The
   // parent remounts the modal whenever `modalState` flips, so this
@@ -398,6 +435,50 @@
         </section>
       </div>
 
+      {#if isEdit && partner !== null}
+        <section class="dpas" aria-label="DPAS priority rating">
+          <h3 class="dpas__title">DPAS priority rating</h3>
+          <p class="dpas__hint">
+            15 CFR § 700 / FAR 11.6 — the priority rating this supplier is
+            approved to service. Assigning it records an audited
+            <code>supplier.dpas_priority_set</code> event.
+          </p>
+          {#if dpasResult !== null}
+            <p class="dpas__current" role="status">
+              Assigned: <strong>{dpasResult.dpas_rating}</strong>
+              {#if dpasResult.previous_rating}
+                <span class="dpas__prev">(was {dpasResult.previous_rating})</span>
+              {/if}
+            </p>
+          {/if}
+          {#if dpasError !== null}
+            <p class="error" role="alert">{dpasError}</p>
+          {/if}
+          <div class="dpas__row">
+            <select bind:value={dpasPriority} aria-label="Priority symbol">
+              <option value="DO">DO</option>
+              <option value="DX">DX</option>
+            </select>
+            <span class="dpas__dash">-</span>
+            <input
+              type="text"
+              bind:value={dpasSymbol}
+              placeholder="A1"
+              aria-label="Program identifier symbol"
+              class="dpas__symbol"
+            />
+            <button
+              type="button"
+              class="quiet-button"
+              disabled={dpasSubmitting}
+              onclick={assignDpasRating}
+            >
+              {dpasSubmitting ? "Assigning…" : "Assign rating"}
+            </button>
+          </div>
+        </section>
+      {/if}
+
       {#if submitError !== null}
         <div class="error" role="alert">
           <strong>Could not save partner.</strong>
@@ -422,6 +503,40 @@
 </dialog>
 
 <style>
+  /* D-10 — DPAS priority-rating assignment block (edit mode). */
+  .dpas {
+    margin-top: 1rem;
+    padding: 0.75rem 1rem 1rem;
+    border: 1px solid var(--border, #d5d5d5);
+    border-radius: 8px;
+  }
+  .dpas__title {
+    margin: 0 0 0.25rem;
+    font-size: 1rem;
+  }
+  .dpas__hint {
+    margin: 0 0 0.6rem;
+    font-size: 0.85rem;
+    color: var(--text-muted, #666);
+  }
+  .dpas__current {
+    margin: 0 0 0.5rem;
+  }
+  .dpas__prev {
+    color: var(--text-muted, #666);
+  }
+  .dpas__row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .dpas__dash {
+    font-weight: 700;
+  }
+  .dpas__symbol {
+    width: 6rem;
+  }
+
   dialog.partner-form {
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-base);

@@ -603,6 +603,12 @@
     {#if activeTab === "cui"}
       <section class="product-detail__form cui-panel" aria-label="CUI marking">
         <h3>CUI / classification marking</h3>
+        <p class="cui-note">
+          Access posture: every open of a marked record is logged as a
+          <strong>granted</strong> access (32 CFR § 2002.4 lawful-government-purpose).
+          A deny path awaits a clearance/role model — until then any
+          authenticated operator is granted.
+        </p>
         {#if cuiMarking !== null}
           <p class="cui-current">
             Current: <strong class="mono">{cuiMarking.banner_str}</strong>
@@ -683,6 +689,15 @@
   }
   .cui-panel .cui-current {
     margin: 0 0 0.75rem;
+  }
+  .cui-note {
+    margin: 0 0 0.75rem;
+    padding: 0.5rem 0.7rem;
+    border-radius: 6px;
+    background: var(--surface-muted, #f2f2f2);
+    color: var(--text-muted, #555);
+    font-size: 0.85rem;
+    line-height: 1.4;
   }
   .cui-form {
     display: flex;

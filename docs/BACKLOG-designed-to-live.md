@@ -346,10 +346,13 @@ this slice added it. 3 end-to-end route tests
 proves durability). `set_partner_dpas_rating` Tauri command +
 `setPartnerDpasRating` api.ts binding are wired.
 
-**Remaining (small).** An SPA control on the partner screen (the assignment
-is a separate action from the `PartnerInputs` edit form), and an optional
-"clear rating" path (the payload records an unrated supplier by omitting the
-field).
+**SPA control shipped.** `PartnerForm.svelte` (edit mode) now carries a DPAS
+priority-rating block — a `DO`/`DX` symbol select + program-identifier input
++ "Assign rating" button over `setPartnerDpasRating`, showing the assigned
+(and previous) rating. D-10 is now Live end-to-end.
+
+**Remaining (optional).** A "clear rating" path (the payload records an
+unrated supplier by omitting the field).
 
 <a id="d-11"></a>
 ### D-11 — Material reserve / release / consume, and certificate capture
