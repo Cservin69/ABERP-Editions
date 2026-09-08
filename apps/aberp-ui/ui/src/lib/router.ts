@@ -44,6 +44,8 @@ export type AppRoute =
   | "work-orders"
   // D-09 — DFARS 252.204-7012 cyber-incident intake (Compliance area).
   | "cyber-incidents"
+  // D-15 — the 21 CFR Part 11 e-signature ceremony (Compliance area).
+  | "e-signature"
   | "qa"
   | "dispatch"
   | "workshop"
@@ -208,6 +210,8 @@ export function parseRoute(hash: string): AppRoute {
       return "qc-reports";
     case "cyber-incidents":
       return "cyber-incidents";
+    case "e-signature":
+      return "e-signature";
     case "purchase-orders":
       return "purchase-orders";
     case "tenants":

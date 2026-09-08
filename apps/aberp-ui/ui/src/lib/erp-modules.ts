@@ -281,7 +281,11 @@ export const MODULES: ErpModule[] = [
     label_hu: "Megfelelőség",
     label_en: "Compliance",
     glyph: "🛡️",
-    routes: [{ id: "cyber-incidents", label: "Kiberincidens / Cyber incident" }],
+    routes: [
+      { id: "cyber-incidents", label: "Kiberincidens / Cyber incident" },
+      // D-15 — the 21 CFR Part 11 e-signature ceremony.
+      { id: "e-signature", label: "E-aláírás / E-signature" },
+    ],
   },
   {
     id: "master-data",

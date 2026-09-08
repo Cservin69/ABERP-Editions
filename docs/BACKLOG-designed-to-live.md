@@ -240,8 +240,14 @@ the seam. The append rides the shared `aberp_db::Handle` in one tx
 proves durability). `apply_signature` Tauri command + `applySignature`
 api.ts binding are wired.
 
-**Remaining sub-slices.** The ceremony UI (sub-slice 2), and the three
-other kinds — `personnel.id_registered` (identity registration),
+**Sub-slice 2 Live: the ceremony UI.** A Compliance-area **E-signature**
+screen (`apps/aberp-ui/ui/src/routes/ESignatureView.svelte`) — pick a record
+kind (invoice / work order / inspection / quote / other) + id, "Apply
+signature", and the signed panel shows the signer identity, algorithm, and
+timestamp over `applySignature`.
+
+**Remaining sub-slices.** The three other kinds —
+`personnel.id_registered` (identity registration),
 `personnel.access_granted` / `_denied` (a personnel-scoped access
 enforcement point, like D-08's). The signature value is limited against the
 mock identity until D-07 lands a real backend, but the ceremony + audit

@@ -60,6 +60,8 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "workshop",
   // D-09 — DFARS 252.204-7012 cyber-incident intake (Compliance module).
   "cyber-incidents",
+  // D-15 — the 21 CFR Part 11 e-signature ceremony (Compliance module).
+  "e-signature",
   "tenant",
   "nav-credentials",
   "maintenance",
@@ -160,6 +162,8 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   "audit-events": "audit",
   // D-09 (S362) — DFARS cyber-incident intake, own Compliance module.
   "cyber-incidents": "compliance",
+  // D-15 (S355) — the e-signature ceremony, Compliance module.
+  "e-signature": "compliance",
 };
 
 // The expected area for each AppRoute. The two-area usage-frequency
@@ -229,6 +233,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   "purchase-orders": "operational",
   // D-09 (S362) — DFARS cyber-incident intake, operational area.
   "cyber-incidents": "operational",
+  // D-15 (S355) — the e-signature ceremony, operational area.
+  "e-signature": "operational",
   // S433 — multi-tenant admin (maintenance area, under Settings).
   tenants: "maintenance",
 };

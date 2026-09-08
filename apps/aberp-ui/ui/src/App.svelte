@@ -85,6 +85,7 @@
   import InspectionPlansList from "./routes/InspectionPlansList.svelte";
   import QcReportsList from "./routes/QcReportsList.svelte";
   import CyberIncidentView from "./routes/CyberIncidentView.svelte";
+  import ESignatureView from "./routes/ESignatureView.svelte";
   import MarginProfilesList from "./routes/MarginProfilesList.svelte";
   import AvlVendorsList from "./routes/AvlVendorsList.svelte";
   // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Work Orders v1.
@@ -856,6 +857,8 @@
           <Purchasing />
         {:else if route === "cyber-incidents"}
           <CyberIncidentView />
+        {:else if route === "e-signature"}
+          <ESignatureView />
         {:else if route === "invoices-new"}
           <!-- PR-87 / session-112 — full-page issuance route. The
                IssueInvoice form was a `<dialog>` modal mounted inside
