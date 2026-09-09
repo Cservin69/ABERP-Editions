@@ -838,6 +838,17 @@ into it.
    *Severity.* No customer-visible loss beyond a wrongly-Failed quote the
    operator can Retry, and it needs a five-deep erroring backlog to fire.
 
+> **A2 — ✅ CLOSED (D-20 A2, 2026-09-09).** `enqueue_one` now reads a fast-path
+> `jobs::job_exists` BEFORE the download and skips the fetch+encrypt when the
+> row already exists AND its blob is still on disk (`dest_path.exists() &&
+> job_exists`). The `&& dest_path.exists()` half is the correctness care the
+> item flagged: a row whose blob write was interrupted or was cleaned off disk
+> has no file, so the fast-path falls through and re-downloads to REPAIR it
+> rather than strand a Fetched row the extract step would fail. `insert_fetched_job`'s
+> ON CONFLICT remains the real idempotency guard. Pinned (revert-proof) by
+> `d_priceq_an_already_enqueued_quote_is_not_re_downloaded` via a
+> download-counting mock. **A3 and A4 below remain open.**
+
 2. **A2 — the enqueue loop re-downloads and re-encrypts every still-
    `received` quote, every cycle, before the idempotency check.** Cycle
    wall-clock therefore grows with the size of the un-enqueued storefront

@@ -1297,6 +1297,25 @@ pub fn list_jobs(conn: &Connection, tenant_id: &str) -> Result<Vec<PricingJobRow
     Ok(out)
 }
 
+/// D-20 A2 — does a `quote_pricing_jobs` row exist for `(tenant, quote_id)`,
+/// in ANY state? The enqueue path reads this BEFORE downloading a CAD: a
+/// still-`received` storefront quote reappears on every poll until it is priced
+/// and posted back, and re-downloading + re-encrypting its blob each cycle made
+/// the cycle's wall clock grow with the un-posted backlog rather than with new
+/// work. The row's existence is the idempotency signal; `insert_fetched_job`'s
+/// `ON CONFLICT` still backs it up, so this is a fast-path, not the guard.
+pub fn job_exists(conn: &Connection, tenant_id: &str, quote_id: &str) -> Result<bool> {
+    ensure_schema(conn)?;
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM quote_pricing_jobs WHERE tenant_id = ? AND quote_id = ?",
+            params![tenant_id, quote_id],
+            |r| r.get(0),
+        )
+        .context("count quote_pricing_jobs for enqueue fast-path")?;
+    Ok(n > 0)
+}
+
 /// Daemon read path — find the oldest non-terminal job to advance.
 /// Returns `None` if the queue is empty.
 ///

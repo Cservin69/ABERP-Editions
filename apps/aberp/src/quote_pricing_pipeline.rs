@@ -1163,6 +1163,23 @@ impl PricingPipelineService {
         Ok((fetched, enqueued))
     }
 
+    /// D-20 A2 — does a pricing-jobs row already exist for `quote_id`? Reads
+    /// through the shared handle. The enqueue fast-path uses this to skip
+    /// re-downloading an already-enqueued quote's CAD every poll.
+    async fn job_exists(&self, quote_id: &str) -> Result<bool> {
+        let db = self.deps.db.clone();
+        let tenant_id = self.deps.tenant.as_str().to_string();
+        let qid = quote_id.to_string();
+        spawn_blocking(move || -> Result<bool> {
+            let conn = db
+                .read()
+                .context("shared read: enqueue fast-path (D-20 A2)")?;
+            jobs::job_exists(&conn, &tenant_id, &qid)
+        })
+        .await
+        .context("job_exists spawn_blocking join")?
+    }
+
     /// Pull metadata + the first CAD file, save to artifact_dir,
     /// insert a `Fetched` job, and emit `QuotePricingFetched`. Returns
     /// `Ok(true)` when a fresh row was inserted, `Ok(false)` when the
@@ -1199,9 +1216,28 @@ impl PricingPipelineService {
 
         // Download to artifact_dir/<id>/<filename>.
         let dest_dir = self.config.artifact_dir.join(qid);
+        let dest_path = dest_dir.join(&cad.filename);
+
+        // D-20 A2 — fast-path: a still-`received` quote reappears on every poll
+        // until it is priced and posted back. If we already enqueued it AND its
+        // encrypted blob is still on disk, there is nothing to fetch — skip the
+        // download + encrypt (which otherwise made the cycle's wall clock grow
+        // with the un-posted backlog, re-pulling and re-encrypting every blob
+        // each cycle). The `ON CONFLICT` in `insert_fetched_job` remains the
+        // real idempotency guard; this only spares the wasted I/O.
+        //
+        // The `&& dest_path.exists()` half is load-bearing (the A2 caveat): a
+        // row whose blob write was interrupted, or whose blob was later cleaned
+        // off disk, has no file — fall through and re-download to repair it, so
+        // the fast-path never strands a Fetched row with a missing artifact
+        // that the extract step would then fail. Reading the row FIRST and the
+        // file SECOND is the safe order: a present file with a present row is
+        // the only combination we skip.
+        if dest_path.exists() && self.job_exists(qid).await? {
+            return Ok(false);
+        }
         std::fs::create_dir_all(&dest_dir)
             .with_context(|| format!("mkdir {}", dest_dir.display()))?;
-        let dest_path = dest_dir.join(&cad.filename);
         let file_url = format!(
             "{}/api/quotes/{}/files/{}",
             self.config.base_url, qid, cad.filename
@@ -7966,6 +8002,124 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// D-20 A2 — [`d_priceq_mock`] that counts CAD `/files/` downloads, so a
+    /// test can assert an already-enqueued quote is NOT re-downloaded. The
+    /// counter increments once per `/files/` GET the mock serves.
+    async fn d_priceq_counting_mock(
+        cad_bytes: Vec<u8>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let downloads = std::sync::Arc::new(AtomicU64::new(0));
+        let counter = downloads.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let cad = cad_bytes.clone();
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let resp: Vec<u8> = if req.contains("/files/") {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let mut r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                             Content-Length: {}\r\n\r\n",
+                            cad.len()
+                        )
+                        .into_bytes();
+                        r.extend_from_slice(&cad);
+                        r
+                    } else if req.contains("/api/quotes") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 13\r\n\r\n{\"quotes\":[]}"
+                            .to_vec()
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 2\r\n\r\n{}"
+                            .to_vec()
+                    };
+                    let _ = sock.write_all(&resp).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (addr, downloads)
+    }
+
+    /// **D-20 A2 — an already-enqueued quote is not re-downloaded.**
+    ///
+    /// A still-`received` storefront quote reappears on every poll until it is
+    /// priced and posted. Re-pulling and re-encrypting its blob each cycle made
+    /// the cycle grow with the un-posted backlog. The fast-path skips the
+    /// download when the row exists AND its blob is on disk — but must still
+    /// re-download when the blob is GONE (interrupted write / cleaned off disk),
+    /// or it would strand a Fetched row the extract step then fails.
+    ///
+    /// Revert-proof: delete the fast-path `return Ok(false)` and the second
+    /// assert (still 1 download) goes red; drop the `&& dest_path.exists()`
+    /// half and the repair assert (2 downloads) goes red.
+    #[tokio::test]
+    async fn d_priceq_an_already_enqueued_quote_is_not_re_downloaded() {
+        let (addr, downloads) =
+            d_priceq_counting_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("a2-nodl.duckdb");
+        let artifacts = s430_temp("art");
+        let qid = "00000000-0000-0000-0000-0000000c0001";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+
+        assert!(
+            svc.enqueue_one(s430_quote(qid, "part.step")).await.unwrap(),
+            "first enqueue inserts a fresh row"
+        );
+        assert_eq!(
+            downloads.load(Ordering::SeqCst),
+            1,
+            "the first enqueue downloads the CAD exactly once"
+        );
+
+        // Same still-received quote, twice more: idempotent skip, NO new fetch.
+        for _ in 0..2 {
+            assert!(
+                !svc.enqueue_one(s430_quote(qid, "part.step")).await.unwrap(),
+                "an already-enqueued quote returns Ok(false)"
+            );
+        }
+        assert_eq!(
+            downloads.load(Ordering::SeqCst),
+            1,
+            "an already-enqueued quote whose blob is on disk must NOT be re-downloaded"
+        );
+
+        // The A2 caveat: if the blob is gone, the fast-path must fall through
+        // and re-download to REPAIR it rather than strand the row.
+        std::fs::remove_dir_all(artifacts.join(qid)).expect("wipe the blob");
+        assert!(
+            !svc.enqueue_one(s430_quote(qid, "part.step")).await.unwrap(),
+            "the row still exists, so the insert is still an idempotent skip"
+        );
+        assert_eq!(
+            downloads.load(Ordering::SeqCst),
+            2,
+            "a row whose artifact went missing must be re-downloaded, not stranded"
+        );
+        assert!(
+            artifacts.join(qid).join("part.step").exists(),
+            "the repaired blob is back on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
     }
 
     /// [`d_priceq_mock`] with a kill switch. While the returned flag is set the
