@@ -1742,6 +1742,24 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         }
     }
 
+    // D-21 R1 (ADR-0119) — claim the whole-DB advisory lock for serve's WHOLE
+    // lifetime, here: AFTER the edition/foreign-path + prod-tenant refuse-to-
+    // start guards above (so those refuse FIRST, before any lock file is made),
+    // and BEFORE the install-journal resume + the first DuckDB open + any audit
+    // write below. An audit-writing `aberp` subcommand cannot then race the
+    // serve writer on the audit table cross-process (the in-process Handle mutex
+    // + AUDIT_APPEND_LOCK serialise writers only INSIDE this process). Held in
+    // `_serve_db_lock` for the rest of `run` — which spans the whole serve run —
+    // released on shutdown or crash (flock frees when the fd closes). A boot
+    // that cannot acquire it means another writer (a second `aberp serve`, or a
+    // drain/retry/submit CLI) holds this tenant's DB: refuse to boot rather than
+    // fork the tamper-evident chain. The held lock IS the liveness signal a
+    // refused CLI reads — no pidfile. NAMED guard (not `_`) so it is held, not
+    // dropped immediately.
+    let _serve_db_lock =
+        crate::db_lock::acquire_for_serve_boot(&args.db, std::time::Duration::from_secs(10))
+            .context("acquire the whole-DB lock at serve boot (ADR-0119 R1)")?;
+
     // ADR-0098 R2 (finding B) — BEFORE any DuckDB open at boot, resume any
     // install-intent journal left by a `durable_checkpoint` that crashed mid
     // swap. This deterministically completes an interrupted rename, or deletes a

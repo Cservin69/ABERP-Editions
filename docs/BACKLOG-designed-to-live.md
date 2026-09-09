@@ -938,6 +938,22 @@ Note the scope honestly: this gate covers the **second-writer** class. The
 seq-2508 incident was **not** that class — it was a lost DB commit (ADR-0099
 §R2.2), tracked separately as [D-22](#d-22).
 
+> **R1 — ✅ CLOSED (D-21 R1, ADR-0119, 2026-09-09).** New `apps/aberp/src/db_lock.rs`
+> (structural sibling of `submission_lock.rs`): a whole-DB `fs2` exclusive
+> advisory flock on `.aberp-db.lock` next to the tenant DB. `aberp serve` holds
+> it for its whole lifetime (`acquire_for_serve_boot`, after the edition/foreign
+> -path + prod-tenant refusals, before the first DB open); the held lock IS the
+> liveness signal (no pidfile — flock frees on process death). The 14
+> audit-writing CLIs (`issue_*`, `submit_*`, `retry_*`, `*_annulment`,
+> `mark_abandoned`, `poll_*`, `observe_*`, `drain_*`, `recover_from_nav`)
+> `acquire_or_refuse` FIRST and refuse with an actionable message while serve
+> holds it; read-only CLIs are ungated. A bare relative `--db` resolves the lock
+> against the cwd rather than erroring. Subsumes the tracked-but-unbuilt S386
+> single-serve guard. Gate-enforced by a new **CHECK 10R** (serve holds it + all
+> 14 CLIs acquire-or-refuse) and revert-proof by a new negative probe (harness
+> 79/79, teeth). Full aberp suite green modulo the documented serve-boot
+> baseline red. **R3 below remains.**
+
 **R1 — cross-process table-side forks are still detection-only.** A CLI
 subcommand (`aberp retry-submission`, `aberp drain-pending-retries`, …)
 running while `aberp serve` holds the DB is outside every in-process lock,

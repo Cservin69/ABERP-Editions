@@ -67,7 +67,7 @@ PROBE_SHARD_INDEX="${PROBE_SHARD_INDEX:-1}"
 # accounting site (which is how a probe stops being a probe), moves the count
 # and goes RED instead of quietly testing less. Adding a probe is a deliberate
 # one-line bump here.
-EXPECTED_PROBES=78
+EXPECTED_PROBES=79
 if [[ ! "$PROBE_SHARD_TOTAL" =~ ^[1-9][0-9]*$ ]] || [[ ! "$PROBE_SHARD_INDEX" =~ ^[1-9][0-9]*$ ]] \
    || (( PROBE_SHARD_INDEX > PROBE_SHARD_TOTAL )); then
   echo "NEGATIVE-PROBES: ✗ FAILED — bad shard spec (1-based, index <= total): PROBE_SHARD_INDEX=$PROBE_SHARD_INDEX PROBE_SHARD_TOTAL=$PROBE_SHARD_TOTAL" >&2
@@ -753,6 +753,13 @@ echo "[CHECK 10Q] a SECOND caller of an extracted pre-Handle boot fn (the daemon
 c="$(fresh)"
 printf '\nfn _adr0119r2_probe_second_boot_caller() {\n    // D-21 R2 regression: a second caller of a boot fn that is allow-listed as\n    // "pre-Handle, cannot fork". If a daemon reaches it post-Handle, the\n    // exemption is false — CHECK 10Q must catch the extra caller.\n    let _ = boot_reconcile_audit_mirror(todo!(), todo!(), todo!());\n}\n' >> "$c/apps/aberp/src/serve.rs"
 expect_fail "$c" "must have exactly ONE caller" "CHECK 10Q — a second caller of an extracted pre-Handle boot fn is caught (the exemption cannot rot into a wholesale one)"
+
+# ── CHECK 10R — D-21 R1 (ADR-0119) whole-DB lock wiring ───────────────────────
+echo "[CHECK 10R] an audit-writing CLI that DROPS its whole-DB lock acquire (re-opening the cross-process fork window) — 10R must go red"
+c="$(fresh)"
+grep -v "db_lock::acquire_or_refuse" "$c/apps/aberp/src/drain_submission_queue.rs" > "$c/apps/aberp/src/drain_submission_queue.rs.tmp"
+mv "$c/apps/aberp/src/drain_submission_queue.rs.tmp" "$c/apps/aberp/src/drain_submission_queue.rs"
+expect_fail "$c" "do NOT acquire the whole-DB lock" "CHECK 10R — an audit-writing CLI that stops acquiring the whole-DB lock is caught (the cross-process fork window stays closed)"
 
 echo "[CHECK 10P] HARNESS — deleting the scanner must NOT read as \"no violations\"; the gate must say so"
 c="$(fresh)"

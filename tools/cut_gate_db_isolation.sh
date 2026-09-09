@@ -1346,6 +1346,32 @@ else
   done
 fi
 
+# ── CHECK 10R — D-21 R1 (ADR-0119): the whole-DB cross-process lock is wired.
+#    `aberp serve` must hold the whole-DB advisory lock for its lifetime, and
+#    every audit-WRITING `aberp` subcommand must acquire-or-refuse it FIRST, so
+#    a CLI cannot race the serve writer on the audit table cross-process. If any
+#    audit-writing CLI drops its acquire, it silently re-opens the fork window
+#    ADR-0099 §R2 left detection-only; if serve stops holding the lock, every
+#    CLI refusal is inert. Both are RED here.
+echo "[CHECK 10R] D-21 R1 — serve + audit-writing CLIs hold/refuse the whole-DB lock (ADR-0119)"
+r1_clis="issue_invoice submit_invoice retry_submission mark_abandoned issue_storno issue_modification request_technical_annulment submit_annulment poll_ack poll_annulment_ack observe_receiver_confirmation drain_submission_queue drain_pending_retries recover_from_nav"
+r1_missing=""
+for m in $r1_clis; do
+  if ! grep -q "db_lock::acquire_or_refuse" "apps/aberp/src/${m}.rs" 2>/dev/null; then
+    r1_missing="$r1_missing $m"
+  fi
+done
+if [[ -n "$r1_missing" ]]; then
+  note "✗ FAIL: CHECK 10R — these audit-writing CLIs do NOT acquire the whole-DB lock (db_lock::acquire_or_refuse) and could fork the chain against a live serve (ADR-0119 R1):${r1_missing}"; fail=1
+else
+  note "✓ all 14 audit-writing CLIs acquire-or-refuse the whole-DB lock"
+fi
+if grep -q "db_lock::acquire_for_serve_boot" apps/aberp/src/serve.rs; then
+  note "✓ aberp serve holds the whole-DB lock for its lifetime (the CLI refusals have teeth)"
+else
+  note "✗ FAIL: CHECK 10R — aberp serve does NOT acquire the whole-DB lock at boot; every CLI refusal is inert (ADR-0119 R1)."; fail=1
+fi
+
 # ── CHECK 11 — ADR-0116 D2: the RECOVERY-EVIDENCE guard.
 #
 #    Recovery evidence (*CORRUPT*, *RECOVERY*, *DEFORK*, *PRE-*, healed-*,

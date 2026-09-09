@@ -192,6 +192,10 @@ pub fn run(args: &SubmitAnnulmentArgs) -> Result<()> {
     // NAV `manageAnnulment` call. On the Handle the `WriteGuard`'s drop runs
     // `fsync_data_paths` FIRST and only then the lockstep mirror sync, and
     // `Handle::durable_ack` below claims that flush's outcome.
+    // D-21 R1 (ADR-0119) — refuse to run alongside a live `aberp serve` (or
+    // another audit-writing CLI): this command appends to the audit ledger, and
+    // serve holds the whole-DB lock for its lifetime. Held for this run.
+    let _db_lock = crate::db_lock::acquire_or_refuse(&args.db, "submit-annulment")?;
     let db = aberp_db::Handle::open_default(&args.db, tenant.clone())
         .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
     let precondition = {

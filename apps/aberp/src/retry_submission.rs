@@ -260,6 +260,10 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
     //    the lockstep mirror sync; `Handle::durable_ack` claims that flush's
     //    outcome before the operator is told the retry succeeded. The writer
     //    mutex is NOT held across the wire send — each window re-acquires it.
+    // D-21 R1 (ADR-0119) — refuse to run alongside a live `aberp serve` (or
+    // another audit-writing CLI): this command appends to the audit ledger, and
+    // serve holds the whole-DB lock for its lifetime. Held for this run.
+    let _db_lock = crate::db_lock::acquire_or_refuse(&args.db, "retry-submission")?;
     let db = aberp_db::Handle::open_default(&args.db, tenant.clone())
         .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
     let (ready_invoice, idempotency_key) = {

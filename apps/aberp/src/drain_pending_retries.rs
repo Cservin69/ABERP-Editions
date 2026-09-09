@@ -208,6 +208,10 @@ pub fn run(args: &DrainPendingRetriesArgs) -> Result<()> {
     //     coherent `try_clone` reads, and runs the lockstep mirror sync on
     //     every WriteGuard drop — so the drain never holds two live
     //     instances. Same pattern as `submit_invoice::run`.
+    // D-21 R1 (ADR-0119) — refuse to run alongside a live `aberp serve` (or
+    // another audit-writing CLI): this command appends to the audit ledger, and
+    // serve holds the whole-DB lock for its lifetime. Held for this run.
+    let _db_lock = crate::db_lock::acquire_or_refuse(&args.db, "drain-pending-retries")?;
     let db = aberp_db::Handle::open_default(&args.db, tenant.clone())
         .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
 

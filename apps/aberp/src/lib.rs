@@ -30,6 +30,9 @@ pub mod branding_config;
 pub mod build_profile;
 pub mod catalogue_push;
 pub mod cli;
+// D-21 R1 (ADR-0119) — whole-DB cross-process advisory lock: serve holds it for
+// its lifetime; audit-writing CLIs refuse while it is held.
+pub mod db_lock;
 pub mod drain_pending_retries;
 pub mod drain_submission_queue;
 // S275 / PR-264 / F22 — DuckDB-binding helpers + the project's

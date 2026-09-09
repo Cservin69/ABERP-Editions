@@ -155,6 +155,10 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
     //    on the DB + WAL + tenant dir FIRST and only then the lockstep mirror
     //    sync, and `Handle::durable_ack` below claims that flush's outcome so
     //    the operator-visible "OK" cannot outrun the bytes.
+    // D-21 R1 (ADR-0119) — refuse to run alongside a live `aberp serve` (or
+    // another audit-writing CLI): this command appends to the audit ledger, and
+    // serve holds the whole-DB lock for its lifetime. Held for this run.
+    let _db_lock = crate::db_lock::acquire_or_refuse(&args.db, "mark-abandoned")?;
     let db = aberp_db::Handle::open_default(&args.db, tenant.clone())
         .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
 

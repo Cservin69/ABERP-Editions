@@ -155,6 +155,10 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
     // path passes state.db). Same dual-use resolution as poll_ack/submit run().
     let tenant_for_handle = TenantId::new(args.tenant.clone())
         .ok_or_else(|| anyhow!("tenant value '{}' is empty or has a null byte", args.tenant))?;
+    // D-21 R1 (ADR-0119) — refuse to run alongside a live `aberp serve` (or
+    // another audit-writing CLI): this command appends to the audit ledger, and
+    // serve holds the whole-DB lock for its lifetime. Held for this run.
+    let _db_lock = crate::db_lock::acquire_or_refuse(&args.db, "issue-storno")?;
     let db_handle = aberp_db::Handle::open_default(&args.db, tenant_for_handle)
         .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
     let summary = storno_from_inputs(
