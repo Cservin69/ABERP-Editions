@@ -607,7 +607,7 @@ function is_allowed(name,   k){ for(k=1;k<=n_allow;k++) if(A[k]==name) return 1;
 }
 SERVE_SCAN_AWK
   # Boot allow-list: the sequential pre-serve-loop create/provision/seed region.
-  serve_strays="$(awk -v allow="run,seed_demo_sample_data" -f "$scan_awk" "$sv" || true)"
+  serve_strays="$(awk -v allow="run,seed_demo_sample_data,boot_reconcile_audit_mirror,boot_seed_quoting_tunables" -f "$scan_awk" "$sv" || true)"
   rm -f "$scan_awk"
   if [[ -n "$serve_strays" ]]; then
     flag10 "✗ serve.rs has a live-path Connection::open/open_with_flags/append_reopen OUTSIDE the Handle (Session-C regression):"
@@ -819,7 +819,7 @@ else
     case " $c2_set " in *" $f "*) continue;; esac
     case "$f" in crates/aberp-db/*|crates/aberp-snapshot/*) continue;; esac
     if [[ "$f" == "apps/aberp/src/serve.rs" ]]; then
-      actual="$(awk -v allow="run,seed_demo_sample_data" -f "$scan" "$f" 2>/dev/null | wc -l | tr -d ' ')"
+      actual="$(awk -v allow="run,seed_demo_sample_data,boot_reconcile_audit_mirror,boot_seed_quoting_tunables" -f "$scan" "$f" 2>/dev/null | wc -l | tr -d ' ')"
     else
       actual="$(awk -f "$scan" "$f" 2>/dev/null | wc -l | tr -d ' ')"
     fi
@@ -901,7 +901,7 @@ else
     frozen="$(awk -v p="$f" '$1!="#" && $2==p{print $1}' "$manifest")"
     [[ -z "$frozen" ]] && continue
     if [[ "$f" == "apps/aberp/src/serve.rs" ]]; then
-      openers="$(awk -v allow="run,seed_demo_sample_data" -f "$scan" "$f" 2>/dev/null)"
+      openers="$(awk -v allow="run,seed_demo_sample_data,boot_reconcile_audit_mirror,boot_seed_quoting_tunables" -f "$scan" "$f" 2>/dev/null)"
     else
       openers="$(awk -f "$scan" "$f" 2>/dev/null)"
     fi
@@ -942,7 +942,7 @@ else
     case " $c2_set " in *" $f "*) continue;; esac
     case "$f" in crates/aberp-db/*|crates/aberp-snapshot/*) continue;; esac
     if [[ "$f" == "apps/aberp/src/serve.rs" ]]; then
-      sigs="$(awk -v allow="run,seed_demo_sample_data" -f "$scan" "$f" 2>/dev/null | sed 's/^[0-9]*://')"
+      sigs="$(awk -v allow="run,seed_demo_sample_data,boot_reconcile_audit_mirror,boot_seed_quoting_tunables" -f "$scan" "$f" 2>/dev/null | sed 's/^[0-9]*://')"
     else
       sigs="$(awk -f "$scan" "$f" 2>/dev/null | sed 's/^[0-9]*://')"
     fi
@@ -1006,12 +1006,12 @@ wf_manifest="tools/adr0099_write_fork_residuals.txt"
 # a different file than the booted Handle owns) or a PRE-Handle boot append
 # (record_tenant_boot runs before open_tenant_handle) — neither can fork the
 # serve writer, exactly as emit_reopen_cli).
-WF_ALLOW="run,seed_demo_sample_data,record_upgrade_snapshot_mismatch_audit,emit_reopen_cli,append_reopen,emit_tenant_reopen"
+WF_ALLOW="run,seed_demo_sample_data,record_upgrade_snapshot_mismatch_audit,emit_reopen_cli,append_reopen,emit_tenant_reopen,boot_reconcile_audit_mirror,boot_seed_quoting_tunables"
 if [[ ! -f "$wf_scan" || ! -f "$wf_manifest" ]]; then
   flag10M "✗ write-fork scanner or frozen manifest missing: $wf_scan / $wf_manifest"
 else
   # 10M-a — the MIGRATED in-process seams must stay at ZERO write-fork.
-  serve_wf="$(awk -v allow="run,seed_demo_sample_data,record_upgrade_snapshot_mismatch_audit" -f "$wf_scan" apps/aberp/src/serve.rs 2>/dev/null || true)"
+  serve_wf="$(awk -v allow="run,seed_demo_sample_data,record_upgrade_snapshot_mismatch_audit,boot_reconcile_audit_mirror,boot_seed_quoting_tunables" -f "$wf_scan" apps/aberp/src/serve.rs 2>/dev/null || true)"
   snap_wf="$(awk -v allow="emit_reopen_cli" -f "$wf_scan" apps/aberp/src/snapshot.rs 2>/dev/null || true)"
   if [[ -n "$serve_wf" ]]; then
     flag10M "✗ serve.rs REGREW an in-process write-fork (independent opener + append) — route it through the shared Handle (db.write()+append_in_tx), ADR-0099:"
@@ -1306,6 +1306,44 @@ else
     fi
   fi
   rm -f "$tf_files" "$tf_raw" "$tf_cur" "$tf_froz"
+fi
+
+# ── CHECK 10Q — D-21 R2 (ADR-0119): the pre-Handle boot fns extracted out of
+#    `run` are pinned to a SINGLE caller, `run`, BEFORE `open_tenant_handle`.
+#
+#    Removing `serve.rs:run` from the audit-writer allow-list (10M-a / 10N /
+#    10P) closed the "a fork planted in run's 3,000-line body passes the gate"
+#    hole. Its replacement — allow-listing the extracted `boot_*` fns instead —
+#    is only sound while each such fn runs PRE-HANDLE and single-threaded. If a
+#    daemon (post-Handle, multi-threaded) later calls one, it would falsely
+#    inherit the "cannot fork the serve writer" exemption. This is the anti-rot
+#    pin the ADR-0119 adversarial pass required: exactly one caller, and it is
+#    before the Handle exists.
+#
+#    Teeth: cut_gate_negative_probes.sh adds a second caller of a boot_* fn (or
+#    moves its call past `open_tenant_handle`) and this reds.
+echo "[CHECK 10Q] D-21 R2 — extracted boot fns pinned to one pre-Handle caller (ADR-0119)"
+q_sv="apps/aberp/src/serve.rs"
+q_handle_line="$(grep -nE 'open_tenant_handle\(&args\.db' "$q_sv" | head -1 | cut -d: -f1)"
+if [[ -z "$q_handle_line" ]]; then
+  note "✗ FAIL: CHECK 10Q could not locate the open_tenant_handle boundary in $q_sv"; fail=1
+else
+  for bfn in boot_reconcile_audit_mirror boot_seed_quoting_tunables; do
+    # A CALL is any `<bfn>(` on a line that is not the definition (`fn <bfn>(`).
+    # Match anywhere on the line — not just the first token — so an embedded
+    # call (`let _ = <bfn>(…)`, `if <bfn>(…)`, `foo(<bfn>(…))`) is caught too.
+    # Comment lines are excluded so the fn's own doc reference cannot mask a
+    # real second caller.
+    q_call_lines="$(grep -nE "\b${bfn}\(" "$q_sv" | grep -vE ":[[:space:]]*(//|\*)" | grep -vE "\bfn ${bfn}\(" | cut -d: -f1)"
+    q_n="$(printf '%s\n' "$q_call_lines" | grep -c . || true)"
+    if [[ "$q_n" -ne 1 ]]; then
+      note "✗ FAIL: CHECK 10Q — ${bfn} must have exactly ONE caller (run, pre-Handle); found ${q_n}. A second caller would falsely inherit the pre-Handle 'cannot fork' exemption (ADR-0119 R2)."; fail=1
+    elif [[ "$q_call_lines" -ge "$q_handle_line" ]]; then
+      note "✗ FAIL: CHECK 10Q — ${bfn}'s caller is at L${q_call_lines}, at/after the Handle boundary L${q_handle_line}; the pre-Handle exemption is false there (ADR-0119 R2)."; fail=1
+    else
+      note "✓ ${bfn} — one pre-Handle caller (L${q_call_lines}, before the Handle at L${q_handle_line})"
+    fi
+  done
 fi
 
 # ── CHECK 11 — ADR-0116 D2: the RECOVERY-EVIDENCE guard.

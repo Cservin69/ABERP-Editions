@@ -67,7 +67,7 @@ PROBE_SHARD_INDEX="${PROBE_SHARD_INDEX:-1}"
 # accounting site (which is how a probe stops being a probe), moves the count
 # and goes RED instead of quietly testing less. Adding a probe is a deliberate
 # one-line bump here.
-EXPECTED_PROBES=77
+EXPECTED_PROBES=78
 if [[ ! "$PROBE_SHARD_TOTAL" =~ ^[1-9][0-9]*$ ]] || [[ ! "$PROBE_SHARD_INDEX" =~ ^[1-9][0-9]*$ ]] \
    || (( PROBE_SHARD_INDEX > PROBE_SHARD_TOTAL )); then
   echo "NEGATIVE-PROBES: ✗ FAILED — bad shard spec (1-based, index <= total): PROBE_SHARD_INDEX=$PROBE_SHARD_INDEX PROBE_SHARD_TOTAL=$PROBE_SHARD_TOTAL" >&2
@@ -747,6 +747,12 @@ echo "[CHECK 10P] NON-TRIGGER — a read-clone appender inside #[cfg(test)] must
 c="$(fresh)"
 printf '\n#[cfg(test)]\nmod adr0099r2_test_probe {\n    fn t(db: &aberp_db::HandleArc) {\n        let mut conn = db.read().unwrap();\n        let tx = conn.transaction().unwrap();\n        let _ = aberp_audit_ledger::append_in_tx(&tx, todo!(), todo!(), vec![], todo!(), None);\n    }\n}\n' >> "$c/apps/aberp/src/serve.rs"
 expect_pass "$c" "CHECK 10P — a read-clone appender inside #[cfg(test)] is correctly IGNORED"
+
+# ── CHECK 10Q — D-21 R2 (ADR-0119) extracted-boot-fn caller-set pin ───────────
+echo "[CHECK 10Q] a SECOND caller of an extracted pre-Handle boot fn (the daemon-inherits-the-exemption rot) — 10Q must go red"
+c="$(fresh)"
+printf '\nfn _adr0119r2_probe_second_boot_caller() {\n    // D-21 R2 regression: a second caller of a boot fn that is allow-listed as\n    // "pre-Handle, cannot fork". If a daemon reaches it post-Handle, the\n    // exemption is false — CHECK 10Q must catch the extra caller.\n    let _ = boot_reconcile_audit_mirror(todo!(), todo!(), todo!());\n}\n' >> "$c/apps/aberp/src/serve.rs"
+expect_fail "$c" "must have exactly ONE caller" "CHECK 10Q — a second caller of an extracted pre-Handle boot fn is caught (the exemption cannot rot into a wholesale one)"
 
 echo "[CHECK 10P] HARNESS — deleting the scanner must NOT read as \"no violations\"; the gate must say so"
 c="$(fresh)"

@@ -28,10 +28,16 @@ apps/aberp/src/tenant_registry.rs:emit_tenant_reopen
 # ── PRE-HANDLE BOOT ─────────────────────────────────────────────────────────
 # Runs BEFORE `open_tenant_handle` (apps/aberp/src/serve.rs) and before any
 # daemon is spawned, so there is exactly one thread and no Handle to share.
-# `serve.rs:run` is the boot fn itself and carries the boot mirror reconcile;
-# it is allow-listed by CHECK 10M and 10N for the same reason. KNOWN HOLE,
-# named in ADR-0099 §R2: a fork planted inside `run` passes all three checks.
-apps/aberp/src/serve.rs:run
+#
+# D-21 R2 (ADR-0119): `serve.rs:run` is NO LONGER allow-listed. Its one inline
+# pre-Handle audit write — the boot mirror reconcile — was extracted into the
+# named `boot_reconcile_audit_mirror`, allow-listed below. `run` is now RED for
+# any audit write left in (or added to) its body, closing the "fork hidden in a
+# 3,000-line fn" hole ADR-0099 §R2 named. Each allow-listed boot fn is pinned to
+# exactly one caller (`run`, pre-Handle) by the CHECK 10N-style caller-set gate,
+# so the exemption cannot rot into a wholesale one if a daemon later calls it.
+apps/aberp/src/serve.rs:boot_reconcile_audit_mirror
+apps/aberp/src/serve.rs:boot_seed_quoting_tunables
 apps/aberp/src/serve.rs:record_upgrade_snapshot_mismatch_audit
 crates/aberp-snapshot/src/recover.rs:append_staged_audit_row
 crates/aberp-snapshot/src/recover.rs:build_and_validate

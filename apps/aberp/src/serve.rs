@@ -1166,6 +1166,230 @@ pub fn run_recover(args: &crate::cli::RecoverArgs) -> Result<()> {
     }
 }
 
+/// D-21 R2 — the pre-Handle boot step that reconciles the audit-ledger
+/// mirror against the DB (ADR-0119). Extracted out of [`run`]'s body so the
+/// fork-gate exemption (cut-gate CHECK 10M/10N/10P, `adr0099_audit_writer_residuals.txt`)
+/// covers THIS one before-Handle step rather than the whole 3,000-line `run`.
+///
+/// It runs single-threaded, before `open_tenant_handle`, with no daemon
+/// spawned and no shared `Handle` in existence — so its audit writes (the
+/// mirror reconcile and, on the AHEAD branch, the recovery replay) provably
+/// cannot fork the serve writer. That property is what the allow-list entry
+/// asserts, and the CHECK 10N-style caller-set pin keeps true: this fn has
+/// exactly one caller, `run`, before the Handle exists.
+fn boot_reconcile_audit_mirror(
+    args: &ServeArgs,
+    tenant: &TenantId,
+    binary_hash_handle: &BinaryHashHandle,
+) -> Result<()> {
+    tracing::info!("boot step: reconciling audit-ledger mirror with DB (idempotent recovery)");
+    {
+        let _s = tracing::info_span!("serve.recover_audit_mirror").entered();
+        let conn = Connection::open(&args.db).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for audit-ledger mirror recovery",
+                args.db.display()
+            )
+        })?;
+        aberp_audit_ledger::ensure_schema(&conn)
+            .context("ensure audit-ledger schema at serve boot")?;
+        refuse_a_latched_interrupted_restore(&args.db, &conn)?;
+        let mirror_path = aberp_audit_ledger::mirror_path_for(&args.db);
+        match aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror_path) {
+            Ok(action) => tracing::info!(?action, "audit-ledger mirror reconciled at boot"),
+            Err(e) => {
+                // ADR-0099 R3 — the route is decided by `boot_mirror_route`, and
+                // ONLY a clean mirror-AHEAD is auto-recoverable.
+                //
+                // R2 also routed `MirrorDivergedFromDb` here, on the reasoning
+                // that `replay_mirror_delta` refuses a colliding replay with
+                // `SequenceConflict`, so a diverged mirror could only reach
+                // `Recovered` if the replay was conflict-free. That safety was
+                // UNREACHABLE, twice over:
+                //
+                //   * `replay_mirror_delta` is only ever asked to replay seqs
+                //     ABOVE the imported snapshot's head, into a STAGING DB that
+                //     by construction holds only `[1..=snapshot_head]`. It never
+                //     targets an occupied seq, so it never collides.
+                //   * Even if it did, `audit_ledger` has NO `UNIQUE(seq)` — S341
+                //     dropped that ART index (duckdb#23046 / S332) — so a
+                //     colliding INSERT still reports `rows_changed = 1` and
+                //     returns `Ok`.
+                //
+                // And the loss is structural, not incidental: recovery rebuilds
+                // from a SNAPSHOT and replays the MIRROR's delta, so the DB's
+                // rows at the re-used seqs (2508/2509 in the incident) — which
+                // exist in NEITHER input — are dropped, `Recovered` is logged,
+                // and boot continues with a WARN. Measured on the fork shape:
+                // four committed DB rows gone. Pre-R2 that same shape returned
+                // `MirrorCorruptPreserved` and went boot-fatal, so a human
+                // looked. Making the diagnosis precise must not make the
+                // handling lossy.
+                //
+                // There is no automatic resolution: two different committed
+                // entries claim one seq, and choosing between them is a business
+                // question about which events really happened. Both copies are on
+                // disk (the mirror preserved to a side file, the DB untouched),
+                // and boot refuses so an operator reconciles them.
+                let route = boot_mirror_route(&e);
+                let refusal_context = boot_mirror_refusal_context(&e);
+                match route {
+                    BootMirrorRoute::AutoRecover { trigger } => {
+                        // ADR-0095 §1 — a CLEAN ahead mirror is the fingerprint of
+                        // a torn-write / lost DB commit (root cause #4). Instead of
+                        // a fatal stop, attempt the guarded, reversible
+                        // auto-recovery: rebuild from the latest VALID snapshot and
+                        // REPLAY the preserved ahead mirror (the chunk-3 P1 guard
+                        // already copied it to `<mirror>.ahead-*.bak`;
+                        // recover_or_refuse READS it, never truncates it). Nothing
+                        // is dropped: `ensure_consistent_with_db` proved the shared
+                        // prefix agrees before reporting AHEAD, so the mirror
+                        // strictly EXTENDS the DB's chain. On a guard-rail refusal
+                        // keep today's preserve-and-surface (demoted from the ONLY
+                        // outcome to the last resort). Drop the open handle first so
+                        // the atomic swap can rename over the live path cleanly.
+                        tracing::error!(
+                            error = %e,
+                            trigger,
+                            "audit-ledger mirror is AHEAD of the DB — attempting ADR-0095 §1 \
+                             auto-recovery"
+                        );
+                        drop(conn);
+                        let recovery =
+                            attempt_db_auto_recovery(&args.db, tenant, binary_hash_handle, trigger);
+                        match recovery {
+                            Ok(BootRecovery::Recovered) => {
+                                tracing::warn!(
+                                    "ADR-0095 §1 — auto-recovery reconciled the ahead mirror \
+                                     with the DB at boot"
+                                );
+                                // ADR-0116 D5 — make the RECOVERED state a
+                                // rollback point. Recorded here, acted on by
+                                // the snapshot daemon, which cannot exist
+                                // until recovery has returned — so
+                                // `recover_or_refuse` provably owns the mirror
+                                // at boot and no snapshot precedes it.
+                                crate::snapshot::note_boot_recovery(
+                                    crate::snapshot::BootRecoveryReason::MirrorAhead,
+                                );
+                            }
+                            Ok(BootRecovery::Refused(reason)) => {
+                                tracing::error!(
+                                    reason = %reason,
+                                    "REFUSING to boot — ahead mirror could not be safely \
+                                     auto-recovered"
+                                );
+                                return Err(anyhow::Error::new(e)).context(refusal_context);
+                            }
+                            Err(rec_err) => {
+                                return Err(rec_err).context(
+                                    "ADR-0095 auto-recovery of an ahead mirror failed \
+                                     mechanically at boot",
+                                );
+                            }
+                        }
+                    }
+                    BootMirrorRoute::RefuseFatal => {
+                        tracing::error!(
+                            target: "audit_event",
+                            event = "audit_mirror_boot_refused",
+                            error = %e,
+                            "REFUSING to boot — the audit-ledger mirror could not be reconciled \
+                             with the DB and the condition is NOT auto-recoverable. Evidence is \
+                             preserved on disk; investigate before re-running (ADR-0099 R3)"
+                        );
+                        return Err(anyhow::Error::new(e)).context(refusal_context);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// D-21 R2 — the pre-Handle boot step that ensures the quoting-tunables +
+/// catalogue schemas and seeds them (ADR-0119). Extracted out of [`run`]'s
+/// body because the ADR-0097 N1 tolerance-cost-rate migration seed inside it
+/// appends an audit row (`tolerance_seed_meta`), making this a pre-Handle
+/// audit-writing boot step. Runs single-threaded, before `open_tenant_handle`,
+/// no daemon and no shared Handle in existence — so its one audit append
+/// cannot fork the serve writer. Allow-listed as a boot step (not via the
+/// old blanket `run` exemption), pinned to its single `run` caller.
+fn boot_seed_quoting_tunables(
+    args: &ServeArgs,
+    tenant: &TenantId,
+    binary_hash_handle: &BinaryHashHandle,
+) -> Result<()> {
+    {
+        let _s = tracing::info_span!("serve.ensure_quoting_tunables_schema").entered();
+        let mut conn = Connection::open(&args.db).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for quoting_tunables boot migration",
+                args.db.display()
+            )
+        })?;
+        crate::quoting_tunables::ensure_schema(&mut conn, tenant.as_str())
+            .context("ensure quoting_tunables schemas + seeds at serve boot")?;
+        // S4 / ADR-0094 Gap 2 — machine-rate catalogue: idempotent schema +
+        // six-family seed (insert-if-absent). Co-located with the tunables
+        // boot migration; the pricing pipeline snapshots this into the engine.
+        crate::quoting_machine_rates::ensure_schema(&conn)
+            .context("ensure quoting_machine_rates schema at serve boot")?;
+        crate::quoting_machine_rates::seed_machine_rates_if_absent(&conn, tenant.as_str())
+            .context("seed quoting_machine_rates families at serve boot")?;
+        // S6 / ADR-0094 Gap 3 — gear-process catalogue: idempotent schema +
+        // five-process seed (insert-if-absent). Co-located with the machine-
+        // rate boot migration; the pricing pipeline snapshots this into the
+        // engine's 11th `gear_process_rates` argument. Seeding is inert for
+        // existing quotes (gear cost accrues only on a part that carries gear
+        // ops, a brand-new defaulted-empty field).
+        crate::quoting_gear_processes::ensure_schema(&conn)
+            .context("ensure quoting_gear_processes schema at serve boot")?;
+        crate::quoting_gear_processes::seed_gear_processes_if_absent(&conn, tenant.as_str())
+            .context("seed quoting_gear_processes at serve boot")?;
+        // T4 / ADR-0097 Part 2 — tolerance cost-rate catalogue: idempotent
+        // schema + the five-band seed. The pricing pipeline snapshots this into
+        // the engine's `CatalogueSnapshot.tolerance_cost_rates`.
+        //
+        // The band set is laid down ONCE PER TENANT (marker-gated, so an
+        // operator deleting a band is not overruled on the next boot — B1), and
+        // `loose`/`standard` stay zero-contribution so an un-toleranced part
+        // still prices byte-identically (R4). The migration arm re-prices a
+        // tenant still on the original all-zero seed and is audited inside its
+        // own write tx, hence the `LedgerMeta` (N1).
+        crate::quoting_tolerance_cost_rates::ensure_schema(&conn)
+            .context("ensure quoting_tolerance_cost_rates schema at serve boot")?;
+        let tolerance_seed_meta = LedgerMeta::new(
+            tenant.clone(),
+            binary_hash_handle
+                .wait()
+                .context("await binary hash for tolerance cost-rate seed audit")?,
+        );
+        crate::quoting_tolerance_cost_rates::seed_tolerance_cost_rates_if_absent(
+            &mut conn,
+            &tolerance_seed_meta,
+            tenant.as_str(),
+        )
+        .context("seed quoting_tolerance_cost_rates at serve boot")?;
+        // ADR-0112 Part C (D-19 slice C2) — drilling cost-model catalogue.
+        // The SCHEMA is laid down in BOTH editions (an empty table is
+        // byte-identical to a lazily-created one, and gating it would fork the
+        // physical schema). The SEED is Defense-ONLY: only a build that
+        // `machining_cost_model_allowed()` gets the per-material rows — and even
+        // then every seeded row is feed-zero / inert, so the engine prices no
+        // drilling until an operator tunes a real feed. A Portable tenant has
+        // zero rows, so its snapshot slice is empty and the drilling path is
+        // never entered (the empty slice IS the edition gate).
+        crate::quoting_drilling_rates::ensure_schema(&conn)
+            .context("ensure quoting_drilling_rates schema at serve boot")?;
+        if crate::build_profile::machining_cost_model_allowed() {
+            crate::quoting_drilling_rates::seed_drilling_rates_if_absent(&conn, tenant.as_str())
+                .context("seed quoting_drilling_rates at serve boot")?;
+        }
+    }
+    Ok(())
+}
+
 pub fn run(args: &ServeArgs) -> Result<()> {
     // S433 — honor-once tenant switch. The Tenants admin screen writes a
     // one-shot `~/.aberp/next_tenant` hint and restarts the binary; this
@@ -1750,73 +1974,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // seeds for the tolerance enum + the parameters singleton. MUST run
     // AFTER the materials migration above because `quoting_stock_adjustments`
     // app-layer-FK-checks against `quoting_materials.grade`.
-    {
-        let _s = tracing::info_span!("serve.ensure_quoting_tunables_schema").entered();
-        let mut conn = Connection::open(&args.db).with_context(|| {
-            format!(
-                "open tenant DuckDB at {} for quoting_tunables boot migration",
-                args.db.display()
-            )
-        })?;
-        crate::quoting_tunables::ensure_schema(&mut conn, tenant.as_str())
-            .context("ensure quoting_tunables schemas + seeds at serve boot")?;
-        // S4 / ADR-0094 Gap 2 — machine-rate catalogue: idempotent schema +
-        // six-family seed (insert-if-absent). Co-located with the tunables
-        // boot migration; the pricing pipeline snapshots this into the engine.
-        crate::quoting_machine_rates::ensure_schema(&conn)
-            .context("ensure quoting_machine_rates schema at serve boot")?;
-        crate::quoting_machine_rates::seed_machine_rates_if_absent(&conn, tenant.as_str())
-            .context("seed quoting_machine_rates families at serve boot")?;
-        // S6 / ADR-0094 Gap 3 — gear-process catalogue: idempotent schema +
-        // five-process seed (insert-if-absent). Co-located with the machine-
-        // rate boot migration; the pricing pipeline snapshots this into the
-        // engine's 11th `gear_process_rates` argument. Seeding is inert for
-        // existing quotes (gear cost accrues only on a part that carries gear
-        // ops, a brand-new defaulted-empty field).
-        crate::quoting_gear_processes::ensure_schema(&conn)
-            .context("ensure quoting_gear_processes schema at serve boot")?;
-        crate::quoting_gear_processes::seed_gear_processes_if_absent(&conn, tenant.as_str())
-            .context("seed quoting_gear_processes at serve boot")?;
-        // T4 / ADR-0097 Part 2 — tolerance cost-rate catalogue: idempotent
-        // schema + the five-band seed. The pricing pipeline snapshots this into
-        // the engine's `CatalogueSnapshot.tolerance_cost_rates`.
-        //
-        // The band set is laid down ONCE PER TENANT (marker-gated, so an
-        // operator deleting a band is not overruled on the next boot — B1), and
-        // `loose`/`standard` stay zero-contribution so an un-toleranced part
-        // still prices byte-identically (R4). The migration arm re-prices a
-        // tenant still on the original all-zero seed and is audited inside its
-        // own write tx, hence the `LedgerMeta` (N1).
-        crate::quoting_tolerance_cost_rates::ensure_schema(&conn)
-            .context("ensure quoting_tolerance_cost_rates schema at serve boot")?;
-        let tolerance_seed_meta = LedgerMeta::new(
-            tenant.clone(),
-            binary_hash_handle
-                .wait()
-                .context("await binary hash for tolerance cost-rate seed audit")?,
-        );
-        crate::quoting_tolerance_cost_rates::seed_tolerance_cost_rates_if_absent(
-            &mut conn,
-            &tolerance_seed_meta,
-            tenant.as_str(),
-        )
-        .context("seed quoting_tolerance_cost_rates at serve boot")?;
-        // ADR-0112 Part C (D-19 slice C2) — drilling cost-model catalogue.
-        // The SCHEMA is laid down in BOTH editions (an empty table is
-        // byte-identical to a lazily-created one, and gating it would fork the
-        // physical schema). The SEED is Defense-ONLY: only a build that
-        // `machining_cost_model_allowed()` gets the per-material rows — and even
-        // then every seeded row is feed-zero / inert, so the engine prices no
-        // drilling until an operator tunes a real feed. A Portable tenant has
-        // zero rows, so its snapshot slice is empty and the drilling path is
-        // never entered (the empty slice IS the edition gate).
-        crate::quoting_drilling_rates::ensure_schema(&conn)
-            .context("ensure quoting_drilling_rates schema at serve boot")?;
-        if crate::build_profile::machining_cost_model_allowed() {
-            crate::quoting_drilling_rates::seed_drilling_rates_if_absent(&conn, tenant.as_str())
-                .context("seed quoting_drilling_rates at serve boot")?;
-        }
-    }
+    boot_seed_quoting_tunables(args, &tenant, &binary_hash_handle)?;
 
     // S232 / PR-228 / ADR-0062 — pin the work-orders schema at boot
     // (creates work_orders + boms + routings tables). Same idempotent
@@ -1951,132 +2109,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // preserves the ahead mirror to a side file and REFUSES boot so a
     // human investigates. Per-write `sync_mirror` still loud-fails on
     // mid-process divergence — that IS a runtime bug.
-    tracing::info!("boot step: reconciling audit-ledger mirror with DB (idempotent recovery)");
-    {
-        let _s = tracing::info_span!("serve.recover_audit_mirror").entered();
-        let conn = Connection::open(&args.db).with_context(|| {
-            format!(
-                "open tenant DuckDB at {} for audit-ledger mirror recovery",
-                args.db.display()
-            )
-        })?;
-        aberp_audit_ledger::ensure_schema(&conn)
-            .context("ensure audit-ledger schema at serve boot")?;
-        refuse_a_latched_interrupted_restore(&args.db, &conn)?;
-        let mirror_path = aberp_audit_ledger::mirror_path_for(&args.db);
-        match aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror_path) {
-            Ok(action) => tracing::info!(?action, "audit-ledger mirror reconciled at boot"),
-            Err(e) => {
-                // ADR-0099 R3 — the route is decided by `boot_mirror_route`, and
-                // ONLY a clean mirror-AHEAD is auto-recoverable.
-                //
-                // R2 also routed `MirrorDivergedFromDb` here, on the reasoning
-                // that `replay_mirror_delta` refuses a colliding replay with
-                // `SequenceConflict`, so a diverged mirror could only reach
-                // `Recovered` if the replay was conflict-free. That safety was
-                // UNREACHABLE, twice over:
-                //
-                //   * `replay_mirror_delta` is only ever asked to replay seqs
-                //     ABOVE the imported snapshot's head, into a STAGING DB that
-                //     by construction holds only `[1..=snapshot_head]`. It never
-                //     targets an occupied seq, so it never collides.
-                //   * Even if it did, `audit_ledger` has NO `UNIQUE(seq)` — S341
-                //     dropped that ART index (duckdb#23046 / S332) — so a
-                //     colliding INSERT still reports `rows_changed = 1` and
-                //     returns `Ok`.
-                //
-                // And the loss is structural, not incidental: recovery rebuilds
-                // from a SNAPSHOT and replays the MIRROR's delta, so the DB's
-                // rows at the re-used seqs (2508/2509 in the incident) — which
-                // exist in NEITHER input — are dropped, `Recovered` is logged,
-                // and boot continues with a WARN. Measured on the fork shape:
-                // four committed DB rows gone. Pre-R2 that same shape returned
-                // `MirrorCorruptPreserved` and went boot-fatal, so a human
-                // looked. Making the diagnosis precise must not make the
-                // handling lossy.
-                //
-                // There is no automatic resolution: two different committed
-                // entries claim one seq, and choosing between them is a business
-                // question about which events really happened. Both copies are on
-                // disk (the mirror preserved to a side file, the DB untouched),
-                // and boot refuses so an operator reconciles them.
-                let route = boot_mirror_route(&e);
-                let refusal_context = boot_mirror_refusal_context(&e);
-                match route {
-                    BootMirrorRoute::AutoRecover { trigger } => {
-                        // ADR-0095 §1 — a CLEAN ahead mirror is the fingerprint of
-                        // a torn-write / lost DB commit (root cause #4). Instead of
-                        // a fatal stop, attempt the guarded, reversible
-                        // auto-recovery: rebuild from the latest VALID snapshot and
-                        // REPLAY the preserved ahead mirror (the chunk-3 P1 guard
-                        // already copied it to `<mirror>.ahead-*.bak`;
-                        // recover_or_refuse READS it, never truncates it). Nothing
-                        // is dropped: `ensure_consistent_with_db` proved the shared
-                        // prefix agrees before reporting AHEAD, so the mirror
-                        // strictly EXTENDS the DB's chain. On a guard-rail refusal
-                        // keep today's preserve-and-surface (demoted from the ONLY
-                        // outcome to the last resort). Drop the open handle first so
-                        // the atomic swap can rename over the live path cleanly.
-                        tracing::error!(
-                            error = %e,
-                            trigger,
-                            "audit-ledger mirror is AHEAD of the DB — attempting ADR-0095 §1 \
-                             auto-recovery"
-                        );
-                        drop(conn);
-                        let recovery = attempt_db_auto_recovery(
-                            &args.db,
-                            &tenant,
-                            &binary_hash_handle,
-                            trigger,
-                        );
-                        match recovery {
-                            Ok(BootRecovery::Recovered) => {
-                                tracing::warn!(
-                                    "ADR-0095 §1 — auto-recovery reconciled the ahead mirror \
-                                     with the DB at boot"
-                                );
-                                // ADR-0116 D5 — make the RECOVERED state a
-                                // rollback point. Recorded here, acted on by
-                                // the snapshot daemon, which cannot exist
-                                // until recovery has returned — so
-                                // `recover_or_refuse` provably owns the mirror
-                                // at boot and no snapshot precedes it.
-                                crate::snapshot::note_boot_recovery(
-                                    crate::snapshot::BootRecoveryReason::MirrorAhead,
-                                );
-                            }
-                            Ok(BootRecovery::Refused(reason)) => {
-                                tracing::error!(
-                                    reason = %reason,
-                                    "REFUSING to boot — ahead mirror could not be safely \
-                                     auto-recovered"
-                                );
-                                return Err(anyhow::Error::new(e)).context(refusal_context);
-                            }
-                            Err(rec_err) => {
-                                return Err(rec_err).context(
-                                    "ADR-0095 auto-recovery of an ahead mirror failed \
-                                     mechanically at boot",
-                                );
-                            }
-                        }
-                    }
-                    BootMirrorRoute::RefuseFatal => {
-                        tracing::error!(
-                            target: "audit_event",
-                            event = "audit_mirror_boot_refused",
-                            error = %e,
-                            "REFUSING to boot — the audit-ledger mirror could not be reconciled \
-                             with the DB and the condition is NOT auto-recoverable. Evidence is \
-                             preserved on disk; investigate before re-running (ADR-0099 R3)"
-                        );
-                        return Err(anyhow::Error::new(e)).context(refusal_context);
-                    }
-                }
-            }
-        }
-    }
+    boot_reconcile_audit_mirror(args, &tenant, &binary_hash_handle)?;
 
     // ── ADR-0116 D3.4 — `--boot-check` stops HERE, deliberately ─────────
     //

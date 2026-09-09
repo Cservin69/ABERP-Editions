@@ -951,6 +951,19 @@ rather than racing it.
 what a refused CLI should print, and whether `serve` must publish liveness,
 is the content.
 
+> **R2 — ✅ CLOSED (D-21 R2, ADR-0119, 2026-09-09).** `serve.rs:run` is off the
+> audit-writer allow-list (CHECK 10M-a / 10N / 10P). Its two inline pre-Handle
+> audit-writing boot steps were extracted into named fns —
+> `boot_reconcile_audit_mirror` (the mirror reconcile) and
+> `boot_seed_quoting_tunables` (the ADR-0097 N1 tolerance-migration seed) —
+> which are allow-listed instead; `run`'s body is now RED for any audit write
+> left in or added to it. A new **CHECK 10Q** pins each extracted boot fn to
+> exactly ONE caller, `run`, before `open_tenant_handle`, so the per-step
+> exemption cannot rot into a wholesale one if a daemon later calls it (the
+> anti-rot the ADR-0119 adversarial pass required). Revert-proof by a new
+> negative probe (harness: 78/78, teeth). Full gate green modulo the documented
+> serve-boot baseline red.
+
 **R2 — `serve.rs::run` is allow-listed by CHECK 10M, 10N and 10P alike.** A
 fork planted in the boot fn passes all three gates. The allow-list is
 justified (it runs before `open_tenant_handle`, single-threaded, no daemons
