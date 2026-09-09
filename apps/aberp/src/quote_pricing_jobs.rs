@@ -368,6 +368,18 @@ ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS gear_ops_json VARCHAR;
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS tolerance_class VARCHAR;
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS tolerance_spec_json VARCHAR;
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS tolerance_manual_review BOOLEAN;
+-- D-20 A1 — RFC3339 instant the advance loop last PICKED THIS ROW UP (before
+-- doing any work, so an erroring row that never transitions still stamps it).
+-- NULL = never attempted. The stale-job reaper reads this to tell a STUCK row
+-- (reached recently, would not move) from a STARVED one (never reached because
+-- erroring rows ahead of it consumed the per-cycle budget, or the next-job
+-- lookup itself faulted) — an `updated_at` frozen in a started state does not
+-- distinguish the two, and reaping on it alone wrongly Failed a healthy row.
+-- Nullable, no DEFAULT per [[no-sql-specific]]; idempotent via ADD COLUMN IF
+-- NOT EXISTS. A legacy row that predates this column reads NULL ⇒ treated as
+-- never-attempted ⇒ not reapable until the daemon actually reaches it, which
+-- is the conservative direction.
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS last_attempt_at VARCHAR;
 ";
 
 /// Idempotent — call at every writer entry.
@@ -1420,18 +1432,23 @@ pub fn get_job_artifacts(
 /// across rows. Comparing parsed instants is the honest version.
 ///
 /// `limit` bounds the per-cycle reap work.
+///
+/// D-20 A1 — corrects the reasoning above. A frozen `updated_at` in a started
+/// state does NOT prove "a cycle picked the row up and could not advance it":
+/// it equally describes a row the advance loop NEVER RE-REACHED — starved
+/// behind erroring rows that consumed the per-cycle budget, or orphaned when
+/// the next-job lookup itself faulted. The reaper therefore also reads
+/// [`ReapCandidate::last_attempt_at`] (the pickup stamp) and condemns only a
+/// row it actually reached within the recent live-cycle window.
 pub fn started_non_terminal_jobs(
     conn: &Connection,
     tenant_id: &str,
     limit: usize,
-) -> Result<Vec<PricingJobRow>> {
+) -> Result<Vec<ReapCandidate>> {
     ensure_schema(conn)?;
     let mut stmt = conn
         .prepare(
-            "SELECT quote_id, tenant_id, state, fetched_at, updated_at,
-                    customer_email, customer_name, material_grade, quantity,
-                    feature_graph_hash, total_price_eur, error_stage, error_reason,
-                    attempt_n, failure_kind, customer_company
+            "SELECT quote_id, state, updated_at, last_attempt_at, attempt_n
                 FROM quote_pricing_jobs
                 WHERE tenant_id = ?
                   AND state IN ('extracting','pricing','rendering','posting_back')
@@ -1444,9 +1461,57 @@ pub fn started_non_terminal_jobs(
         .context("execute started_non_terminal_jobs")?;
     let mut out = Vec::new();
     while let Some(r) = rows.next().context("step started_non_terminal_jobs")? {
-        out.push(row_to_pricing_job(r)?);
+        let state_str: String = r.get(1).context("get state")?;
+        let attempt_n: i64 = r.get(4).context("get attempt_n")?;
+        out.push(ReapCandidate {
+            quote_id: r.get(0).context("get quote_id")?,
+            state: JobState::parse_str(&state_str)?,
+            updated_at: r.get(2).context("get updated_at")?,
+            last_attempt_at: r.get(3).ok().flatten(),
+            attempt_n: attempt_n.max(0) as u32,
+        });
     }
     Ok(out)
+}
+
+/// D-20 A1 — the reaper's view of a started, non-terminal job: exactly the
+/// columns the stale-job reaper needs, and no more (the operator list projection
+/// carries fifteen more it does not). Deliberately NOT a [`PricingJobRow`] — the
+/// reaper reads `last_attempt_at`, which that projection does not carry, and
+/// keeping this narrow means the reaper query never has to move in lockstep with
+/// the SPA's.
+#[derive(Debug, Clone)]
+pub struct ReapCandidate {
+    pub quote_id: String,
+    pub state: JobState,
+    /// RFC3339; the last time the row's STATE moved.
+    pub updated_at: String,
+    /// RFC3339; the last time the advance loop PICKED THIS ROW UP. `None` on a
+    /// row never attempted (including legacy rows that predate the column).
+    pub last_attempt_at: Option<String>,
+    pub attempt_n: u32,
+}
+
+/// D-20 A1 — stamp `last_attempt_at = now` for one row, recording that the
+/// advance loop reached it. Called at the TOP of each pickup, before any work,
+/// so a row that then errors without transitioning is still stamped as reached
+/// (which is what lets the reaper condemn a genuinely-stuck erroring row while
+/// sparing a starved one). Its own write, so it commits independently of the
+/// arm's outcome. `now` is passed in (not read here) so a test can pin it.
+pub fn touch_last_attempt(
+    conn: &Connection,
+    tenant_id: &str,
+    quote_id: &str,
+    now_rfc3339: &str,
+) -> Result<()> {
+    ensure_schema(conn)?;
+    conn.execute(
+        "UPDATE quote_pricing_jobs SET last_attempt_at = ?
+            WHERE tenant_id = ? AND quote_id = ?",
+        params![now_rfc3339, tenant_id, quote_id],
+    )
+    .context("stamp quote_pricing_jobs.last_attempt_at")?;
+    Ok(())
 }
 
 /// Artifacts attached to one job row. The fields go `Some(_)` as the

@@ -772,6 +772,19 @@ into it.
 
 **Missing for Live.**
 
+> **A1 — ✅ CLOSED (D-20 A1, 2026-09-09).** The reaper now reads a persisted
+> `last_attempt_at` (RFC3339), stamped at the top of every `advance_one_step`
+> pickup — before the work, so an erroring row that never transitions is still
+> stamped. `started_non_terminal_jobs` returns it on a dedicated `ReapCandidate`,
+> and `reap_stale_jobs` condemns a stale row only if it was actually REACHED
+> within the recent live-cycle window (`last_attempt_at >= reaper_window_start`).
+> A row never reached — starved behind erroring rows that ate the per-cycle
+> budget, or orphaned when the next-job lookup itself faulted (the round-4 second
+> shape) — is spared. Reaping the genuinely-stuck erroring head is also what
+> clears the starvation. Pinned by `d_priceq_a_starved_row_is_not_reaped_only_the_reached_one_is`
+> (revert-proof) + `d_priceq_the_advance_loop_stamps_every_pickup`; all existing
+> reaper tests green. **The three items below (A2–A4) remain open.**
+
 1. **A1 — the reaper conflates "stuck" with "starved".** The reaper's only
    signal is `updated_at`, so it cannot tell a row *nothing can move* from a
    row *the advance loop never reached*. `MAX_JOBS_PER_CYCLE` is 5, and the

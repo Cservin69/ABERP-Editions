@@ -839,6 +839,31 @@ impl PricingPipelineService {
         Some(window_start.min(wall_floor))
     }
 
+    /// D-20 A1 — the start of the current window of really-run cycles, or
+    /// `None` until the window is full (the same gate [`Self::reaper_cutoff`]
+    /// uses). The reaper condemns a row only if its `last_attempt_at` is at or
+    /// after this instant: proof the advance loop actually REACHED the row
+    /// during this run of cycles. A row reached earlier than this — or never —
+    /// is not being worked right now (starved behind erroring rows, or orphaned
+    /// by a faulting next-job lookup), which is not the same as stuck.
+    ///
+    /// This is the EARLIEST mark, not `front()`, for the same non-monotonic
+    /// clock reason as `reaper_cutoff`: a clock that stepped back during a
+    /// suspend must push this bound EARLIER (admitting more `last_attempt_at`
+    /// values as "in window"), never later — pulling it later would wrongly
+    /// reclassify a genuinely-reached row as un-reached and spare a stuck job.
+    fn reaper_window_start(&self) -> Option<OffsetDateTime> {
+        let window = self.reaper_window_cycles();
+        let marks = self
+            .recent_cycle_marks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if marks.len() < window {
+            return None;
+        }
+        marks.iter().min().copied()
+    }
+
     /// D-PRICEQ — terminalise jobs stuck in a STARTED, non-terminal state
     /// past [`STALE_JOB_REAP_AFTER`]. Returns how many were reaped.
     ///
@@ -873,6 +898,12 @@ impl PricingPipelineService {
             );
             return 0;
         };
+        // D-20 A1 — the same full-window gate, exposed as the instant a row's
+        // `last_attempt_at` must reach for the row to count as "reached this
+        // run". `reaper_cutoff` already returned `Some`, so the window is full
+        // and this is `Some` too; the `?`-style fallback to `now` can never
+        // actually withhold reaping (it would only make the guard STRICTER).
+        let window_start = self.reaper_window_start().unwrap_or(now);
         let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
@@ -912,6 +943,39 @@ impl PricingPipelineService {
                     // is newer still.
                     break;
                 }
+                // D-20 A1 — the STARVATION guard. A stale `updated_at` alone
+                // does not mean stuck: it equally describes a healthy row the
+                // advance loop never RE-REACHED (erroring rows ahead of it ate
+                // the per-cycle budget), or one orphaned when the next-job
+                // lookup itself faulted. Condemn only a row the daemon actually
+                // picked up during THIS run of live cycles — i.e. whose
+                // `last_attempt_at` is at/after `window_start`. A row never
+                // attempted (NULL), or last attempted before the window began,
+                // is starved / un-reached, not stuck: skip it (it is not
+                // ordered out, so `continue`, do not `break`). Its turn — or
+                // the reaping of the erroring rows ahead of it — comes on a
+                // later cycle. The genuinely stuck erroring row IS reached
+                // every cycle, so its stamp is fresh and it is still condemned,
+                // which is also what clears the head that was starving this one.
+                let reached_in_window = row
+                    .last_attempt_at
+                    .as_deref()
+                    .and_then(|ts| {
+                        OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339)
+                            .ok()
+                    })
+                    .is_some_and(|t| t >= window_start);
+                if !reached_in_window {
+                    tracing::debug!(
+                        quote_id = %row.quote_id,
+                        state = %row.state.as_str(),
+                        updated_at = %row.updated_at,
+                        last_attempt_at = ?row.last_attempt_at,
+                        "stale-job reaper: row not reached within the live-cycle window \
+                         (starved / un-reached, not stuck); NOT reaping"
+                    );
+                    continue;
+                }
                 let stuck_for_s = (now - updated).whole_seconds().max(0);
                 // The effective cutoff can be EARLIER than
                 // `STALE_JOB_REAP_AFTER` ago (D-PRICEQ B4: the window of real
@@ -920,8 +984,9 @@ impl PricingPipelineService {
                 // actually failed to clear, not just the nominal one.
                 let reason = format!(
                     "job stuck in state `{}` since {} ({}s with no progress, threshold {}s, \
-                     unmoved since before {}); reaped to Failed by the stale-job reaper so it \
-                     cannot hold the queue head",
+                     unmoved since before {}); the advance loop reached it (last attempt {}) \
+                     but it did not move, so it is stuck rather than starved — reaped to Failed \
+                     by the stale-job reaper so it cannot hold the queue head",
                     row.state.as_str(),
                     row.updated_at,
                     stuck_for_s,
@@ -929,6 +994,7 @@ impl PricingPipelineService {
                     cutoff
                         .format(&Rfc3339)
                         .unwrap_or_else(|_| cutoff.to_string()),
+                    row.last_attempt_at.as_deref().unwrap_or("never"),
                 );
                 emit_failure(
                     &mut conn,
@@ -1456,6 +1522,42 @@ impl PricingPipelineService {
         .context("next-actionable spawn_blocking join")?
     }
 
+    /// D-20 A1 — best-effort: stamp `last_attempt_at = now` for a row the
+    /// advance loop is about to work, recording that the daemon REACHED it.
+    ///
+    /// Best-effort by design: a failure is logged and swallowed. The stamp is
+    /// the reaper's "was this row reached?" signal; dropping one only costs the
+    /// reaper a little accuracy (a genuinely stuck row waits one more window
+    /// before being condemned), whereas propagating the error would turn a
+    /// perfectly good pickup into a skipped job — the exact head-of-line
+    /// failure mode this whole daemon was hardened against.
+    async fn stamp_pickup(&self, quote_id: &str) {
+        let now = match OffsetDateTime::now_utc().format(&Rfc3339) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, quote_id, "pickup stamp: format now failed");
+                return;
+            }
+        };
+        let db = self.deps.db.clone();
+        let tenant_id = self.deps.tenant.as_str().to_string();
+        let qid = quote_id.to_string();
+        let res = spawn_blocking(move || -> Result<()> {
+            let conn = db
+                .write()
+                .context("shared writer: pickup stamp (D-20 A1)")?;
+            jobs::touch_last_attempt(&conn, &tenant_id, &qid, &now)
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, quote_id, "pickup stamp: write failed (non-fatal)")
+            }
+            Err(e) => tracing::warn!(error = %e, quote_id, "pickup stamp: join failed"),
+        }
+    }
+
     /// Advance one job by one state. Returns whether the job reached
     /// terminal `Posted`, terminal `Failed`, or simply advanced.
     ///
@@ -1481,6 +1583,14 @@ impl PricingPipelineService {
         let entry_arm = advance_arm_of(row.state);
         let quote_id = row.quote_id.clone();
         let attempt_n = row.attempt_n;
+        // D-20 A1 — record that the advance loop REACHED this row this cycle,
+        // BEFORE doing any work, so an erroring row (which never transitions,
+        // and whose `updated_at` therefore never moves) still stamps its
+        // pickup. The stale-job reaper reads this stamp to tell a genuinely
+        // stuck row (reached, would not move) from a STARVED one (never
+        // reached because erroring rows ahead of it ate the per-cycle budget)
+        // — reaping on `updated_at` alone condemned the healthy starved row.
+        self.stamp_pickup(&quote_id).await;
         let stepped = match row.state {
             JobState::Fetched | JobState::Extracting => self.advance_extract(row).await,
             JobState::Pricing => self.advance_price(row).await,
@@ -7920,19 +8030,49 @@ mod tests {
     /// Backdate a row's `fetched_at` / `updated_at` through the service's
     /// OWN shared handle (a separate `Connection::open` would be invisible
     /// to it — ADR-0098 Gap 1a).
+    /// Backdate a row's `fetched_at` + `updated_at`, and — D-20 A1 — stamp its
+    /// `last_attempt_at` to NOW. That models the STUCK case the reaper is meant
+    /// to catch: the advance loop reached this row on a recent cycle, yet its
+    /// state has not moved since `updated_at`. A row that is stale but was
+    /// NEVER reached (starved / un-reached) is a different case with a different
+    /// verdict — set that up with [`d_priceq_backdate_unreached`].
     fn d_priceq_backdate(
         svc: &PricingPipelineService,
         qid: &str,
         fetched_at: &str,
         updated_at: &str,
     ) {
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
         let conn = svc.deps.db.write().expect("backdate via shared handle");
         conn.execute(
-            "UPDATE quote_pricing_jobs SET fetched_at = ?, updated_at = ?
+            "UPDATE quote_pricing_jobs SET fetched_at = ?, updated_at = ?, last_attempt_at = ?
                 WHERE quote_id = ?",
-            duckdb::params![fetched_at, updated_at, qid],
+            duckdb::params![fetched_at, updated_at, now, qid],
         )
         .expect("backdate UPDATE");
+    }
+
+    /// D-20 A1 — backdate a row AND set its `last_attempt_at` to
+    /// `last_attempt_at` (or clear it when `None`). Models the STARVED / never-
+    /// reached case: the row is as stale as a stuck one, but the advance loop
+    /// did not pick it up within the live-cycle window, so the reaper must
+    /// spare it.
+    fn d_priceq_backdate_unreached(
+        svc: &PricingPipelineService,
+        qid: &str,
+        fetched_at: &str,
+        updated_at: &str,
+        last_attempt_at: Option<&str>,
+    ) {
+        let conn = svc.deps.db.write().expect("backdate via shared handle");
+        conn.execute(
+            "UPDATE quote_pricing_jobs SET fetched_at = ?, updated_at = ?, last_attempt_at = ?
+                WHERE quote_id = ?",
+            duckdb::params![fetched_at, updated_at, last_attempt_at, qid],
+        )
+        .expect("backdate-unreached UPDATE");
     }
 
     fn d_priceq_row(
@@ -7953,6 +8093,152 @@ mod tests {
             },
         )
         .expect("job row")
+    }
+
+    /// D-20 A1 — read a row's `last_attempt_at` (the pickup stamp).
+    fn d_priceq_last_attempt(svc: &PricingPipelineService, qid: &str) -> Option<String> {
+        let conn = svc.deps.db.read().expect("read via shared handle");
+        conn.query_row(
+            "SELECT last_attempt_at FROM quote_pricing_jobs WHERE quote_id = ?",
+            [qid],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .expect("last_attempt_at row")
+    }
+
+    /// **D-20 A1 — a starved row is not reaped; only a REACHED one is.**
+    ///
+    /// Two rows, equally stale in a started state, in a service with a full,
+    /// recent live-cycle window and both past the wall-clock floor — so the
+    /// PRE-A1 reaper, reading `updated_at` alone, would condemn BOTH as
+    /// "stuck". The only difference is the pickup stamp: one was reached by the
+    /// advance loop this window (`last_attempt_at` recent), the other never
+    /// (NULL — the shape of a row starved behind erroring rows that ate the
+    /// per-cycle budget, or orphaned by a faulting next-job lookup). Only the
+    /// reached-but-unmoved row is stuck; the un-reached one is waiting its turn
+    /// and must survive.
+    ///
+    /// Revert-proof: delete the starvation guard in `reap_stale_jobs` and the
+    /// un-reached row is wrongly Failed — the `starved` assert goes red.
+    #[tokio::test]
+    async fn d_priceq_a_starved_row_is_not_reaped_only_the_reached_one_is() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("starved.duckdb");
+        let artifacts = s430_temp("art");
+        let reached = "00000000-0000-0000-0000-0000000a0001";
+        let starved = "00000000-0000-0000-0000-0000000a0002";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+        for q in [reached, starved] {
+            svc.enqueue_one(s430_quote(q, "part.step")).await.unwrap();
+        }
+        {
+            let conn = svc.deps.db.write().expect("stage via shared handle");
+            for q in [reached, starved] {
+                conn.execute(
+                    "UPDATE quote_pricing_jobs SET state = 'extracting' WHERE quote_id = ?",
+                    duckdb::params![q],
+                )
+                .expect("force extracting");
+            }
+        }
+        let long_ago = "2020-01-01T00:00:00Z";
+        // `reached`: stale, but the advance loop picked it up just now → stuck.
+        d_priceq_backdate(&svc, reached, long_ago, long_ago);
+        // `starved`: identically stale, but NEVER reached → not stuck.
+        d_priceq_backdate_unreached(&svc, starved, long_ago, long_ago, None);
+
+        assert_eq!(
+            svc.reap_stale_jobs().await,
+            1,
+            "only the reached-but-unmoved row is stuck; the never-reached one is starved"
+        );
+        assert_eq!(d_priceq_row(&svc, reached).0, "failed");
+        assert_eq!(d_priceq_row(&svc, reached).1.as_deref(), Some("reaper"));
+        assert_eq!(
+            d_priceq_row(&svc, starved).0,
+            "extracting",
+            "a stale row the advance loop never reached is starved, not stuck — spared"
+        );
+
+        // The ONLY thing that changes the verdict is the reach stamp: once the
+        // daemon actually reaches `starved` and it STILL will not move, it is
+        // stuck too. Same row, same staleness — only `last_attempt_at` moved.
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        d_priceq_backdate_unreached(&svc, starved, long_ago, long_ago, Some(&now));
+        assert_eq!(
+            svc.reap_stale_jobs().await,
+            1,
+            "reached this window and still unmoved → now genuinely stuck"
+        );
+        assert_eq!(d_priceq_row(&svc, starved).0, "failed");
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **D-20 A1 — the advance loop stamps every pickup, even a failing one.**
+    ///
+    /// The starvation guard is only sound if `last_attempt_at` is actually
+    /// written whenever the loop REACHES a row — most importantly for a row
+    /// whose advance ERRORS, because such a row never transitions and its
+    /// `updated_at` would otherwise be the reaper's only (misleading) signal.
+    /// Pins that `advance_one_step` stamps the pickup for both a row that
+    /// advances and one that fail-louds.
+    ///
+    /// Revert-proof: remove the `stamp_pickup` call at the top of
+    /// `advance_one_step` and both `is_some()` asserts go red.
+    #[tokio::test]
+    async fn d_priceq_the_advance_loop_stamps_every_pickup() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("pickup-stamp.duckdb");
+        let artifacts = s430_temp("art");
+        let good = "00000000-0000-0000-0000-0000000b0001";
+        let bad = "00000000-0000-0000-0000-0000000b0002";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+        for q in [good, bad] {
+            svc.enqueue_one(s430_quote(q, "part.step")).await.unwrap();
+        }
+        assert!(
+            d_priceq_last_attempt(&svc, good).is_none(),
+            "a freshly enqueued row has never been reached"
+        );
+
+        // A normal pickup (Fetched → Extracting …) stamps last_attempt_at.
+        let good_row = d_priceq_job_row(&svc, good);
+        let _ = svc.advance_one_step(good_row).await;
+        assert!(
+            d_priceq_last_attempt(&svc, good).is_some(),
+            "advancing a row must stamp its pickup"
+        );
+
+        // A FAILING pickup: force `pricing` with no feature_graph_json — a
+        // fail-loud site (Ok(Failed), no transition of its own). The stamp is
+        // written before the work, so it lands even though the row fails.
+        {
+            let conn = svc.deps.db.write().expect("stage");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET state = 'pricing', feature_graph_json = NULL \
+                    WHERE quote_id = ?",
+                duckdb::params![bad],
+            )
+            .expect("force pricing/null-graph");
+        }
+        let bad_row = d_priceq_job_row(&svc, bad);
+        let outcome = svc.advance_one_step(bad_row).await;
+        assert!(
+            matches!(outcome, Ok(StepOutcome::Failed)),
+            "the null-graph pricing row must fail-loud, not wedge: {outcome:?}"
+        );
+        assert!(
+            d_priceq_last_attempt(&svc, bad).is_some(),
+            "a row that the loop reached and that then FAILED must still be stamped — \
+             otherwise the reaper cannot tell it from a starved row"
+        );
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
     }
 
     /// **Bug 1 — the artifact that is gone.** `advance_extract` read the CAD
