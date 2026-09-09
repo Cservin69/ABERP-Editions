@@ -25186,6 +25186,28 @@ async fn handle_retry_quote_pricing_job(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
+    // D-20 A3 — edition-gate the retry. `quote_pricing_jobs` rows are created
+    // only by the storefront pricing daemon, which is Defense-only
+    // (`storefront_polling_allowed`), so re-enqueueing one into that daemon's
+    // queue is a Defense-edition capability. Harmless on Portable today (the
+    // table is always empty there, so a retry answers 404), but this closes the
+    // edition-surface drift and matches the storefront-config sibling routes.
+    // (The other pricing-jobs mutation routes share this property; gating the
+    // whole surface coherently is a tracked follow-up, not this item's scope.)
+    if !crate::build_profile::storefront_polling_allowed() {
+        tracing::warn!(
+            edition = crate::build_profile::edition_label(),
+            "refused POST /api/quote-pricing-jobs/:id/retry — the storefront pricing pipeline \
+             is a Defense-only capability, compiled out of this edition (ADR-0093 / D-20 A3)"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            "The storefront pricing pipeline (and its retry) is a Defense-only capability and is \
+             compiled out of this edition. The local quote engine and manual quoting remain \
+             available.",
+        )
+            .into_response();
+    }
     // Defence-in-depth on the quote id — only allow the storefront UUID
     // shape that the daemon enqueues. Stops a path-traversal attempt
     // from poisoning the DuckDB `WHERE` clause via the URL segment.

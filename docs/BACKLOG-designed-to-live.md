@@ -860,6 +860,16 @@ into it.
    which needs care that the check stays correct for a row whose artifact
    write was interrupted.
 
+> **A3 — ✅ CLOSED (D-20 A3, 2026-09-09).** `handle_retry_quote_pricing_job`
+> now refuses with 403 when `!storefront_polling_allowed()`, matching the
+> storefront-config sibling routes: the retry *logic* stays edition-agnostic
+> (its helper `retry_pricing_job_request` is unchanged), but the ROUTE — a lever
+> into the Defense-only storefront pricing daemon's queue — is gated. Pinned
+> (revert-proof) by `retry_route_is_refused_on_a_non_storefront_edition`, driven
+> through the real `build_router` via a `tower` oneshot (Portable → 403, Defense
+> → not-403). The other pricing-jobs mutation routes share this property and are
+> a tracked follow-up. **A4 below remains open — it needs its own design.**
+
 3. **A3 — the Retry route is not edition-gated.** The route and its
    response codes are compiled into Portable as well as Defense. Harmless
    today — Portable never runs the pricing daemon, so `quote_pricing_jobs`

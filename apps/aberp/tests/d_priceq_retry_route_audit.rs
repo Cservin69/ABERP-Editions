@@ -229,3 +229,47 @@ fn retry_on_an_unknown_row_is_not_found() {
     );
     assert!(retry_entries(&state).is_empty());
 }
+
+/// **D-20 A3 — the retry ROUTE is edition-gated.**
+///
+/// The retry *logic* (`retry_pricing_job_request`) is edition-agnostic and the
+/// tests above pin it directly. The edition boundary lives at the HTTP route:
+/// `quote_pricing_jobs` rows are created only by the storefront pricing daemon,
+/// which is Defense-only, so a non-storefront build must refuse the retry route
+/// with 403 rather than expose a lever for a pipeline it never runs. Driven
+/// through the real router so a future refactor that drops the guard is caught.
+///
+/// Portable build (the default): the route answers 403. Defense build: the
+/// guard is lifted, so the SAME request is NOT 403 (an unknown row is a 404).
+#[tokio::test]
+async fn retry_route_is_refused_on_a_non_storefront_edition() {
+    use tower::ServiceExt;
+
+    let dir = test_dir("edition-gate");
+    let state = build_state(dir.join("aberp.duckdb"));
+    let router = serve::build_router(state);
+
+    let request = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/api/quote-pricing-jobs/00000000-0000-0000-0000-00000000e001/retry")
+        .header("Authorization", "Bearer test-token")
+        .body(axum::body::Body::empty())
+        .expect("build retry request");
+    let response = router.oneshot(request).await.expect("router responds");
+
+    if aberp::build_profile::storefront_polling_allowed() {
+        // Defense: the gate is lifted; an unknown row is a 404, never a 403.
+        assert_ne!(
+            response.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a Defense build must NOT edition-refuse the retry route"
+        );
+    } else {
+        // Portable: the storefront pipeline is compiled out — 403.
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a non-storefront build must refuse the retry route with 403"
+        );
+    }
+}
