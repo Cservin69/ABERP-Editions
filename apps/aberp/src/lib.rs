@@ -166,6 +166,9 @@ pub mod audit_dap_boot;
 // re-POSTs `priced.pdf` with `stock_alert:true` to the storefront.
 pub mod quote_pdf_rerender_daemon;
 pub mod quote_pdf_rerender_queue;
+// ADR-0112 Part C (D-19 slice C2) — Defense-gated drilling cycle-time rate
+// catalogue feeding the engine's located-holes drilling cost model.
+pub mod quoting_drilling_rates;
 pub mod quoting_gear_processes;
 pub mod quoting_machine_rates;
 pub mod quoting_machines;

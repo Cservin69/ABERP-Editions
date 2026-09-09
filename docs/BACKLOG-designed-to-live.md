@@ -520,6 +520,24 @@ existing events evidence which controls is the work.
 <a id="d-19"></a>
 ### D-19 — Located-holes geometry hardening — GATES slice C (drilling cycle-time pricing)
 
+**Slice-C progress (ADR-0112 Part C).** The five HARD-GATE geometry defects are
+closed and merged on local main (their closure fns are live), so slice C is
+unblocked and building:
+- **C1 — engine (landed, f4b6043).** `DrillingRate` catalogue row +
+  `CatalogueSnapshot.drilling_rates` slice + the per-hole §C.2 drilling block +
+  the double-count guard; pinned by `aberp-quote-engine/tests/drilling_cost.rs`
+  (9 tests). Inert slice ⇒ byte-identical.
+- **C2 — app wiring (landed).** `machining_cost_model_allowed()` edition gate;
+  `quoting_drilling_rates` catalogue module (schema + Defense-only, feed-zero /
+  inert seed + CRUD, `EventKind::ParametersChanged` audit); Defense-gated REST
+  handlers (403 on Portable); the pricing pipeline loads the rows into the
+  snapshot at both quote sites; both-arm edition test
+  (`drilling_rates_edition.rs`) proves Portable seeds nothing + refuses CRUD and
+  Defense seeds only inert rows. Byte-identical until an operator tunes a real
+  feed.
+- **C3 — Quoting-tunables SPA tab (next).** The drilling-rate editor tab, hidden
+  in Portable.
+
 **HARD GATE.** Slice C — the drilling cycle-time pricing that would price
 off `located_holes` — **must not ship until every defect below is closed**.
 This is a *pre-emptive* gate, not an incident report. As of ADR-0112 slice

@@ -1801,6 +1801,21 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             tenant.as_str(),
         )
         .context("seed quoting_tolerance_cost_rates at serve boot")?;
+        // ADR-0112 Part C (D-19 slice C2) — drilling cost-model catalogue.
+        // The SCHEMA is laid down in BOTH editions (an empty table is
+        // byte-identical to a lazily-created one, and gating it would fork the
+        // physical schema). The SEED is Defense-ONLY: only a build that
+        // `machining_cost_model_allowed()` gets the per-material rows — and even
+        // then every seeded row is feed-zero / inert, so the engine prices no
+        // drilling until an operator tunes a real feed. A Portable tenant has
+        // zero rows, so its snapshot slice is empty and the drilling path is
+        // never entered (the empty slice IS the edition gate).
+        crate::quoting_drilling_rates::ensure_schema(&conn)
+            .context("ensure quoting_drilling_rates schema at serve boot")?;
+        if crate::build_profile::machining_cost_model_allowed() {
+            crate::quoting_drilling_rates::seed_drilling_rates_if_absent(&conn, tenant.as_str())
+                .context("seed quoting_drilling_rates at serve boot")?;
+        }
     }
 
     // S232 / PR-228 / ADR-0062 — pin the work-orders schema at boot
@@ -4865,6 +4880,18 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/quoting-machine-rates/:id",
             put(handle_update_machine_rate).delete(handle_delete_machine_rate),
+        )
+        // ADR-0112 Part C (D-19 slice C2) — Defense-only drilling cost-rate
+        // catalogue. The handlers themselves refuse with 403 on a non-Defense
+        // build (`machining_cost_model_allowed()`); the routes are mounted in
+        // both editions so a Portable caller gets a clear 403 rather than a 404.
+        .route(
+            "/api/quoting-drilling-rates",
+            get(handle_list_drilling_rates).post(handle_create_drilling_rate),
+        )
+        .route(
+            "/api/quoting-drilling-rates/:id",
+            put(handle_update_drilling_rate).delete(handle_delete_drilling_rate),
         )
         // S6 / ADR-0094 Gap 3 — per-process gear-generation coefficient catalogue.
         .route(
@@ -15785,6 +15812,198 @@ async fn handle_delete_machine_rate(
         Ok(Err(e)) => tunable_write_response(e, "delete_machine_rate"),
         Err(join_err) => internal_error(
             "delete_machine_rate:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ── quoting_drilling_rates (ADR-0112 Part C, D-19 slice C2) ──────────
+//
+// Structurally the machine-rate CRUD handlers, with ONE addition: every arm
+// is EDITION-GATED. The drilling cost model is Defense-only, so a non-Defense
+// build refuses all four with 403 FORBIDDEN (`machining_cost_model_allowed()`),
+// exactly as the storefront-config handlers refuse a Portable build. The SPA
+// hides the tab on Portable, and this is the runtime backstop behind it.
+
+/// Refuse a drilling-rate request on a non-Defense build. Returns `Some(403)`
+/// when the edition may not run the drilling cost model, `None` when it may.
+fn drilling_rates_edition_guard(intent: &str) -> Option<Response> {
+    if crate::build_profile::machining_cost_model_allowed() {
+        return None;
+    }
+    tracing::warn!(
+        edition = crate::build_profile::edition_label(),
+        intent,
+        "refused a quoting_drilling_rates request — the drilling cost model is a Defense-only \
+         capability, compiled out of this edition (ADR-0112 Part C)"
+    );
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            "The drilling cost model (quoting_drilling_rates) is a Defense-only capability and is \
+             compiled out of this edition (ADR-0112 Part C). The local quote engine and manual \
+             quoting remain available.",
+        )
+            .into_response(),
+    )
+}
+
+async fn handle_list_drilling_rates(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if let Some(resp) = drilling_rates_edition_guard("list") {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<Vec<crate::quoting_drilling_rates::DrillingRateRow>> {
+            let conn = state_for_task.db.read().with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            crate::quoting_drilling_rates::list_drilling_rates(
+                &conn,
+                state_for_task.tenant.as_str(),
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({ "rates": rows })).into_response(),
+        Ok(Err(e)) => internal_error("list_drilling_rates", e),
+        Err(join_err) => internal_error(
+            "list_drilling_rates:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_create_drilling_rate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<crate::quoting_drilling_rates::DrillingRateInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if let Some(resp) = drilling_rates_edition_guard("create") {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = state_for_task.db.write().with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_drilling_rates::create_drilling_rate(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => (StatusCode::CREATED, Json(row)).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "create_drilling_rate"),
+        Err(join_err) => internal_error(
+            "create_drilling_rate:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_update_drilling_rate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(inputs): Json<crate::quoting_drilling_rates::DrillingRateInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if let Some(resp) = drilling_rates_edition_guard("update") {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = state_for_task.db.write().with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_drilling_rates::update_drilling_rate(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &id,
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => Json(row).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "update_drilling_rate"),
+        Err(join_err) => internal_error(
+            "update_drilling_rate:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_delete_drilling_rate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if let Some(resp) = drilling_rates_edition_guard("delete") {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<(), crate::quoting_tunables::TunableWriteError> {
+            let mut conn = state_for_task.db.write().with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_drilling_rates::delete_drilling_rate(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &id,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "delete_drilling_rate"),
+        Err(join_err) => internal_error(
+            "delete_drilling_rate:join",
             anyhow!("blocking task panicked: {join_err}"),
         ),
     }

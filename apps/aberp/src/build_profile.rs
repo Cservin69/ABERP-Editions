@@ -327,6 +327,73 @@ pub fn assert_qc_reporting_allowed(intent: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── ADR-0112 Part C — compile-time drilling / machining-cost-model gate ──
+//
+// The drilling cycle-time cost model (`quoting_drilling_rates` + the engine
+// drilling block) is a Defense-only quoting capability. It is gated the same
+// way as the QC-report layer above, and for the same reason it costs almost
+// nothing: the engine only enters the drilling path when its snapshot slice is
+// non-empty, and the ONLY producer of rows is the Defense-gated boot seed.
+// An empty slice ⇒ `drilling_minutes = 0.0`, NO reasoning line, breakdown
+// byte-identical to pre-ADR-0112 (the ADR-0093/0097 empty-slice posture used
+// AS the edition gate).
+//
+// SCOPE — three surfaces this gate covers, and one it deliberately does not:
+//
+// - COVERED: the boot SEED of `quoting_drilling_rates` (Portable seeds no
+//   rows), the drilling-rate CRUD HANDLERS (Portable refuses, same shape as
+//   the storefront-settings handlers), and the Quoting-tunables SPA TAB
+//   (hidden in Portable, same as the storefront-settings panels).
+// - NOT COVERED: the `quoting_drilling_rates` SCHEMA and the engine drilling
+//   block themselves run in BOTH editions. The table is created lazily on
+//   first access in either edition (a Portable tenant simply never gets a
+//   row), and the engine's drilling path is guarded by the empty slice, not by
+//   `#[cfg]`. Gating the schema would mean two divergent physical schemas, and
+//   gating the engine would fork the shared `aberp-quote-engine` crate on an
+//   edition it cannot see. The empty slice is the gate.
+
+/// Whether a given [`Edition`] may run the drilling / machining cost model —
+/// i.e. seed and edit `quoting_drilling_rates` and expose its tuning UI.
+///
+/// Pure, total over `Edition`, and the SINGLE source of truth for the
+/// decision: ONLY [`Edition::Defense`]. Parameterised so BOTH edition arms are
+/// provable in one compile — the exact shape of
+/// [`qc_reporting_allowed_for`]. `const fn` for const-context use.
+pub const fn machining_cost_model_allowed_for(edition: Edition) -> bool {
+    matches!(edition, Edition::Defense)
+}
+
+/// `true` iff THIS build's edition may run the drilling / machining cost
+/// model. Compile-time constant derived from [`EDITION`] via
+/// [`machining_cost_model_allowed_for`]: Defense ⇒ `true`, Portable (and the
+/// never-built `Prod` arm) ⇒ `false`.
+pub const fn machining_cost_model_allowed() -> bool {
+    machining_cost_model_allowed_for(EDITION)
+}
+
+/// Defence-in-depth drilling-cost-model gate — the runtime backstop behind the
+/// compile-time [`machining_cost_model_allowed`] binding, mirroring
+/// [`assert_qc_reporting_allowed`].
+///
+/// A Defense build has the gate LIFTED. Any other build REFUSES loud rather
+/// than seeding or editing a drilling-rate table it has no business owning: a
+/// Portable build that could tune drilling feeds would be exposing a
+/// Defense-only cost model. `intent` names the refused surface.
+pub fn assert_machining_cost_model_allowed(intent: &str) -> anyhow::Result<()> {
+    if !machining_cost_model_allowed() {
+        anyhow::bail!(
+            "ADR-0112 edition isolation: the {} edition refuses the drilling cost model ({}) — \
+             the quoting_drilling_rates catalogue and its cycle-time model are a Defense-only \
+             capability, seeded and edited only on a Defense build. The local quote engine and \
+             manual quoting stay available; only the drilling cost model is Defense-only. \
+             Rebuild as Defense (`cargo build --features production`) to enable it.",
+            edition_label(),
+            intent,
+        );
+    }
+    Ok(())
+}
+
 /// Defence-in-depth storefront-reach gate — the runtime backstop behind the
 /// compile-time [`storefront_polling_allowed`] binding, mirroring
 /// [`assert_endpoint_allowed`] (prod NAV) and
@@ -471,9 +538,17 @@ mod tests {
         assert!(qc_reporting_allowed_for(Edition::Defense));
         assert!(!qc_reporting_allowed_for(Edition::Portable));
         assert!(!qc_reporting_allowed_for(Edition::Prod));
+
+        // ADR-0112 Part C — the drilling / machining cost model, all three
+        // arms provable in ONE compile.
+        assert!(machining_cost_model_allowed_for(Edition::Defense));
+        assert!(!machining_cost_model_allowed_for(Edition::Portable));
+        assert!(!machining_cost_model_allowed_for(Edition::Prod));
+
         // This build's predicate agrees with its own EDITION.
         assert_eq!(storefront_polling_allowed(), EDITION == Edition::Defense);
         assert_eq!(qc_reporting_allowed(), EDITION == Edition::Defense);
+        assert_eq!(machining_cost_model_allowed(), EDITION == Edition::Defense);
     }
 
     #[cfg(not(feature = "production"))]
@@ -483,9 +558,12 @@ mod tests {
         assert_eq!(EDITION, Edition::Portable);
         assert!(!storefront_polling_allowed());
         assert!(!qc_reporting_allowed());
+        assert!(!machining_cost_model_allowed());
         // The runtime backstop loud-fails even when config is "present"
         // — the storefront base_url / token never reaches the network.
         assert!(assert_storefront_reach_allowed("quote-intake poll daemon").is_err());
+        // ADR-0112 Part C — the drilling seed / CRUD backstop refuses too.
+        assert!(assert_machining_cost_model_allowed("quoting_drilling_rates seed").is_err());
     }
 
     #[cfg(feature = "production")]
@@ -495,5 +573,8 @@ mod tests {
         assert_eq!(EDITION, Edition::Defense);
         assert!(storefront_polling_allowed());
         assert!(assert_storefront_reach_allowed("quote-intake poll daemon").is_ok());
+        // ADR-0112 Part C — the drilling cost model is lifted on Defense.
+        assert!(machining_cost_model_allowed());
+        assert!(assert_machining_cost_model_allowed("quoting_drilling_rates seed").is_ok());
     }
 }

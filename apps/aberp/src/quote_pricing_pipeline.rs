@@ -1999,6 +1999,16 @@ impl PricingPipelineService {
             let engine_tolerance_cost_rates =
                 convert_tolerance_cost_rates(&tolerance_cost_rate_rows);
 
+            // ── ADR-0112 Part C (D-19 C2) — drilling cost model ──────────
+            // Snapshot the operator's drilling-rate catalogue. A Portable
+            // (unseeded) tenant has zero rows, and every Defense seed row is
+            // feed-zero / inert, so with no matching non-inert rate the engine
+            // never enters the drilling path ⇒ price byte-identical to
+            // pre-ADR-0112 until an operator tunes a real feed.
+            let engine_drilling_rates =
+                crate::quoting_drilling_rates::engine_rates(&conn, &tenant_id_string)
+                    .context("load drilling rates")?;
+
             match engine::quote_with_catalogue(
                 &graph,
                 &engine::CatalogueSnapshot {
@@ -2011,8 +2021,9 @@ impl PricingPipelineService {
                     // ADR-0097 Part 2 (T4): operator-tunable tolerance cost-rate
                     // catalogue. Empty/zero-seeded ⇒ tolerance_cost = 0.0.
                     tolerance_cost_rates: &engine_tolerance_cost_rates,
-                    // ADR-0112 Part C — drilling rates wired in slice C2; empty here.
-                    drilling_rates: &[],
+                    // ADR-0112 Part C (D-19 C2): operator-tunable drilling
+                    // cost-rate catalogue. Empty/inert ⇒ drilling_minutes = 0.0.
+                    drilling_rates: &engine_drilling_rates,
                 },
                 &engine_params,
                 qty,
@@ -4408,6 +4419,11 @@ pub fn reprice_quote(
         crate::quoting_tolerance_cost_rates::list_tolerance_cost_rates(conn, tenant)?;
     let engine_tolerance_cost_rates = convert_tolerance_cost_rates(&tolerance_cost_rate_rows);
 
+    // ADR-0112 Part C (D-19 C2) — drilling cost model. Empty (Portable /
+    // unseeded) or all-inert (feed = 0) ⇒ the engine never enters the drilling
+    // path ⇒ reprice byte-identical to pre-ADR-0112.
+    let engine_drilling_rates = crate::quoting_drilling_rates::engine_rates(conn, tenant)?;
+
     let breakdown = engine::quote_with_catalogue(
         &graph,
         &engine::CatalogueSnapshot {
@@ -4420,8 +4436,9 @@ pub fn reprice_quote(
             // ADR-0097 Part 2 (T4): operator-tunable tolerance cost-rate
             // catalogue. Empty/zero-seeded ⇒ tolerance_cost = 0.0.
             tolerance_cost_rates: &engine_tolerance_cost_rates,
-            // ADR-0112 Part C — drilling rates wired in slice C2; empty here.
-            drilling_rates: &[],
+            // ADR-0112 Part C (D-19 C2): operator-tunable drilling cost-rate
+            // catalogue. Empty/inert ⇒ drilling_minutes = 0.0.
+            drilling_rates: &engine_drilling_rates,
         },
         &engine_params,
         qty,
