@@ -49,6 +49,7 @@
     listStockAdjustments,
     listGearProcesses,
     listMachineRates,
+    listDrillingRates,
     listToleranceCostRates,
     listToleranceMultipliers,
     type NavCredentialsStatusResponse,
@@ -304,6 +305,20 @@
         const res = await listMachineRates();
         const n = res.rates.length;
         return n === 1 ? "1 family rate" : `${n} family rates`;
+      }
+      case "DrillingRateCount": {
+        // ADR-0112 Part C (D-19 C3) — count of per-material drilling-rate
+        // rows. Defense-only: a Portable build's backend answers 403, which
+        // the chip surfaces calmly as "Defense-only" rather than an error.
+        try {
+          const res = await listDrillingRates();
+          const n = res.rates.length;
+          return n === 1 ? "1 material rate" : `${n} material rates`;
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          if (message.includes("Defense-only capability")) return "Defense-only";
+          throw err;
+        }
       }
       case "GearProcessCount": {
         // S6 / ADR-0094 Gap 3 — count of per-process gear coefficient rows.

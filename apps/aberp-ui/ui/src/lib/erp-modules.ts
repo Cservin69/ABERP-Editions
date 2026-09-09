@@ -353,6 +353,10 @@ export const MODULES: ErpModule[] = [
       { id: "quoting-stock-adjustments", label: "Stock adjustments" },
       // S4 / ADR-0094 Gap 2 — per-family machine EUR/min rate catalogue.
       { id: "quoting-machine-rates", label: "Machine rates" },
+      // ADR-0112 Part C (D-19 C3) — Defense-only per-material drilling
+      // cycle-time rate catalogue. Shown in both editions; a Portable build's
+      // backend answers 403 and the screen shows a Defense-only notice.
+      { id: "quoting-drilling-rates", label: "Drilling rates" },
       // S6 / ADR-0094 Gap 3 — per-process gear-generation coefficient catalogue.
       { id: "quoting-gear-processes", label: "Gear processes" },
       // T5 / ADR-0097 Part 2 — per-band tolerance cost-rate catalogue.
@@ -536,6 +540,10 @@ export type MaintenanceTileStatusKind =
   | "StockAdjustmentCount"
   // S4 / ADR-0094 Gap 2 — count of per-family machine-rate rows.
   | "MachineRateCount"
+  // ADR-0112 Part C (D-19 C3) — count of per-material drilling-rate rows
+  // (Defense-only; the chip reads "Defense-only" on a Portable build, where
+  // the backend answers 403).
+  | "DrillingRateCount"
   | "GearProcessCount"
   // T5 / ADR-0097 Part 2 — count of per-band tolerance cost-rate rows
   // (seeded zero-contribution, 5 bands, on a fresh tenant).
@@ -747,6 +755,17 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Gépcsaládonkénti EUR/perc + lights-out",
     description_en: "Per-family EUR/min + lights-out factor",
     statusKind: "MachineRateCount",
+  },
+  // ADR-0112 Part C (D-19 C3) — per-material drilling cycle-time rate tile.
+  // Defense-only: the chip reads "Defense-only" on a Portable build.
+  {
+    moduleId: "quoting",
+    route: "quoting-drilling-rates",
+    label_hu: "Fúrási díjak",
+    label_en: "Drilling rates",
+    description_hu: "Anyagcsoportonkénti fúrási ciklusidő-együtthatók (védelmi)",
+    description_en: "Per-material drilling cycle-time coefficients (Defense-only)",
+    statusKind: "DrillingRateCount",
   },
   // S6 / ADR-0094 Gap 3 — per-process gear-generation coefficient tile.
   {

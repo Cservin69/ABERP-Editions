@@ -112,6 +112,7 @@
   import QuotingParametersForm from "./routes/QuotingParametersForm.svelte";
   import QuotingStockAdjustmentsList from "./routes/QuotingStockAdjustmentsList.svelte";
   import MachineRatesList from "./routes/MachineRatesList.svelte";
+  import DrillingRatesList from "./routes/DrillingRatesList.svelte";
   import GearProcessesList from "./routes/GearProcessesList.svelte";
   import QuotingToleranceCostRatesList from "./routes/QuotingToleranceCostRatesList.svelte";
   // S273 / PR-262 / ADR-0069 — material-side Inventory Balances view.
@@ -833,6 +834,8 @@
           <QuotingStockAdjustmentsList />
         {:else if route === "quoting-machine-rates"}
           <MachineRatesList />
+        {:else if route === "quoting-drilling-rates"}
+          <DrillingRatesList />
         {:else if route === "quoting-gear-processes"}
           <GearProcessesList />
         {:else if route === "quoting-tolerance-cost-rates"}

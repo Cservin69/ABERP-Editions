@@ -535,8 +535,19 @@ unblocked and building:
   (`drilling_rates_edition.rs`) proves Portable seeds nothing + refuses CRUD and
   Defense seeds only inert rows. Byte-identical until an operator tunes a real
   feed.
-- **C3 — Quoting-tunables SPA tab (next).** The drilling-rate editor tab, hidden
-  in Portable.
+- **C3 — Quoting-tunables SPA tab (landed).** The drilling-rate editor
+  (`Maintenance → Quoting → Drilling rates`): List + Form modal, Tauri CRUD
+  bridge, router/App/erp-modules wiring, a maintenance-dashboard tile, and pure
+  helpers pinned by `drilling-rates.test.ts`. Consistent with the codebase's
+  Defense-surface pattern (QcReports/NCR): the route is shown in both editions
+  and the Portable backend's 403 renders as a calm "Defense-only" notice + chip,
+  rather than nav-hiding (there is no per-route edition-hiding mechanism in the
+  SPA — gating is server-side).
+
+**Slice C is complete** (C1+C2+C3 landed); the drilling cost model is wired
+end-to-end and ships inert (feed 0) until Ervin supplies real per-material
+feeds. The remaining D-19 work is the five geometry defects' HARD GATE, already
+closed and merged (below).
 
 **HARD GATE.** Slice C — the drilling cycle-time pricing that would price
 off `located_holes` — **must not ship until every defect below is closed**.

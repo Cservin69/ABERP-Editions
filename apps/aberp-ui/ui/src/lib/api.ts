@@ -2495,6 +2495,63 @@ export async function deleteMachineRate(id: string): Promise<void> {
   await invoke<void>("delete_machine_rate", { id });
 }
 
+// ── ADR-0112 Part C (D-19 C2) — quoting_drilling_rates catalogue ─────
+
+/** A `quoting_drilling_rates` row (material-group-keyed drilling cycle-time
+ * coefficients). Mirrors `aberp::quoting_drilling_rates::DrillingRateRow`'s
+ * `#[derive(Serialize)]`. One row per material group per tenant. A row with
+ * `feed_mm_per_min_per_mm_dia === 0` is INERT — the engine prices no drilling
+ * for that material until a real feed is set. Defense-only: on a Portable
+ * build the CRUD commands reject (403). */
+export interface DrillingRate {
+  /** Prefixed-ULID `qdr_<26-char-ULID>`. */
+  id: string;
+  material_group: string;
+  /** Cutting feed, mm/min per mm of drill diameter. `0` ⇒ inert. */
+  feed_mm_per_min_per_mm_dia: number;
+  peck_depth_dia_multiple: number;
+  peck_retract_sec: number;
+  rapid_per_hole_sec: number;
+  tool_change_sec: number;
+  flat_bottom_factor: number;
+  unknown_end_condition_factor: number;
+  notes: string | null;
+  updated_at: string;
+  updated_by_actor: string;
+}
+
+/** Request body for create/update. Mirror of
+ * `aberp::quoting_drilling_rates::DrillingRateInputs`. */
+export interface DrillingRateInput {
+  material_group: string;
+  feed_mm_per_min_per_mm_dia: number;
+  peck_depth_dia_multiple: number;
+  peck_retract_sec: number;
+  rapid_per_hole_sec: number;
+  tool_change_sec: number;
+  flat_bottom_factor: number;
+  unknown_end_condition_factor: number;
+  notes: string | null;
+}
+
+export async function listDrillingRates(): Promise<{ rates: DrillingRate[] }> {
+  return invoke<{ rates: DrillingRate[] }>("list_drilling_rates");
+}
+export async function createDrillingRate(
+  body: DrillingRateInput,
+): Promise<DrillingRate> {
+  return invoke<DrillingRate>("create_drilling_rate", { body });
+}
+export async function updateDrillingRate(
+  id: string,
+  body: DrillingRateInput,
+): Promise<DrillingRate> {
+  return invoke<DrillingRate>("update_drilling_rate", { id, body });
+}
+export async function deleteDrillingRate(id: string): Promise<void> {
+  await invoke<void>("delete_drilling_rate", { id });
+}
+
 // ── S6 / ADR-0094 Gap 3 — quoting_gear_processes catalogue ───────────
 
 /** S6 — a `quoting_gear_processes` row (process-keyed time coefficients).

@@ -1079,6 +1079,41 @@ pub async fn delete_gear_process(state: State<'_, AppState>, id: String) -> Resu
     forward_delete(&state, &path).await
 }
 
+// ── ADR-0112 Part C (D-19 C2) — quoting_drilling_rates CRUD bridge ───
+// Thin HTTPS forwarders to the serve.rs routes, which are Defense-gated: a
+// Portable build's routes answer 403, and forward_* surfaces that to the SPA
+// so the drilling-rates screen can show a "Defense-only" state instead of an
+// editable table.
+
+#[tauri::command]
+pub async fn list_drilling_rates(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quoting-drilling-rates", true).await
+}
+
+#[tauri::command]
+pub async fn create_drilling_rate(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/quoting-drilling-rates", body).await
+}
+
+#[tauri::command]
+pub async fn update_drilling_rate(
+    state: State<'_, AppState>,
+    id: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quoting-drilling-rates/{}", urlencode(&id));
+    forward_put(&state, &path, body).await
+}
+
+#[tauri::command]
+pub async fn delete_drilling_rate(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let path = format!("/api/quoting-drilling-rates/{}", urlencode(&id));
+    forward_delete(&state, &path).await
+}
+
 // ── T5 / ADR-0097 Part 2 — quoting_tolerance_cost_rates CRUD bridge ──
 // Mirrors the machine-rate / gear-process bridges: thin HTTPS forwarders to
 // the serve.rs routes (which carry the auth/tenant/audit + the T4 handlers).

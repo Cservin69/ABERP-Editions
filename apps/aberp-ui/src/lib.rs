@@ -361,6 +361,11 @@ pub fn run() {
             commands::create_machine_rate,
             commands::update_machine_rate,
             commands::delete_machine_rate,
+            // ADR-0112 Part C (D-19 C2) — Defense-gated drilling-rate catalogue CRUD.
+            commands::list_drilling_rates,
+            commands::create_drilling_rate,
+            commands::update_drilling_rate,
+            commands::delete_drilling_rate,
             // S6 / ADR-0094 Gap 3 — gear-process coefficient catalogue CRUD.
             commands::list_gear_processes,
             commands::create_gear_process,

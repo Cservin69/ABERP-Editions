@@ -63,6 +63,8 @@ export type AppRoute =
   | "quoting-stock-adjustments"
   // S4 / ADR-0094 Gap 2 — machine-family rate catalogue.
   | "quoting-machine-rates"
+  // ADR-0112 Part C (D-19 C3) — Defense-only drilling cost-rate catalogue.
+  | "quoting-drilling-rates"
   // S6 / ADR-0094 Gap 3 — gear-process coefficient catalogue.
   | "quoting-gear-processes"
   // T5 / ADR-0097 Part 2 — per-band tolerance cost-rate catalogue.
@@ -188,6 +190,8 @@ export function parseRoute(hash: string): AppRoute {
       return "quoting-stock-adjustments";
     case "quoting-machine-rates":
       return "quoting-machine-rates";
+    case "quoting-drilling-rates":
+      return "quoting-drilling-rates";
     case "quoting-gear-processes":
       return "quoting-gear-processes";
     case "quoting-tolerance-cost-rates":

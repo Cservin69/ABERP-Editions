@@ -75,6 +75,8 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "quoting-stock-adjustments",
   // S4 / ADR-0094 Gap 2 — machine-family rate catalogue.
   "quoting-machine-rates",
+  // ADR-0112 Part C (D-19 C3) — Defense-only drilling cost-rate catalogue.
+  "quoting-drilling-rates",
   // S6 / ADR-0094 Gap 3 — gear-process coefficient catalogue.
   "quoting-gear-processes",
   // T5 / ADR-0097 Part 2 — tolerance cost-rate catalogue.
@@ -148,6 +150,7 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   "quoting-parameters": "quoting",
   "quoting-stock-adjustments": "quoting",
   "quoting-machine-rates": "quoting",
+  "quoting-drilling-rates": "quoting",
   "quoting-gear-processes": "quoting",
   "quoting-tolerance-cost-rates": "quoting",
   // S273 / PR-262 / ADR-0069 — material-side Inventory Balances; lives
@@ -209,6 +212,7 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   "quoting-parameters": "maintenance",
   "quoting-stock-adjustments": "maintenance",
   "quoting-machine-rates": "maintenance",
+  "quoting-drilling-rates": "maintenance",
   "quoting-gear-processes": "maintenance",
   "quoting-tolerance-cost-rates": "maintenance",
   // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
@@ -271,6 +275,8 @@ const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   "StockAdjustmentCount",
   // S4 / ADR-0094 Gap 2 — machine-family rate tile.
   "MachineRateCount",
+  // ADR-0112 Part C (D-19 C3) — Defense-only drilling-rate tile.
+  "DrillingRateCount",
   // S6 / ADR-0094 Gap 3 — gear-process tile.
   "GearProcessCount",
   // T5 / ADR-0097 Part 2 — tolerance cost-rate tile.
