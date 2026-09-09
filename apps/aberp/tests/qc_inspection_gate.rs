@@ -125,6 +125,8 @@ fn mark_one_unit(conn: &Connection, wo_id: &str) -> String {
         heat_lot_reference: None,
         marked_at_utc: "2026-06-16T00:00:00Z".to_string(),
         marked_by_operator: "op".to_string(),
+        // D-03 — derived-on-read; ignored by record_part_marks.
+        iuid: String::new(),
     };
     record_part_marks(conn, T, wo_id, &[mark]).unwrap();
     part_uid

@@ -2056,6 +2056,7 @@ fn seed_part_marks(
             .map(|unit_index| {
                 let part_uid = part_marking::generate_part_uid();
                 let serial = part_marking::auto_serial(wo_id, unit_index);
+                let iuid = part_marking::part_uid_to_iuid_iri(&part_uid).unwrap_or_default();
                 part_marking::PartMark {
                     wo_id: wo_id.clone(),
                     unit_index,
@@ -2069,6 +2070,7 @@ fn seed_part_marks(
                     heat_lot_reference: Some(HEAT_LOT_TI.to_string()),
                     marked_at_utc: marked_at.clone(),
                     marked_by_operator: DEMO_OPERATOR.to_string(),
+                    iuid,
                 }
             })
             .collect();

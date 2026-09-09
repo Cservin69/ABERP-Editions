@@ -114,6 +114,8 @@ fn mark_units(conn: &Connection, wo_id: &str, n: u32) -> Vec<String> {
             heat_lot_reference: None,
             marked_at_utc: "2026-06-16T00:00:00Z".to_string(),
             marked_by_operator: "op".to_string(),
+            // D-03 — a derived-on-read view field; irrelevant to this fixture.
+            iuid: String::new(),
         });
     }
     record_part_marks(conn, T, wo_id, &marks).unwrap();

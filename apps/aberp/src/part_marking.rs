@@ -125,6 +125,43 @@ pub fn data_matrix_payload(part_uid: &str, serial: &str, heat_lot: Option<&str>)
     format!("{part_uid}|{serial}|{}", heat_lot_tail(heat_lot))
 }
 
+// ── D-03 (ADR-0118) — MIL-STD-130N IUID derivation ──────────────────
+//
+// ⚠️  MOCK ENTERPRISE IDENTIFIER — NOT FOR PRODUCTION USE. ⚠️
+//
+// Ervin's D-03 decision (2026-09-09): carry the already-minted `dp-<ULID>` part
+// UIDs FORWARD into the MIL-STD-130N IUID scheme by using each part UID AS the
+// IUID **serial** (Construct 1 = IAC + EID + serial). No re-mint, no orphan —
+// the exact existing `dp-<ULID>` string is the serial, so continuity is total.
+//
+// The IUID IRI is DERIVED from the two config constants below + the stored part
+// UID; it is NEVER persisted (the `wo_part_marks` schema is unchanged). So
+// replacing this mock enterprise identifier with the shop's REAL CAGE /
+// DoD-assigned EID is a ONE-LINE config change here, re-rendering every IUID
+// (existing + new) with ZERO data migration. A real EID MUST replace
+// `MOCK_ENTERPRISE_ID` before any production marking — see ADR-0118.
+
+/// Issuing Agency Code (ISO/IEC 15459). `"D"` selects the CAGE-code construct
+/// (the enterprise identifier is a CAGE code). Config — half of the EID swap.
+pub const IUID_IAC: &str = "D";
+
+/// ⚠️ MOCK enterprise identifier — a CAGE-shaped placeholder that spells `MOCK`
+/// so it can never be mistaken for a real CAGE code. Replace with the assigned
+/// CAGE / DoD enterprise id before production (ADR-0118). Config — the other
+/// half of the swap.
+pub const MOCK_ENTERPRISE_ID: &str = "MOCK0";
+
+/// Derive the MIL-STD-130N IUID IRI (Construct 1: `IAC + EID + serial`) for a
+/// part UID, using the part UID itself as the serial (continuity per D-03).
+/// Pure + config-driven: the EID is never stored, so swapping the real one
+/// re-renders every IUID.
+pub fn part_uid_to_iuid_iri(part_uid: &str) -> Result<String, aberp_compliance::uid::UidError> {
+    Ok(
+        aberp_compliance::uid::IuidConstruct1::new(IUID_IAC, MOCK_ENTERPRISE_ID, part_uid)?
+            .to_iri(),
+    )
+}
+
 /// How many discrete units a WO `qty_target` represents. Parts are discrete, so
 /// a fractional target rounds UP (defensive — a partial unit still ships whole).
 pub fn qty_to_units(qty_target: Decimal) -> u32 {
@@ -183,6 +220,11 @@ pub struct PartMark {
     pub heat_lot_reference: Option<String>,
     pub marked_at_utc: String,
     pub marked_by_operator: String,
+    /// D-03 (ADR-0118) — the MIL-STD-130N IUID IRI, DERIVED from `part_uid` via
+    /// [`part_uid_to_iuid_iri`] (config IAC + mock EID + part_uid-as-serial). NOT
+    /// a stored column — computed on read so a real-EID swap needs no migration.
+    /// Empty only on a misconfigured EID/IAC (pinned non-empty by a unit test).
+    pub iuid: String,
 }
 
 /// Count the marked units recorded for a WO. The shipment gate compares this to
@@ -213,15 +255,18 @@ pub fn list_part_marks(conn: &Connection, tenant: &str, wo_id: &str) -> Result<V
         .context("prepare list_part_marks")?;
     let rows = stmt
         .query_map(params![tenant, wo_id], |r| {
+            let part_uid = r.get::<_, String>(2)?;
+            let iuid = part_uid_to_iuid_iri(&part_uid).unwrap_or_default();
             Ok(PartMark {
                 wo_id: r.get::<_, String>(0)?,
                 unit_index: r.get::<_, i64>(1)?.max(0) as u32,
-                part_uid: r.get::<_, String>(2)?,
+                part_uid,
                 serial_number: r.get::<_, String>(3)?,
                 data_matrix_payload: r.get::<_, String>(4)?,
                 heat_lot_reference: r.get::<_, Option<String>>(5)?,
                 marked_at_utc: r.get::<_, String>(6)?,
                 marked_by_operator: r.get::<_, String>(7)?,
+                iuid,
             })
         })
         .context("query list_part_marks")?;
@@ -492,16 +537,21 @@ pub fn trace_part_uid(conn: &Connection, tenant: &str, part_uid: &str) -> Result
             .query(params![tenant, value])
             .context("query trace_part_uid")?;
         match rows.next().context("read trace_part_uid row")? {
-            Some(r) => Some(PartMark {
-                wo_id: r.get::<_, String>(0)?,
-                unit_index: r.get::<_, i64>(1)?.max(0) as u32,
-                part_uid: r.get::<_, String>(2)?,
-                serial_number: r.get::<_, String>(3)?,
-                data_matrix_payload: r.get::<_, String>(4)?,
-                heat_lot_reference: r.get::<_, Option<String>>(5)?,
-                marked_at_utc: r.get::<_, String>(6)?,
-                marked_by_operator: r.get::<_, String>(7)?,
-            }),
+            Some(r) => {
+                let part_uid = r.get::<_, String>(2)?;
+                let iuid = part_uid_to_iuid_iri(&part_uid).unwrap_or_default();
+                Some(PartMark {
+                    wo_id: r.get::<_, String>(0)?,
+                    unit_index: r.get::<_, i64>(1)?.max(0) as u32,
+                    part_uid,
+                    serial_number: r.get::<_, String>(3)?,
+                    data_matrix_payload: r.get::<_, String>(4)?,
+                    heat_lot_reference: r.get::<_, Option<String>>(5)?,
+                    marked_at_utc: r.get::<_, String>(6)?,
+                    marked_by_operator: r.get::<_, String>(7)?,
+                    iuid,
+                })
+            }
             None => None,
         }
     };
@@ -542,15 +592,18 @@ pub fn trace_customer(
             .context("prepare trace_customer")?;
         let rows = stmt
             .query_map(params![tenant, value], |r| {
+                let part_uid = r.get::<_, String>(2)?;
+                let iuid = part_uid_to_iuid_iri(&part_uid).unwrap_or_default();
                 Ok(PartMark {
                     wo_id: r.get::<_, String>(0)?,
                     unit_index: r.get::<_, i64>(1)?.max(0) as u32,
-                    part_uid: r.get::<_, String>(2)?,
+                    part_uid,
                     serial_number: r.get::<_, String>(3)?,
                     data_matrix_payload: r.get::<_, String>(4)?,
                     heat_lot_reference: r.get::<_, Option<String>>(5)?,
                     marked_at_utc: r.get::<_, String>(6)?,
                     marked_by_operator: r.get::<_, String>(7)?,
+                    iuid,
                 })
             })
             .context("query trace_customer")?;
@@ -664,6 +717,7 @@ mod tests {
         let part_uid = generate_part_uid();
         let serial = auto_serial(wo_id, i);
         let payload = data_matrix_payload(&part_uid, &serial, Some("HEAT-1234"));
+        let iuid = part_uid_to_iuid_iri(&part_uid).unwrap_or_default();
         PartMark {
             wo_id: wo_id.to_string(),
             unit_index: i,
@@ -673,6 +727,74 @@ mod tests {
             heat_lot_reference: Some("HEAT-1234".to_string()),
             marked_at_utc: "2026-06-16T00:00:00Z".to_string(),
             marked_by_operator: "op".to_string(),
+            iuid,
+        }
+    }
+
+    // ── D-03 (ADR-0118) — MIL-STD-130N IUID derivation ────────────────
+
+    #[test]
+    fn iuid_carries_the_dp_part_uid_forward_as_the_serial() {
+        let part_uid = generate_part_uid(); // dp-<ULID>
+        let iri = part_uid_to_iuid_iri(&part_uid).expect("derive IUID");
+        // Construct 1: IAC + EID + serial, where serial IS the part UID.
+        assert_eq!(iri, format!("{IUID_IAC}{MOCK_ENTERPRISE_ID}{part_uid}"));
+        assert!(iri.starts_with(IUID_IAC));
+        assert!(
+            iri.ends_with(&part_uid),
+            "the existing dp- part UID must be carried forward as the serial (continuity)"
+        );
+    }
+
+    #[test]
+    fn every_minted_part_uid_derives_a_valid_iuid() {
+        // The migration never orphans a part: every dp-<ULID> the mint can
+        // produce yields a valid MIL-STD-130N IUID.
+        for _ in 0..64 {
+            let part_uid = generate_part_uid();
+            assert!(
+                part_uid_to_iuid_iri(&part_uid).is_ok(),
+                "part UID {part_uid} must derive a valid IUID"
+            );
+        }
+    }
+
+    #[test]
+    fn the_enterprise_id_is_never_persisted_so_a_real_eid_swap_needs_no_migration() {
+        let part_uid = generate_part_uid();
+        // The stored DataMatrix payload does NOT carry the enterprise id.
+        let payload = data_matrix_payload(&part_uid, "SN-1", Some("HEAT-1234"));
+        assert!(
+            !payload.contains(MOCK_ENTERPRISE_ID),
+            "the EID must NOT be baked into the stored payload"
+        );
+        // Swapping in a real CAGE EID re-renders the IUID from the SAME stored
+        // part UID (serial) — a config change, not a data migration.
+        let real_eid = "1ABC2";
+        let real_iri = aberp_compliance::uid::IuidConstruct1::new(IUID_IAC, real_eid, &part_uid)
+            .unwrap()
+            .to_iri();
+        assert!(real_iri.contains(real_eid));
+        assert!(real_iri.ends_with(&part_uid));
+        assert!(!real_iri.contains(MOCK_ENTERPRISE_ID));
+    }
+
+    #[test]
+    fn the_mock_enterprise_id_is_unmistakably_a_mock() {
+        // Guard: the placeholder must stay clearly-fake so it can't be mistaken
+        // for a real CAGE code (ADR-0118 — replace before production).
+        assert!(MOCK_ENTERPRISE_ID.contains("MOCK"));
+    }
+
+    #[test]
+    fn a_listed_mark_carries_its_derived_iuid() {
+        let conn = open_conn();
+        let marks: Vec<_> = (1..=2).map(|i| sample_mark("wo-iuid", i)).collect();
+        record_part_marks(&conn, "t", "wo-iuid", &marks).unwrap();
+        let listed = list_part_marks(&conn, "t", "wo-iuid").unwrap();
+        for m in &listed {
+            assert_eq!(m.iuid, part_uid_to_iuid_iri(&m.part_uid).unwrap());
+            assert!(m.iuid.ends_with(&m.part_uid));
         }
     }
 

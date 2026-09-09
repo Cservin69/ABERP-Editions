@@ -131,6 +131,8 @@ fn mark_units(conn: &Connection, wo_id: &str, n: u32) -> Vec<ReportUnit> {
             heat_lot_reference: Some("HL-9911".into()),
             marked_at_utc: "2026-08-02T00:00:00Z".to_string(),
             marked_by_operator: "op".to_string(),
+            // D-03 — derived-on-read; ignored by record_part_marks.
+            iuid: String::new(),
         });
     }
     record_part_marks(conn, T, wo_id, &marks).unwrap();

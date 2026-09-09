@@ -119,6 +119,8 @@ fn mark_units(conn: &Connection, wo_id: &str, heat: Option<&str>, n: u32) -> Vec
             heat_lot_reference: heat.map(str::to_string),
             marked_at_utc: "2026-06-16T00:00:00Z".to_string(),
             marked_by_operator: "op".to_string(),
+            // D-03 — derived-on-read; ignored by record_part_marks.
+            iuid: String::new(),
         });
     }
     record_part_marks(conn, T, wo_id, &marks).unwrap();
@@ -217,6 +219,8 @@ fn double_marking_is_refused() {
         heat_lot_reference: None,
         marked_at_utc: "2026-06-16T00:00:00Z".to_string(),
         marked_by_operator: "op".to_string(),
+        // D-03 — derived-on-read; ignored by record_part_marks.
+        iuid: String::new(),
     }];
     let err = record_part_marks(&conn, T, "wo-x", &again).unwrap_err();
     assert!(matches!(err, PartMarkError::AlreadyMarked { n: 3, .. }));

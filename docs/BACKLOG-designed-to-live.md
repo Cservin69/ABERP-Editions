@@ -461,7 +461,21 @@ retries and idempotency; that is the hard part.
 **Size.** Small-to-medium — mostly UI, on top of an existing transport.
 
 <a id="d-03"></a>
-### D-03 — MIL-STD-130N IUID minting
+### D-03 — MIL-STD-130N IUID minting — ✅ Live (ADR-0118, 2026-09-09)
+
+**Landed.** Every already-minted `dp-<ULID>` part UID is now carried forward
+as the **serial** of a MIL-STD-130N Construct-1 IUID (`IAC + EID + Serial`,
+the UID verbatim — no re-mint, no orphaning). The IUID IRI is **derived on
+read** — `part_marking::part_uid_to_iuid_iri` renders it and surfaces it as
+`PartMark::iuid` — so the enterprise identifier is never persisted. The EID is
+a loud, unmistakable **MOCK** (`MOCK_ENTERPRISE_ID = "MOCK0"`) that the real
+CAGE / DoD-assigned EID MUST replace before any production marking; because the
+IRI is derived, that swap is a one-const config change with **zero data
+migration**. The stored DataMatrix payload keeps the `dp-` continuity anchor
+unchanged. Ervin's decision + the mock-EID flag are recorded in **ADR-0118**.
+The one remaining external dependency is the real EID assignment (Open Q1).
+
+<details><summary>Original backlog entry (pre-ADR-0118)</summary>
 
 **Surface today.** `aberp-compliance::uid` implements `IuidConstruct1`,
 `IuidConstruct2`, the `Iuid` enum
@@ -482,6 +496,8 @@ dependency.
 
 **Size.** Small in code; the migration question for already-marked units
 is the real decision.
+
+</details>
 
 <a id="d-04"></a>
 ### D-04 — NIST SP 800-171 control tagging

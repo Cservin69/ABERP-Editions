@@ -27782,6 +27782,7 @@ fn mark_parts_request(
             let part_uid = crate::part_marking::generate_part_uid();
             let data_matrix_payload =
                 crate::part_marking::data_matrix_payload(&part_uid, &serial, heat_lot.as_deref());
+            let iuid = crate::part_marking::part_uid_to_iuid_iri(&part_uid).unwrap_or_default();
             marks.push(crate::part_marking::PartMark {
                 wo_id: wo_id.to_string(),
                 unit_index: i,
@@ -27791,6 +27792,7 @@ fn mark_parts_request(
                 heat_lot_reference: heat_lot.clone(),
                 marked_at_utc: marked_at.clone(),
                 marked_by_operator: operator_login.to_string(),
+                iuid,
             });
         }
 

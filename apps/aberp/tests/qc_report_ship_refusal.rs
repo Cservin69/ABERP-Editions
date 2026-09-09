@@ -134,6 +134,8 @@ fn seed(state: &AppState) -> String {
             heat_lot_reference: Some("HL-1".into()),
             marked_at_utc: "2026-08-23T00:00:00Z".into(),
             marked_by_operator: "op".into(),
+            // D-03 — a derived-on-read view field; irrelevant to this fixture.
+            iuid: String::new(),
         }],
     )
     .expect("record part marks");
