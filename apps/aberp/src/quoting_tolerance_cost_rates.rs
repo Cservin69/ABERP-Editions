@@ -1285,6 +1285,7 @@ mod tests {
             machine_rates: &machine,
             gear_process_rates: &gears,
             tolerance_cost_rates: &rates,
+            drilling_rates: &[],
         };
         quote_with_catalogue(fg, &snap, &params(), 10, band, &CalibrationTable::neutral())
             .expect("seeded tolerance quote must price")
@@ -1507,6 +1508,7 @@ mod tests {
             machine_rates: machine,
             gear_process_rates: &gears,
             tolerance_cost_rates: rates,
+            drilling_rates: &[],
         };
         quote_with_catalogue(fg, &snap, &params(), 10, band, &CalibrationTable::neutral())
             .expect("quote must price")

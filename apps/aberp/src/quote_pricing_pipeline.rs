@@ -2011,6 +2011,8 @@ impl PricingPipelineService {
                     // ADR-0097 Part 2 (T4): operator-tunable tolerance cost-rate
                     // catalogue. Empty/zero-seeded ⇒ tolerance_cost = 0.0.
                     tolerance_cost_rates: &engine_tolerance_cost_rates,
+                    // ADR-0112 Part C — drilling rates wired in slice C2; empty here.
+                    drilling_rates: &[],
                 },
                 &engine_params,
                 qty,
@@ -4418,6 +4420,8 @@ pub fn reprice_quote(
             // ADR-0097 Part 2 (T4): operator-tunable tolerance cost-rate
             // catalogue. Empty/zero-seeded ⇒ tolerance_cost = 0.0.
             tolerance_cost_rates: &engine_tolerance_cost_rates,
+            // ADR-0112 Part C — drilling rates wired in slice C2; empty here.
+            drilling_rates: &[],
         },
         &engine_params,
         qty,

@@ -11,13 +11,13 @@
 use crate::breakdown::QuoteBreakdown;
 use crate::capacity::MachineFamily;
 use crate::catalogue::{
-    ComplexityRule, GearProcessRate, MachineRate, Material, QuotingParameters, StockAdjustment,
-    ToleranceCostRate, ToleranceMultiplier,
+    ComplexityRule, DrillingRate, GearProcessRate, MachineRate, Material, QuotingParameters,
+    StockAdjustment, ToleranceCostRate, ToleranceMultiplier,
 };
 use crate::error::QuoteError;
 use crate::feature_graph::{
-    FeatureGraph, GearKind, GearOp, GearProcess, GeneralClass, SizeBucket, StockForm,
-    ToleranceRange, ToleranceSpec,
+    FeatureGraph, FeatureType, GearKind, GearOp, GearProcess, GeneralClass, HoleEndCondition,
+    LocatedHole, SizeBucket, StockForm, ToleranceRange, ToleranceSpec,
 };
 use crate::ENGINE_VERSION;
 
@@ -156,6 +156,12 @@ pub struct CatalogueSnapshot<'a> {
     /// `tolerance_cost` path is never entered ⇒ `tolerance_cost = 0.0`, no
     /// reasoning line ⇒ today's price. T1 reserved this slot; T3 fills it.
     pub tolerance_cost_rates: &'a [ToleranceCostRate],
+    /// `quoting_drilling_rates` rows (ADR-0112 Part C / D-19 slice C). Prices
+    /// the drilling cycle-time of `located_holes`. Empty (or no row for the
+    /// part's material, or an inert `feed <= 0` row) ⇒ the drilling path is
+    /// never entered ⇒ `drilling_minutes = 0.0`, no reasoning line ⇒ today's
+    /// price. Portable never seeds this ⇒ the empty slice is the edition gate.
+    pub drilling_rates: &'a [DrillingRate],
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -537,6 +543,8 @@ pub fn quote_with_shop_model(
             // ADR-0097 T3: legacy entry points pass an empty rate slice ⇒ the
             // additive tolerance-cost path is inert ⇒ byte-identical pricing.
             tolerance_cost_rates: &[],
+            // ADR-0112 Part C: same posture — empty ⇒ the drilling path is inert.
+            drilling_rates: &[],
         },
         parameters,
         quantity,
@@ -575,6 +583,7 @@ pub fn quote_with_catalogue(
         machine_rates,
         gear_process_rates,
         tolerance_cost_rates,
+        drilling_rates,
     } = *catalogue;
     // ── Pre-flight validation ─────────────────────────────────────
     if quantity == 0 {
@@ -769,6 +778,17 @@ pub fn quote_with_catalogue(
     // on top of the geometry model below without a re-wire.
     let mut feature_machining_minutes: f64 = 0.0;
 
+    // ADR-0112 Part C — the double-count guard fires ONLY when the located-hole
+    // drilling model will actually price these holes (a matching, non-inert
+    // rate exists). If drilling is inert (Portable never seeds rates, or no row
+    // for this material, or an inert `feed <= 0` row) the guard stays off and a
+    // `Hole` feature is charged exactly as before — so a graph that merely
+    // *carries* `located_holes` in Portable is byte-identical.
+    let drilling_active = !feature_graph.located_holes.is_empty()
+        && drilling_rates
+            .iter()
+            .any(|r| r.material_group == material.grade && r.feed_mm_per_min_per_mm_dia > 0.0);
+
     for (idx, feature) in feature_graph.features.iter().enumerate() {
         let bucket = SizeBucket::bucket(feature.representative_size_mm);
         let rule = pick_complexity_rule(
@@ -784,19 +804,38 @@ pub fn quote_with_catalogue(
         })?;
 
         let time_for_feature = rule.base_time_minutes * (feature.count as f64) * rule.multiplier;
-        feature_machining_minutes += time_for_feature;
-        log.push(format!(
-            "[feature {i}] {ft}/{sb}/count={c} (size={sz:.3}mm) → rule#{rid} base={base:.3}min * count={c} * mult={mul:.3} = {t:.4} min",
-            i = idx,
-            ft = feature.feature_type.as_db_str(),
-            sb = bucket.as_db_str(),
-            c = feature.count,
-            sz = feature.representative_size_mm,
-            rid = rule.id,
-            base = rule.base_time_minutes,
-            mul = rule.multiplier,
-            t = time_for_feature,
-        ));
+        // ADR-0112 Part C — double-count guard. Located geometry wins over
+        // counted geometry: when `located_holes` is non-empty, a `Hole` feature
+        // still contributes its setup penalty (below) and complexity/inspection,
+        // but NOT machining minutes — those holes are priced per-hole from
+        // `located_holes` by the drilling model, so charging them here too would
+        // double-count. Pinned by a test.
+        let drilling_supersedes = drilling_active && feature.feature_type == FeatureType::Hole;
+        if drilling_supersedes {
+            log.push(format!(
+                "[feature {i}] {ft}/{sb}/count={c} (size={sz:.3}mm) → machining minutes SUPERSEDED by the located-holes drilling model (ADR-0112 Part C double-count guard); {t:.4} min not charged here (setup penalty still applies)",
+                i = idx,
+                ft = feature.feature_type.as_db_str(),
+                sb = bucket.as_db_str(),
+                c = feature.count,
+                sz = feature.representative_size_mm,
+                t = time_for_feature,
+            ));
+        } else {
+            feature_machining_minutes += time_for_feature;
+            log.push(format!(
+                "[feature {i}] {ft}/{sb}/count={c} (size={sz:.3}mm) → rule#{rid} base={base:.3}min * count={c} * mult={mul:.3} = {t:.4} min",
+                i = idx,
+                ft = feature.feature_type.as_db_str(),
+                sb = bucket.as_db_str(),
+                c = feature.count,
+                sz = feature.representative_size_mm,
+                rid = rule.id,
+                base = rule.base_time_minutes,
+                mul = rule.multiplier,
+                t = time_for_feature,
+            ));
+        }
         fired_setup_penalties.insert(rule.id, rule.setup_penalty_minutes);
     }
 
@@ -852,14 +891,40 @@ pub fn quote_with_catalogue(
         fm = finishing_min,
     ));
 
-    let machining_minutes_base = roughing_min + finishing_min + feature_machining_minutes;
-    log.push(format!(
-        "[machining] machining_minutes = roughing {rm:.4} + finishing {fm:.4} + feature {fmm:.4} = {mm:.4} min",
-        rm = roughing_min,
-        fm = finishing_min,
-        fmm = feature_machining_minutes,
-        mm = machining_minutes_base,
-    ));
+    // ── ADR-0112 Part C (D-19 slice C) — drilling cycle-time ──────
+    // Priced per-hole off the extractor's `located_holes`, keyed on the
+    // material's drilling rate. Inert (0.0, no log) for an empty rate slice /
+    // no matching row / an inert `feed <= 0` row — see `drilling_minutes`.
+    let drilling_min = drilling_minutes(
+        &feature_graph.located_holes,
+        drilling_rates,
+        material,
+        &mut log,
+    );
+
+    // Adding 0.0 is exact for finite floats, so an inert drilling path leaves
+    // `machining_minutes_base` and the log line below byte-identical to
+    // pre-ADR-0112 (the drilling term appears ONLY when it contributes).
+    let machining_minutes_base =
+        roughing_min + finishing_min + feature_machining_minutes + drilling_min;
+    if drilling_min > 0.0 {
+        log.push(format!(
+            "[machining] machining_minutes = roughing {rm:.4} + finishing {fm:.4} + feature {fmm:.4} + drilling {dm:.4} = {mm:.4} min",
+            rm = roughing_min,
+            fm = finishing_min,
+            fmm = feature_machining_minutes,
+            dm = drilling_min,
+            mm = machining_minutes_base,
+        ));
+    } else {
+        log.push(format!(
+            "[machining] machining_minutes = roughing {rm:.4} + finishing {fm:.4} + feature {fmm:.4} = {mm:.4} min",
+            rm = roughing_min,
+            fm = finishing_min,
+            fmm = feature_machining_minutes,
+            mm = machining_minutes_base,
+        ));
+    }
 
     // ── S429: closed-loop calibration ─────────────────────────────
     // Scale the geometry estimate by the routed family's learned
@@ -1510,6 +1575,101 @@ fn gear_op_cost(
         ));
     }
     gear_cost
+}
+
+/// ADR-0112 Part C (D-19 slice C) — drilling cycle-time minutes for the
+/// extractor's `located_holes`, priced on the material's [`DrillingRate`].
+///
+/// Returns `0.0` pushing **no** log line for the inert paths — an empty
+/// `located_holes`, an empty `drilling_rates` slice, or an inert
+/// (`feed <= 0`) rate row — so the no-drilling path is byte-identical to
+/// pre-ADR-0112. A part that HAS holes but whose material has no rate row logs
+/// a loud `[drilling] WARNING` (a seed gap) and still returns `0.0`. With an
+/// active rate it computes §C.2 per hole and logs each term under `[drilling]`.
+fn drilling_minutes(
+    located_holes: &[LocatedHole],
+    drilling_rates: &[DrillingRate],
+    material: &Material,
+    log: &mut Vec<String>,
+) -> f64 {
+    // Inert paths — byte-identical, no log line.
+    if located_holes.is_empty() || drilling_rates.is_empty() {
+        return 0.0;
+    }
+    let Some(rate) = drilling_rates
+        .iter()
+        .find(|r| r.material_group == material.grade)
+    else {
+        log.push(format!(
+            "[drilling] WARNING no DrillingRate row for material_group={g} — drilling_minutes 0.0000 min (seed quoting_drilling_rates)",
+            g = material.grade,
+        ));
+        return 0.0;
+    };
+    // The zero-contribution seed sentinel: a row exists to edit, but is inert.
+    if rate.feed_mm_per_min_per_mm_dia <= 0.0 {
+        return 0.0;
+    }
+
+    let difficulty = material.machining_difficulty;
+    let mut sum_hole_min = 0.0_f64;
+    // Distinct diameters, rounded to 0.01 mm so float noise can't invent a
+    // tool change.
+    let mut distinct_dia: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+
+    for (i, h) in located_holes.iter().enumerate() {
+        let d = h.diameter_mm;
+        let l = h.depth_mm;
+        let feed_mm_per_min = rate.feed_mm_per_min_per_mm_dia * d;
+        // `feed` is > 0 here (positive rate × positive diameter), but guard
+        // against a degenerate d anyway rather than divide by zero.
+        let cut_min = if feed_mm_per_min > 0.0 {
+            l / feed_mm_per_min * difficulty
+        } else {
+            0.0
+        };
+        let peck_count = if rate.peck_depth_dia_multiple > 0.0 && d > 0.0 {
+            ((l / (rate.peck_depth_dia_multiple * d)).ceil() as i64 - 1).max(0)
+        } else {
+            0
+        };
+        let peck_min = peck_count as f64 * rate.peck_retract_sec / 60.0;
+        let rapid_min = rate.rapid_per_hole_sec / 60.0;
+        let end_factor = if h.flat_bottom {
+            rate.flat_bottom_factor
+        } else if h.end_condition == HoleEndCondition::Unknown {
+            rate.unknown_end_condition_factor
+        } else {
+            1.0
+        };
+        let hole_min = (cut_min + peck_min + rapid_min) * end_factor;
+        sum_hole_min += hole_min;
+        distinct_dia.insert((d / 0.01).round() as i64);
+        log.push(format!(
+            "[drilling] hole#{i} d={d:.3} L={l:.3} end={end}{fb} → cut {cut:.4} + peck×{pc} {peck:.4} + rapid {rap:.4} = {sub:.4} × end_factor {ef:.3} = {hm:.4} min",
+            end = h.end_condition.as_db_str(),
+            fb = if h.flat_bottom { " flat" } else { "" },
+            cut = cut_min,
+            pc = peck_count,
+            peck = peck_min,
+            rap = rapid_min,
+            sub = cut_min + peck_min + rapid_min,
+            ef = end_factor,
+            hm = hole_min,
+        ));
+    }
+    let tool_change_min = distinct_dia.len() as f64 * rate.tool_change_sec / 60.0;
+    let drilling_min = sum_hole_min + tool_change_min;
+    log.push(format!(
+        "[drilling] material_group={g}: {n} holes, {nd} distinct diameters → Σhole {sh:.4} + tool_change {tc:.4} = drilling_minutes {dm:.4} min",
+        g = material.grade,
+        n = located_holes.len(),
+        nd = distinct_dia.len(),
+        sh = sum_hole_min,
+        tc = tool_change_min,
+        dm = drilling_min,
+    ));
+    drilling_min
 }
 
 /// ADR-0097 Part 2 / T3 — the additive, itemised professional-tolerance cost.

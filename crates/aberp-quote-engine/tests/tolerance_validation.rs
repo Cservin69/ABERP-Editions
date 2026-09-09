@@ -262,6 +262,7 @@ fn price(fg: &FeatureGraph, rates: Vec<ToleranceCostRate>) -> QuoteBreakdown {
         machine_rates: &machine,
         gear_process_rates: &gears,
         tolerance_cost_rates: &rates,
+        drilling_rates: &[],
     };
     quote_with_catalogue(
         fg,

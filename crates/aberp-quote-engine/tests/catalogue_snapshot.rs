@@ -91,6 +91,7 @@ fn catalogue_entry_plumbs_machine_rates_identically() {
         machine_rates: &machine_rates,
         gear_process_rates: &fixture.gear_process_rates,
         tolerance_cost_rates: &fixture.tolerance_cost_rates,
+        drilling_rates: &fixture.drilling_rates,
     };
     let via_snapshot =
         quote_with_catalogue(&fg, &snapshot, &params, DEFAULT_QTY, DEFAULT_TOL, &cal)

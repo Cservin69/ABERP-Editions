@@ -284,3 +284,40 @@ pub struct ToleranceCostRate {
     /// (ADR-0097 Part 2).
     pub grinding_escalation: bool,
 }
+
+/// A row from `quoting_drilling_rates` (ADR-0112 Part C — D-19 slice C). Prices
+/// the drilling cycle-time of the extractor's `located_holes`. Keyed by the
+/// material's machining group (matched against [`Material::grade`] until a
+/// coarser group key lands on `Material`).
+///
+/// An EMPTY slice — or no row for the part's material, or a row with
+/// `feed_mm_per_min_per_mm_dia <= 0.0` (the inert-seed sentinel) — ⇒ the
+/// drilling path contributes `0.0` minutes with NO reasoning line, so the
+/// breakdown is byte-identical to pre-ADR-0112. The Portable edition never
+/// seeds this table, so the empty slice IS the edition gate (ADR-0093 posture);
+/// the Defense seed is zero-contribution (`feed = 0`) so the CRUD has rows to
+/// edit but nothing moves until the operator tunes real feeds (ADR-0097 Q6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DrillingRate {
+    /// The material machining group this row prices (matched against
+    /// [`Material::grade`]).
+    pub material_group: String,
+    /// Cutting feed, mm/min per mm of drill diameter. `<= 0.0` marks the row
+    /// INERT (the zero-contribution seed) — the engine skips it, no minutes,
+    /// no log — so it can never divide by zero.
+    pub feed_mm_per_min_per_mm_dia: f64,
+    /// Peck depth as a multiple of diameter (`<= 0.0` ⇒ no pecking).
+    pub peck_depth_dia_multiple: f64,
+    /// Seconds lost per peck retract-and-return.
+    pub peck_retract_sec: f64,
+    /// Rapid approach + retract seconds, once per hole.
+    pub rapid_per_hole_sec: f64,
+    /// Tool-change seconds, once per DISTINCT diameter on the part.
+    pub tool_change_sec: f64,
+    /// Multiplier for a blind flat-bottom hole (a slower cycle than a
+    /// standard 118°/135° point). `>= 1.0`.
+    pub flat_bottom_factor: f64,
+    /// Multiplier when `end_condition` is `Unknown` — the conservative
+    /// branch, never optimistic. `>= 1.0`.
+    pub unknown_end_condition_factor: f64,
+}

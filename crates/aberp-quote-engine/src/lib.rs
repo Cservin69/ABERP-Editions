@@ -120,8 +120,8 @@ pub use capacity::{
     FALLBACK_DAILY_HOURS,
 };
 pub use catalogue::{
-    ComplexityRule, GearProcessRate, MachineRate, Material, QuotingParameters, StockAdjustment,
-    StockStatus, ToleranceCostRate, ToleranceMultiplier,
+    ComplexityRule, DrillingRate, GearProcessRate, MachineRate, Material, QuotingParameters,
+    StockAdjustment, StockStatus, ToleranceCostRate, ToleranceMultiplier,
 };
 pub use engine::{
     is_exotic_material, normalize_tolerance, quote, quote_with_calibration, quote_with_catalogue,
