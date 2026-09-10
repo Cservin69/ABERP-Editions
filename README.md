@@ -387,11 +387,16 @@ Two more sockets with no EventKind of their own yet:
   `validate_iac()`, and IRI rendering. Per-unit marking is Live today, but
   it mints a `dp-`-prefixed ULID and a DataMatrix payload — not a DoD
   IUID. Minting a real one needs an assigned enterprise identifier.
-- **NIST SP 800-171 control tagging**
+- **NIST SP 800-171 control tagging** — Live via API (ADR-0121)
   ([D-04](docs/BACKLOG-designed-to-live.md#d-04)). All 110 DFARS
-  252.204-7012 control identifiers exist as constants in
-  `aberp-compliance::nist_800_171`, ready to tag audit events. Nothing
-  consumes them yet.
+  252.204-7012 control identifiers are consumed by a static
+  `EventKind`→control evidence map (`apps/aberp/src/nist_coverage.rs`);
+  `GET /api/nist-coverage?from_ms=&to_ms=` renders each control as
+  evidenced / mapped-but-unexercised / no-automated-evidence over the
+  existing ledger. The report shows *evidence present*, never
+  *compliant* — an assessor grades satisfaction. The starter mapping
+  grows by reviewed code change; an SPA coverage-matrix screen is a
+  follow-on.
 
 ### Reading and exporting it
 

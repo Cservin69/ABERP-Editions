@@ -517,6 +517,22 @@ satisfy each control, and a report that renders the coverage.
 **Size.** Medium, and mostly analysis rather than code: deciding which
 existing events evidence which controls is the work.
 
+**Now Live (backend + API; ADR-0121).** The where-a-tag-lives decision is
+settled AWAY from a per-event payload field (which would bake a revisable
+analyst mapping into append-only hash-pinned bytes at ~191 sites — the
+D-01/D-03 anti-pattern) toward a **static `EventKind`→control evidence map**
+(`apps/aberp/src/nist_coverage.rs`, `EvidenceLink { kind, control, rationale }`,
+keyed on the compile-time enum, git-versioned) feeding a **read-side coverage
+fold** — no new EventKind (ADR-0094), no payload field, no schema, no firing
+site. `GET /api/nist-coverage?from_ms=&to_ms=` renders each of the 110 controls
+as **Evidenced / mapped-but-unexercised / no-automated-evidence** over the
+existing ledger, reading through serve's shared Handle (no new opener). The
+report says **"evidence present," never "compliant/satisfied"** — the type has
+no `Satisfied` value; an assessor grades. **Remaining (both optional / neither
+external):** grow the deliberately-under-claiming **starter mapping** (8 links /
+6 controls — AC/MP/IA/AU/IR; a reviewed code change per added link is the
+mapping's own audit trail), and an SPA coverage-matrix screen (ADR-0121 Q3).
+
 <a id="d-19"></a>
 ### D-19 — Located-holes geometry hardening — GATES slice C (drilling cycle-time pricing)
 
