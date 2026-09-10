@@ -33,7 +33,7 @@ use aberp_audit_ledger::{
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -42,11 +42,32 @@ use time::OffsetDateTime;
 /// `"bundle/"` (see `Archive::extract_paths`).
 const BUNDLE_DIR: &str = "bundle";
 
-/// Manifest schema version this verifier understands per ADR-0029 §3
-/// + ADR-0035 §3 check 2. A bundle whose `version` field differs
-/// FAILs the manifest-version check with a forward-compatibility
-/// note ("a newer aberp-verify may understand this bundle").
-pub const SUPPORTED_MANIFEST_VERSION: u32 = 1;
+/// Manifest schema versions this verifier understands per ADR-0029 §3
+/// + ADR-0035 §3 check 2 + **ADR-0122 §D5**. A bundle whose `version`
+/// is not in this set FAILs the manifest-version check with a
+/// forward-compatibility note ("a newer aberp-verify may understand
+/// this bundle").
+///
+/// **This is a SET, not a single number, and that is load-bearing.**
+/// Until ADR-0122 it was `SUPPORTED_MANIFEST_VERSION: u32 = 1`,
+/// equality-checked at the call site — which meant adding a field to
+/// the manifest had no safe landing:
+///
+/// - bumping the writer alone broke **every** bundle on this verifier;
+/// - bumping the constant too broke **every v1 archive already
+///   written**, and an archive that stops verifying is precisely the
+///   failure the archive exists to prevent.
+///
+/// A verifier that accepts a set can read both. v1 is normalised on
+/// read by [`Manifest::scope`] — a v1 manifest is an invoice bundle by
+/// construction, because a dispatch bundle did not exist until v2.
+pub const SUPPORTED_MANIFEST_VERSIONS: &[u32] = &[1, 2];
+
+/// The version this build's bundle writers emit (ADR-0122 §D5). Always
+/// the highest member of [`SUPPORTED_MANIFEST_VERSIONS`]; both bundle
+/// writers emit it, so the invoice/shipment fork lives in `scope_kind`
+/// and never in the manifest version.
+pub const MANIFEST_VERSION_LATEST: u32 = 2;
 
 /// In-memory representation of the unpacked bundle. The whole bundle
 /// is held in memory because the verifier walks it multiple times
@@ -176,7 +197,35 @@ pub fn read_archive(path: &Path) -> Result<Archive> {
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
     pub version: u32,
-    pub invoice_id: String,
+    /// The bundle's scope discriminant, v2+ (`"invoice"` / `"dispatch"`).
+    /// Absent on a v1 manifest, which predates the shipment bundle —
+    /// [`Manifest::scope`] resolves that case rather than defaulting it
+    /// at any call site.
+    #[serde(default)]
+    pub scope_kind: Option<String>,
+    /// The id the bundle is a slice of, v2+. Equals `invoice_id` for an
+    /// invoice bundle; a `dsp_<ULID>` for a shipment bundle.
+    #[serde(default)]
+    pub scope_id: Option<String>,
+    /// `Some(_)` on every invoice bundle, v1 and v2 alike; `None` on a
+    /// shipment bundle, which has no invoice (ADR-0122 §F1: an outgoing
+    /// invoice cannot be joined back to the shipment it bills).
+    ///
+    /// **Optional on the struct, required in practice for v1**: a v1
+    /// manifest without it is malformed and [`Manifest::scope`] refuses
+    /// it. Serde cannot express "required at v1 only", so the check is
+    /// where the version is known.
+    #[serde(default)]
+    pub invoice_id: Option<String>,
+    /// Count of `qc/` documents the writer put in this bundle
+    /// (ADR-0122 §D2). Zero on every invoice bundle.
+    #[serde(default)]
+    pub qc_documents: u64,
+    /// QC documents that BELONG to this bundle's scope and are not in
+    /// it, each with the reason (ADR-0122 §D3). An auditor must not
+    /// have to infer a hole in a document set.
+    #[serde(default)]
+    pub qc_documents_omitted: Vec<QcOmission>,
     pub tenant_id: String,
     pub generated_at: String,
     pub binary_hash: String,
@@ -188,6 +237,100 @@ pub struct Manifest {
     pub signature_status: String,
     pub mirror_file_present: bool,
     pub mirror_file_status: String,
+}
+
+/// One QC document that belongs to a bundle's scope and is not in the
+/// archive, with the reason (ADR-0122 §D3). Rendered into the manifest
+/// so a hole in the document set is stated rather than inferred.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QcOmission {
+    pub qcr_id: String,
+    /// The operator-facing report number, when the report has one.
+    pub report_number: Option<String>,
+    /// Why the document is absent, in operator-readable prose.
+    pub reason: String,
+}
+
+/// What a bundle is a slice OF, resolved from the manifest (ADR-0122
+/// §D5). This is the normalised form every check keys on, so no check
+/// has to know whether it is reading a v1 or a v2 manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BundleScope {
+    /// A per-invoice evidence bundle (ADR-0029). Every manifest version
+    /// can carry one.
+    Invoice(String),
+    /// A per-shipment evidence bundle (ADR-0122). v2+ only.
+    Dispatch(String),
+}
+
+impl BundleScope {
+    /// The id, whichever arm.
+    pub fn id(&self) -> &str {
+        match self {
+            BundleScope::Invoice(id) | BundleScope::Dispatch(id) => id,
+        }
+    }
+
+    /// Operator-facing label for the summary line — "Invoice" /
+    /// "Dispatch". A shipment bundle whose summary said "Invoice" would
+    /// be naming something the bundle does not contain.
+    pub fn label(&self) -> &'static str {
+        match self {
+            BundleScope::Invoice(_) => "Invoice",
+            BundleScope::Dispatch(_) => "Dispatch",
+        }
+    }
+}
+
+impl Manifest {
+    /// Resolve the bundle's scope, normalising v1 (ADR-0122 §D5).
+    ///
+    /// A **v1** manifest has no `scope_kind`: it is an invoice bundle by
+    /// construction, because the shipment bundle did not exist when v1
+    /// was the only shape. Its `invoice_id` is therefore **required** —
+    /// a v1 manifest without one is malformed, and defaulting it to
+    /// `None` would silently verify a bundle whose subject is unknown.
+    ///
+    /// A **v2** manifest states its scope. `invoice_id` is present on
+    /// the invoice arm and absent on the dispatch arm.
+    pub fn scope(&self) -> Result<BundleScope> {
+        match self.scope_kind.as_deref() {
+            None => {
+                let id = self.invoice_id.clone().ok_or_else(|| {
+                    anyhow!(
+                        "manifest v{} carries neither scope_kind nor invoice_id — a \
+                         pre-ADR-0122 manifest is an invoice bundle and MUST name its \
+                         invoice; a bundle whose subject is unknown cannot be verified",
+                        self.version
+                    )
+                })?;
+                Ok(BundleScope::Invoice(id))
+            }
+            Some("invoice") => {
+                let id = self
+                    .scope_id
+                    .clone()
+                    .or_else(|| self.invoice_id.clone())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "manifest declares scope_kind=\"invoice\" with no scope_id \
+                             and no invoice_id"
+                        )
+                    })?;
+                Ok(BundleScope::Invoice(id))
+            }
+            Some("dispatch") => {
+                let id = self.scope_id.clone().ok_or_else(|| {
+                    anyhow!("manifest declares scope_kind=\"dispatch\" with no scope_id")
+                })?;
+                Ok(BundleScope::Dispatch(id))
+            }
+            Some(other) => Err(anyhow!(
+                "manifest declares an unknown scope_kind {other:?} — this aberp-verify \
+                 understands \"invoice\" and \"dispatch\""
+            )),
+        }
+    }
 }
 
 /// Parse `bundle/manifest.json` bytes into a typed [`Manifest`].
@@ -483,7 +626,7 @@ mod tests {
         let bytes = fixture_manifest_json();
         let parsed = parse_manifest(&bytes).unwrap();
         assert_eq!(parsed.version, 1);
-        assert_eq!(parsed.invoice_id, "inv_TEST");
+        assert_eq!(parsed.invoice_id.as_deref(), Some("inv_TEST"));
         assert_eq!(parsed.tenant_id, "t1");
         assert_eq!(parsed.nav_xsd_version, "3.0");
         assert!(parsed.chain_verified);
@@ -519,7 +662,158 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&m).unwrap();
         let parsed = parse_manifest(&bytes).unwrap();
-        assert_eq!(parsed.invoice_id, "inv_X");
+        assert_eq!(parsed.invoice_id.as_deref(), Some("inv_X"));
+    }
+
+    // ── ADR-0122 §D5 — the manifest-version SET and v1 normalisation ──
+    //
+    // The property under test in this block is the one the round-1
+    // adversarial pass called blocking: adding a field to the manifest
+    // must not break an archive that already exists. A v1 golden and a
+    // v2 golden verify SIDE BY SIDE, in the same test, so a future
+    // change that drops v1 support cannot pass by updating one fixture.
+
+    fn golden_v1_invoice_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "invoice_id": "inv_V1GOLDEN",
+            "tenant_id": "t",
+            "generated_at": "2026-01-01T00:00:00Z",
+            "binary_hash": "00".repeat(32),
+            "nav_xsd_version": "3.0",
+            "chain_verified": true,
+            "chain_verified_entries": 1,
+            "entries_in_bundle": 1,
+            "signed": false,
+            "signature_status": "deferred-per-f5",
+            "mirror_file_present": false,
+            "mirror_file_status": "absent-pre-pr-17",
+        })
+    }
+
+    fn golden_v2_manifest(
+        scope_kind: &str,
+        scope_id: &str,
+        invoice_id: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "version": 2,
+            "scope_kind": scope_kind,
+            "scope_id": scope_id,
+            "invoice_id": invoice_id,
+            "qc_documents": 0,
+            "qc_documents_omitted": [],
+            "tenant_id": "t",
+            "generated_at": "2026-01-01T00:00:00Z",
+            "binary_hash": "00".repeat(32),
+            "nav_xsd_version": "3.0",
+            "chain_verified": true,
+            "chain_verified_entries": 1,
+            "entries_in_bundle": 1,
+            "signed": false,
+            "signature_status": "deferred-per-f5",
+            "mirror_file_present": false,
+            "mirror_file_status": "absent-pre-pr-17",
+        })
+    }
+
+    fn parse(v: &serde_json::Value) -> Manifest {
+        parse_manifest(&serde_json::to_vec(v).unwrap()).expect("golden manifest must parse")
+    }
+
+    /// **The v1 archive keeps verifying.** Both goldens parse, both are
+    /// in the supported set, and both resolve to a scope.
+    ///
+    /// This is the revert-proof for the defect the round-1 review
+    /// caught: the pre-ADR-0122 verifier equality-checked one version,
+    /// so there was no way to add a manifest field without breaking
+    /// either every new bundle or every archive already written.
+    #[test]
+    fn a_v1_and_a_v2_manifest_both_verify() {
+        let v1 = parse(&golden_v1_invoice_manifest());
+        let v2 = parse(&golden_v2_manifest(
+            "invoice",
+            "inv_V2GOLDEN",
+            Some("inv_V2GOLDEN"),
+        ));
+
+        assert!(SUPPORTED_MANIFEST_VERSIONS.contains(&v1.version));
+        assert!(SUPPORTED_MANIFEST_VERSIONS.contains(&v2.version));
+
+        // v1 has no scope_kind and is normalised to an invoice bundle.
+        assert_eq!(v1.scope_kind, None);
+        assert_eq!(
+            v1.scope().unwrap(),
+            BundleScope::Invoice("inv_V1GOLDEN".to_string())
+        );
+        assert_eq!(
+            v2.scope().unwrap(),
+            BundleScope::Invoice("inv_V2GOLDEN".to_string())
+        );
+    }
+
+    /// A v2 SHIPMENT manifest resolves to the dispatch arm, and carries
+    /// no invoice id — ADR-0122 §F1: an outgoing invoice cannot be
+    /// joined back to the shipment it bills, so claiming one here would
+    /// be a fabricated link.
+    #[test]
+    fn a_v2_dispatch_manifest_resolves_to_the_dispatch_scope_with_no_invoice() {
+        let m = parse(&golden_v2_manifest("dispatch", "dsp_ABC", None));
+        assert_eq!(m.invoice_id, None);
+        assert_eq!(
+            m.scope().unwrap(),
+            BundleScope::Dispatch("dsp_ABC".to_string())
+        );
+        assert_eq!(m.scope().unwrap().label(), "Dispatch");
+    }
+
+    /// **A v1 manifest with no `invoice_id` is REFUSED, not defaulted.**
+    ///
+    /// `invoice_id` had to become `Option<String>` on the struct so a
+    /// shipment manifest can omit it, and the hazard that opens is that
+    /// a malformed v1 — which serde previously rejected outright —
+    /// would now deserialise to `None` and verify as a bundle whose
+    /// subject nobody knows. The requirement is version-conditional, so
+    /// serde cannot express it and `scope()` enforces it instead.
+    #[test]
+    fn a_v1_manifest_without_an_invoice_id_is_refused_not_defaulted() {
+        let mut m = golden_v1_invoice_manifest();
+        m.as_object_mut().unwrap().remove("invoice_id");
+        // It still PARSES — that is exactly the hazard.
+        let parsed = parse(&m);
+        assert_eq!(parsed.invoice_id, None);
+        // And `scope()` is what refuses it.
+        let err = parsed
+            .scope()
+            .expect_err("a v1 manifest must name its invoice");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invoice_id"),
+            "the refusal must name the missing field: {msg}"
+        );
+    }
+
+    /// An unknown `scope_kind` fails rather than falling through to the
+    /// invoice arm. A future bundle shape must not be read as an
+    /// invoice bundle by a verifier that has never heard of it.
+    #[test]
+    fn an_unknown_scope_kind_is_refused() {
+        let m = parse(&golden_v2_manifest("warehouse", "whx_1", None));
+        let err = m.scope().expect_err("unknown scope_kind must refuse");
+        assert!(format!("{err:#}").contains("warehouse"));
+    }
+
+    /// A version outside the supported set still fails — the set is a
+    /// widening, not a removal of the gate.
+    #[test]
+    fn a_manifest_version_outside_the_set_is_still_unsupported() {
+        assert!(!SUPPORTED_MANIFEST_VERSIONS.contains(&3));
+        assert!(!SUPPORTED_MANIFEST_VERSIONS.contains(&0));
+        assert_eq!(
+            MANIFEST_VERSION_LATEST,
+            *SUPPORTED_MANIFEST_VERSIONS.last().unwrap(),
+            "the version writers emit must be the highest one readers accept"
+        );
     }
 
     #[test]

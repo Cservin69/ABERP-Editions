@@ -109,7 +109,25 @@ use crate::cli::ExportInvoiceBundleArgs;
 /// changes per ADR-0029 §3. Additive field additions (e.g.,
 /// future `signature_*` block when F5 lifts) keep this at the
 /// existing version.
-const MANIFEST_VERSION: u32 = 1;
+///
+/// **v1 → v2 (ADR-0122 §D5)** — `scope_kind` / `scope_id` were added
+/// and `invoice_id` became nullable, so the manifest can name a
+/// *shipment* bundle as well as an invoice one. That is
+/// parser-breaking, which is exactly what this constant is bumped for.
+///
+/// The bump is paired, in the same change, with `aberp-verify`
+/// accepting a **set** of versions (`SUPPORTED_MANIFEST_VERSIONS`).
+/// Bumping this alone would break every bundle on the current
+/// verifier; bumping the verifier's old single constant instead would
+/// break **every v1 archive already written**, which is the one thing
+/// an evidence archive must never do.
+///
+/// Both bundle writers emit this same version. The invoice/shipment
+/// fork lives in `scope_kind`, never in the version number.
+const MANIFEST_VERSION: u32 = 2;
+
+/// `scope_kind` for the per-invoice bundle (ADR-0029). ADR-0122 §D5.
+const SCOPE_KIND_INVOICE: &str = "invoice";
 
 /// Placeholder string declared in the manifest while the F5
 /// attestation-signing key type remains deferred per ADR-0029
@@ -297,6 +315,23 @@ impl<'a> ChainJsonlEntry<'a> {
     }
 }
 
+/// One QC document that belongs to a bundle's scope and is not in
+/// the archive, with the reason (ADR-0122 §D3).
+///
+/// Mirrors `aberp_verify::QcOmission` field-for-field, and is
+/// declared here rather than imported because `aberp-verify` is a
+/// **dev-dependency only** — the operator binary deliberately does
+/// not depend on the inspector-side artifact (ADR-0035 §"Surfaced
+/// conflict 1" Reading A). Same writer/reader mirror-pair shape as
+/// `ChainJsonlEntry` / `aberp_verify::ChainJsonlLine`; the
+/// round-trip is pinned by `tests/verify_bundle_round_trip.rs`.
+#[derive(Debug, Serialize)]
+struct QcOmission {
+    qcr_id: String,
+    report_number: Option<String>,
+    reason: String,
+}
+
 /// Bundle-level manifest fields per ADR-0029 §3 + ADR-0030 §5
 /// (the additive `mirror_file_*` flip). Serialized as pretty JSON
 /// at `bundle/manifest.json`. Field-set pinned by
@@ -305,7 +340,24 @@ impl<'a> ChainJsonlEntry<'a> {
 #[derive(Debug, Serialize)]
 struct BundleManifest<'a> {
     version: u32,
-    invoice_id: &'a str,
+    /// What this bundle is a slice OF (ADR-0122 §D5) — `"invoice"`
+    /// here, `"dispatch"` for the shipment bundle.
+    scope_kind: &'static str,
+    /// The scope's id. Equal to `invoice_id` on this writer; carried
+    /// separately so a reader never has to know which field to look in.
+    scope_id: &'a str,
+    /// `None` on a shipment bundle. Always `Some(_)` here, and still
+    /// emitted (as `null` when absent, never omitted) so a reader can
+    /// tell "no invoice" from "field dropped".
+    invoice_id: Option<&'a str>,
+    /// Count of `qc/` documents in this bundle (ADR-0122 §D2). Always
+    /// zero on an invoice bundle: a QC report is bound to a *shipment*,
+    /// and §F1 records why the two cannot be joined.
+    qc_documents: u64,
+    /// QC documents that belong to this bundle's scope and are absent,
+    /// with the reason (ADR-0122 §D3). Always empty on an invoice
+    /// bundle, for the same reason `qc_documents` is zero.
+    qc_documents_omitted: Vec<QcOmission>,
     tenant_id: &'a str,
     generated_at: String,
     binary_hash: String,
@@ -437,7 +489,11 @@ fn build_manifest<'a>(
     };
     Ok(BundleManifest {
         version: MANIFEST_VERSION,
-        invoice_id,
+        scope_kind: SCOPE_KIND_INVOICE,
+        scope_id: invoice_id,
+        invoice_id: Some(invoice_id),
+        qc_documents: 0,
+        qc_documents_omitted: Vec::new(),
         tenant_id,
         generated_at,
         binary_hash: hex::encode(binary_hash.as_bytes()),
@@ -1511,6 +1567,69 @@ mod tests {
         assert_eq!(serialized["chain_verified_entries"], serde_json::json!(42));
         assert_eq!(serialized["entries_in_bundle"], serde_json::json!(7));
         assert_eq!(serialized["version"], serde_json::json!(MANIFEST_VERSION));
+    }
+
+    /// ADR-0122 §D5 — the v2 manifest names its own scope, and the
+    /// invoice writer's scope is `"invoice"`.
+    ///
+    /// The three fields pinned here are what let ONE manifest schema
+    /// describe both an invoice bundle and a shipment bundle, so the
+    /// invoice/shipment fork lives in `scope_kind` rather than in the
+    /// version number. `invoice_id` is retained (not replaced by
+    /// `scope_id`) so a reader keyed on it keeps working.
+    #[test]
+    fn manifest_v2_names_its_scope_and_the_invoice_writer_is_invoice_scoped() {
+        let bh = BinaryHash::from_bytes([0u8; 32]);
+        let manifest = build_manifest(
+            "inv_SCOPE",
+            "tenantX",
+            bh,
+            1,
+            1,
+            MirrorAgreementStatus::AbsentPrePr17,
+        )
+        .unwrap();
+        let v = serde_json::to_value(&manifest).unwrap();
+
+        assert_eq!(
+            v["version"],
+            serde_json::json!(2),
+            "ADR-0122 §D5 bumps to 2"
+        );
+        assert_eq!(v["scope_kind"], serde_json::json!(SCOPE_KIND_INVOICE));
+        assert_eq!(v["scope_id"], serde_json::json!("inv_SCOPE"));
+        // Retained, and equal to the scope id on this writer.
+        assert_eq!(v["invoice_id"], serde_json::json!("inv_SCOPE"));
+
+        // An invoice bundle carries no QC document and claims none.
+        // A QC report is bound to a SHIPMENT (ADR-0199 §D6) and
+        // ADR-0122 §F1 records why the two cannot be joined, so a
+        // non-zero count here would be a claim the data cannot support.
+        assert_eq!(v["qc_documents"], serde_json::json!(0));
+        assert_eq!(v["qc_documents_omitted"], serde_json::json!([]));
+    }
+
+    /// ADR-0122 §D5 — `invoice_id` is emitted as `null` on a bundle
+    /// that has none, never omitted.
+    ///
+    /// This writer always has one, so the pin is on the SERDE SHAPE:
+    /// `Option` with no `skip_serializing_if`. An omitted field would
+    /// make "this bundle has no invoice" indistinguishable from "an
+    /// older writer did not know about the field", which is the same
+    /// distinction `shipped_payload_spawned_invoice_id_none_serializes_as_null_not_omitted`
+    /// exists to protect on the dispatch payload.
+    #[test]
+    fn manifest_invoice_id_is_null_not_omitted_when_absent() {
+        let bh = BinaryHash::from_bytes([0u8; 32]);
+        let mut manifest =
+            build_manifest("inv_X", "t", bh, 1, 1, MirrorAgreementStatus::AbsentPrePr17).unwrap();
+        manifest.invoice_id = None;
+        let v = serde_json::to_value(&manifest).unwrap();
+        assert!(
+            v.get("invoice_id").is_some(),
+            "invoice_id must be PRESENT as null, not dropped from the object"
+        );
+        assert_eq!(v["invoice_id"], serde_json::Value::Null);
     }
 
     /// ADR-0029 §3 + ADR-0030 §5: the manifest's load-bearing

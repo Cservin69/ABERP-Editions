@@ -69,11 +69,16 @@ impl CheckOutcome {
 pub struct Report {
     bundle_path: PathBuf,
     outcomes: Vec<CheckOutcome>,
-    /// Captured from the parsed manifest so the summary line names
-    /// the invoice id explicitly. `None` until `set_summary_invoice_id`
-    /// is called (which `verify::run_checks` does after parsing
-    /// the manifest).
-    summary_invoice_id: Option<String>,
+    /// Captured from the parsed manifest so the summary line names the
+    /// bundle's subject explicitly — `("Invoice", "inv_…")` or, since
+    /// ADR-0122, `("Dispatch", "dsp_…")`. `None` until
+    /// [`Report::set_summary_scope`] is called (which
+    /// `verify::run_checks` does after resolving the manifest's scope).
+    ///
+    /// The LABEL is carried, not assumed: a shipment bundle whose
+    /// summary line said "Invoice" would name something the bundle does
+    /// not contain.
+    summary_scope: Option<(&'static str, String)>,
 }
 
 impl Report {
@@ -81,7 +86,7 @@ impl Report {
         Self {
             bundle_path,
             outcomes: Vec::new(),
-            summary_invoice_id: None,
+            summary_scope: None,
         }
     }
 
@@ -89,8 +94,11 @@ impl Report {
         self.outcomes.push(outcome);
     }
 
-    pub fn set_summary_invoice_id(&mut self, id: String) {
-        self.summary_invoice_id = Some(id);
+    /// Record what the bundle is a slice of, for the summary line.
+    /// `label` is the operator-facing noun ("Invoice" / "Dispatch") —
+    /// see `BundleScope::label`.
+    pub fn set_summary_scope(&mut self, label: &'static str, id: String) {
+        self.summary_scope = Some((label, id));
     }
 
     /// True iff every outcome is [`CheckLevel::Ok`] or
@@ -139,24 +147,25 @@ impl Report {
             }
         }
         let (ok, note, fail) = self.counts();
-        let inv = self
-            .summary_invoice_id
-            .as_deref()
-            .unwrap_or("<manifest-parse-failed>");
+        let (scope_label, scope_id) = self
+            .summary_scope
+            .as_ref()
+            .map(|(l, id)| (*l, id.as_str()))
+            .unwrap_or(("Bundle subject", "<manifest-parse-failed>"));
         if self.is_ok() {
             println!(
                 "\nSUMMARY: bundle OK ({} check(s) passed, {} note(s)). \
-                 Invoice {}. This bundle is UNSIGNED (signing deferred per F5 — \
+                 {} {}. This bundle is UNSIGNED (signing deferred per F5 — \
                  ADR-0029 §4); full-chain claim trusted via \
                  manifest.chain_verified=true.",
-                ok, note, inv
+                ok, note, scope_label, scope_id
             );
         } else {
             println!(
                 "\nSUMMARY: bundle FAILED ({} fail(s), {} note(s), {} ok). \
-                 Invoice {}. Resolve the [FAIL] lines above before treating \
+                 {} {}. Resolve the [FAIL] lines above before treating \
                  this bundle as authoritative audit evidence.",
-                fail, note, ok, inv
+                fail, note, ok, scope_label, scope_id
             );
         }
         // Path is also referenced here so a future grep over the

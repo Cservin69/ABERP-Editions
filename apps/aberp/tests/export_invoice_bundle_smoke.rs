@@ -141,8 +141,24 @@ fn run_produces_well_formed_tar_zst_bundle() {
     let manifest_json = manifest_json.expect("manifest.json present in archive");
     let manifest: serde_json::Value =
         serde_json::from_slice(&manifest_json).expect("manifest.json parses as JSON");
-    assert_eq!(manifest["version"], serde_json::json!(1));
+    // ADR-0122 §D5 — the manifest is v2. The bump is what let `scope_kind` /
+    // `scope_id` in, so the ONE manifest schema can describe an invoice bundle
+    // and a shipment bundle without the fork living in the version number.
+    //
+    // This is a third place the version is pinned (writer const, verifier
+    // known-set, here) and it pinned a LITERAL rather than a constant, so it
+    // is the one that had to be found by running it. Kept as a literal
+    // deliberately: a golden assertion that reads the code's own constant
+    // agrees with any value the code picks, including a wrong one.
+    assert_eq!(manifest["version"], serde_json::json!(2));
+    assert_eq!(manifest["scope_kind"], serde_json::json!("invoice"));
+    assert_eq!(manifest["scope_id"], serde_json::json!(invoice_id));
     assert_eq!(manifest["invoice_id"], serde_json::json!(invoice_id));
+    // An invoice bundle carries no QC document and claims none: a QC report is
+    // bound to a SHIPMENT (ADR-0199 §D6), and ADR-0122 §F1 records why the two
+    // cannot be joined.
+    assert_eq!(manifest["qc_documents"], serde_json::json!(0));
+    assert_eq!(manifest["qc_documents_omitted"], serde_json::json!([]));
     assert_eq!(
         manifest["tenant_id"],
         serde_json::json!("tenant-bundle-smoke")

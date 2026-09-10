@@ -20,7 +20,7 @@ use serde::Deserialize;
 
 use crate::bundle::{
     nav_archive_path, parse_chain_jsonl, parse_manifest, qc_archive_path, reconstruct_entry,
-    Archive, ChainJsonlLine, Manifest, SUPPORTED_MANIFEST_VERSION,
+    Archive, BundleScope, ChainJsonlLine, Manifest, SUPPORTED_MANIFEST_VERSIONS,
 };
 use crate::report::{CheckOutcome, Report};
 
@@ -111,7 +111,7 @@ pub fn run_checks(bundle_path: &Path, archive: &Archive) -> Report {
             return report;
         }
     };
-    if manifest.version == SUPPORTED_MANIFEST_VERSION {
+    if SUPPORTED_MANIFEST_VERSIONS.contains(&manifest.version) {
         report.push(CheckOutcome::ok(
             "manifest version",
             format!("{} (supported)", manifest.version),
@@ -120,12 +120,36 @@ pub fn run_checks(bundle_path: &Path, archive: &Archive) -> Report {
         report.push(CheckOutcome::fail(
             "manifest version",
             format!(
-                "manifest version {} unknown to aberp-verify (supports v{}); \
+                "manifest version {} unknown to aberp-verify (supports {:?}); \
                  a newer aberp-verify may understand this bundle",
-                manifest.version, SUPPORTED_MANIFEST_VERSION
+                manifest.version, SUPPORTED_MANIFEST_VERSIONS
             ),
         ));
     }
+
+    // ADR-0122 §D5 — resolve what the bundle is a slice OF, normalising
+    // a v1 manifest (which predates the shipment bundle and is therefore
+    // an invoice bundle by construction). Every check below keys on this
+    // rather than on `manifest.invoice_id`, so none of them has to know
+    // which manifest version it is reading.
+    //
+    // An unresolvable scope is fatal, not a Fail-and-continue: the
+    // membership check has nothing to compare against, and a report that
+    // said "0 entries do not reference <unknown>" would read as a pass.
+    let scope = match manifest.scope() {
+        Ok(s) => s,
+        Err(e) => {
+            report.push(CheckOutcome::fail(
+                "manifest scope",
+                format!("could not resolve what this bundle is a slice of: {e:#}"),
+            ));
+            return report;
+        }
+    };
+    report.push(CheckOutcome::ok(
+        "manifest scope",
+        format!("{} {}", scope.label(), scope.id()),
+    ));
 
     // §3 check 3 — manifest field set. Implicit: if `parse_manifest`
     // succeeded, every required field per `Manifest`'s shape was
@@ -195,7 +219,7 @@ pub fn run_checks(bundle_path: &Path, archive: &Archive) -> Report {
     }
 
     // §3 check 12 — bundle-membership pin.
-    check_bundle_membership(&manifest, &entries, &mut report);
+    check_bundle_membership(&scope, &entries, &mut report);
 
     // §3 check 13/14 — per-NAV-bearing-entry XML pin + cross-totals.
     check_nav_xml_pins(&entries, &archive.nav_files, &mut report);
@@ -216,7 +240,7 @@ pub fn run_checks(bundle_path: &Path, archive: &Archive) -> Report {
         ),
     ));
 
-    report.set_summary_invoice_id(manifest.invoice_id);
+    report.set_summary_scope(scope.label(), scope.id().to_string());
     report
 }
 
@@ -477,15 +501,39 @@ fn check_chain_links_and_gaps(entries: &[Entry], tenant: &TenantId, report: &mut
     }
 }
 
-/// §3 check 12 — every slice entry's payload must reference the
-/// manifest's invoice_id in at least one id-shaped field per the
-/// any-id-field-equality posture (ADR-0029 §2 mirror).
-fn check_bundle_membership(manifest: &Manifest, entries: &[Entry], report: &mut Report) {
+/// §3 check 12 — every slice entry must be explained by the bundle's
+/// scope.
+///
+/// For an **invoice** bundle this is ADR-0029 §2's any-id-field-equality
+/// posture, mirrored: every entry's payload must reference the invoice
+/// id in at least one id-shaped field.
+///
+/// For a **dispatch** bundle (ADR-0122) the rule is the writer's
+/// two-pass one, and this verifier does not implement it yet — it lands
+/// with the writer in ADR-0122 slice 2. Until then a shipment bundle
+/// FAILs here rather than being waved through: a membership check that
+/// does not know the rule cannot report that the rule held.
+fn check_bundle_membership(scope: &BundleScope, entries: &[Entry], report: &mut Report) {
+    let invoice_id = match scope {
+        BundleScope::Invoice(id) => id,
+        BundleScope::Dispatch(id) => {
+            report.push(CheckOutcome::fail(
+                "bundle membership",
+                format!(
+                    "this aberp-verify does not implement the dispatch-scope membership \
+                     rule (ADR-0122 §D1), so it cannot attest that the {} entries in \
+                     shipment bundle {id} belong to it — a newer aberp-verify can",
+                    entries.len()
+                ),
+            ));
+            return;
+        }
+    };
     let mut not_referencing: Vec<u64> = Vec::new();
     for entry in entries {
         let probe: Result<MembershipProbe, _> = serde_json::from_slice(&entry.payload);
         let matches = match probe {
-            Ok(p) => p.matches(&manifest.invoice_id),
+            Ok(p) => p.matches(invoice_id),
             Err(_) => false,
         };
         if !matches {
@@ -499,17 +547,17 @@ fn check_bundle_membership(manifest: &Manifest, entries: &[Entry], report: &mut 
                 "{}/{} entries reference invoice id {:?}",
                 entries.len(),
                 entries.len(),
-                manifest.invoice_id
+                invoice_id
             ),
         ));
     } else {
         report.push(CheckOutcome::fail(
             "bundle membership",
             format!(
-                "{} entries do not reference manifest.invoice_id={:?} in any \
+                "{} entries do not reference manifest scope id {:?} in any \
                  id-shaped field (silent-omission failure mode per CLAUDE.md rule 12): seqs {:?}",
                 not_referencing.len(),
-                manifest.invoice_id,
+                invoice_id,
                 not_referencing
             ),
         ));
@@ -2246,23 +2294,12 @@ mod tests {
             )
             .unwrap();
         let entries = ledger.entries().unwrap();
-        let manifest = Manifest {
-            version: 1,
-            invoice_id: "inv_TARGET".to_string(),
-            tenant_id: "t1".to_string(),
-            generated_at: "2026-01-01T00:00:00Z".to_string(),
-            binary_hash: "00".repeat(32),
-            nav_xsd_version: "3.0".to_string(),
-            chain_verified: true,
-            chain_verified_entries: 1,
-            entries_in_bundle: 1,
-            signed: false,
-            signature_status: SIGNATURE_STATUS_DEFERRED_PER_F5.to_string(),
-            mirror_file_present: false,
-            mirror_file_status: "absent-pre-pr-17".to_string(),
-        };
         let mut report = Report::new("/tmp/test".into());
-        check_bundle_membership(&manifest, &entries, &mut report);
+        check_bundle_membership(
+            &BundleScope::Invoice("inv_TARGET".to_string()),
+            &entries,
+            &mut report,
+        );
         assert!(
             !report.is_ok(),
             "entry referencing inv_OTHER cannot appear in inv_TARGET's bundle"

@@ -193,6 +193,38 @@ impl Ledger {
         }
     }
 
+    /// Give up the `Ledger` and hand back the [`Connection`] it was
+    /// holding, WITHOUT re-opening the file (ADR-0122 §D4).
+    ///
+    /// # Why this consumes, and why a `&Connection` accessor is refused
+    ///
+    /// A read-only consumer sometimes needs both halves of one tenant
+    /// DB: the audit chain (via this type) and an ordinary table (via a
+    /// `Connection`). It cannot open a second one — two
+    /// `Connection::open` calls on one DuckDB file are two database
+    /// instances contending for the same file lock, and the opener
+    /// census (CHECK 10h / 10i) reds a new opener regardless. So the
+    /// one connection has to be shared.
+    ///
+    /// It is shared by **transfer, never by loan**. A
+    /// `fn conn(&self) -> &Connection` would hand out a writer with the
+    /// `Ledger`'s provenance stripped while the `Ledger` is still live —
+    /// the laundering shape CHECK 10P classifies and `from_connection`
+    /// is fenced for. Consuming `self` means there is no interval in
+    /// which a `Ledger` and a bare `Connection` on the same file are
+    /// both in scope: after this call the chain API is simply gone.
+    ///
+    /// The returned `Connection` keeps whatever pragmas it was opened
+    /// with — in particular `Ledger::open`'s
+    /// `disable_checkpoint_on_shutdown` (ADR-0098 R3), so dropping it
+    /// still folds nothing.
+    ///
+    /// This is the exact inverse of [`Ledger::from_connection`]; a
+    /// round trip through both is a no-op on the connection.
+    pub fn into_connection(self) -> Connection {
+        self.conn
+    }
+
     fn initialise(
         conn: Connection,
         tenant_id: TenantId,
@@ -1178,5 +1210,76 @@ mod from_connection_tests {
         assert_eq!(ledger.verify_chain().expect("verify empty"), 0);
         drop(ledger);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod into_connection_tests {
+    //! ADR-0122 §D4 — [`Ledger::into_connection`] is what lets one
+    //! read-only consumer read the audit chain AND an ordinary table on
+    //! the same tenant DB without opening the file twice.
+    //!
+    //! The load-bearing claim: the connection handed back is the SAME
+    //! one the `Ledger` was using — still usable, still carrying its
+    //! pragmas, no second `Connection::open` anywhere in the round trip.
+
+    use super::*;
+
+    fn tenant() -> TenantId {
+        TenantId::new("t-into-conn").unwrap()
+    }
+
+    fn actor() -> Actor {
+        Actor::from_local_cli("01H0000000000000000000000Z".to_string(), "t")
+    }
+
+    /// The returned `Connection` still works, and it is the same
+    /// connection: rows appended THROUGH the `Ledger` are visible on it
+    /// afterwards with no re-open.
+    #[test]
+    fn the_returned_connection_still_sees_what_the_ledger_wrote() {
+        let mut ledger = Ledger::open_in_memory(tenant(), BinaryHash::from_bytes([1u8; 32]))
+            .expect("open in-memory ledger");
+        ledger
+            .append(EventKind::Test, br#"{"k":"v"}"#.to_vec(), actor(), None)
+            .expect("append");
+
+        let conn = ledger.into_connection();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_ledger;", [], |r| r.get(0))
+            .expect("count on the handed-back connection");
+        assert_eq!(
+            n, 1,
+            "the connection handed back must be the SAME one the Ledger wrote through — \
+             an in-memory DuckDB re-open would show zero rows"
+        );
+    }
+
+    /// `from_connection` ∘ `into_connection` is a no-op on the
+    /// connection: the chain still verifies after a round trip, so the
+    /// transfer neither re-opens the file nor loses the schema.
+    #[test]
+    fn a_round_trip_through_from_connection_preserves_the_chain() {
+        let mut ledger = Ledger::open_in_memory(tenant(), BinaryHash::from_bytes([2u8; 32]))
+            .expect("open in-memory ledger");
+        for i in 0..3u8 {
+            ledger
+                .append(
+                    EventKind::Test,
+                    format!(r#"{{"i":{i}}}"#).into_bytes(),
+                    actor(),
+                    None,
+                )
+                .expect("append");
+        }
+        assert_eq!(ledger.verify_chain().expect("verify before"), 3);
+
+        let conn = ledger.into_connection();
+        let rebuilt = Ledger::from_connection(conn, tenant(), BinaryHash::from_bytes([2u8; 32]));
+        assert_eq!(
+            rebuilt.verify_chain().expect("verify after round trip"),
+            3,
+            "into_connection is the exact inverse of from_connection"
+        );
     }
 }
