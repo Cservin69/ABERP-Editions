@@ -73,6 +73,10 @@ pub mod email_relay_credentials;
 pub mod email_relay_daemon;
 pub mod email_relay_queue;
 pub mod export_invoice_bundle;
+// ADR-0122 — the SHIPMENT evidence bundle (D-99 residual 1 / AC10). Scoped to a
+// dispatch rather than an invoice: the QC report is bound to a shipment by
+// construction, and §F1 records why an invoice cannot be joined back to one.
+pub mod export_shipment_bundle;
 pub mod first_launch;
 pub mod fs;
 pub mod incoming_invoices;

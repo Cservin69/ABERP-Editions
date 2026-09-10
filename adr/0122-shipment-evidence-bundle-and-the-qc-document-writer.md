@@ -137,7 +137,28 @@ into a widened probe:
   |---|---|
   | `dsp_id` | `mes.dispatch_created`, `mes.dispatch_shipped`, `qcr.report_attached_to_shipment` |
   | `shipment_id` | `export.shipment_logged` (`ExportShipmentLoggedPayload`, `crates/aberp-dispatch/src/audit.rs:217`) |
-  | `entity_id` | `export.classification_set`, `export.access_check` (both `entity_kind` + `entity_id`, `:117` / `:165`; `entity_kind` is `"dispatch"` at `apps/aberp/src/serve.rs:19649`) |
+  | `entity_id` (+ `entity_kind == "dispatch"`) | `export.access_check` only (`crates/aberp-dispatch/src/audit.rs:165`; `entity_kind: "dispatch"` at `apps/aberp/src/serve.rs:19650`) |
+
+  > **Correction, found while building slice 2.** Round 1's version of this
+  > table also listed `export.classification_set` on the `entity_id` row,
+  > because it uses the same two fields. That is **wrong**: its firing site
+  > writes `entity_kind: "product"` with the WO's `product_id`
+  > (`crates/aberp-dispatch/src/repository.rs:698`). It is a determination
+  > about a **commodity**, not about this shipment, and its id is a `prd_*`
+  > that no dispatch-keyed rule can match.
+  >
+  > It stays **out** of the slice, and that is the right answer rather than a
+  > shortfall. Sweeping it in would need a third declared hop
+  > (dispatch → WO → product), and that hop would pull **every other
+  > shipment's** classification rows for the same product into a per-shipment
+  > bundle. The per-shipment fact is already carried where it belongs:
+  > `export.shipment_logged.ecn_or_authorization` is "populated from the same
+  > determination the `export.classification_set` row carries"
+  > (`audit.rs:228`), scoped to this shipment, and it **is** in the slice.
+  >
+  > Pinned both ways:
+  > `the_export_family_is_in_the_slice_by_its_own_field_names` and
+  > `a_product_scoped_classification_row_is_not_in_a_shipment_slice`.
 
   **The field set is load-bearing and hand-listed**, exactly like
   `BundleMembershipProbe`'s (`apps/aberp/src/export_invoice_bundle.rs:147`): a
