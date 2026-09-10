@@ -32,8 +32,9 @@
 //! is slice 1: the map + the fold, library-only and inert (no ledger reader, no
 //! renderer — those are slice 2).
 
-use aberp_audit_ledger::EventKind;
+use aberp_audit_ledger::{Entry, EventKind};
 use aberp_compliance::nist_800_171 as nist;
+use time::OffsetDateTime;
 
 /// One asserted evidentiary link: emitting `kind` contributes evidence toward
 /// satisfying `control`. `rationale` states WHY in one line, so a reviewer or
@@ -284,6 +285,164 @@ pub fn coverage(observed: &[ObservedKind], window: TimeWindow) -> CoverageReport
     }
 }
 
+impl TimeWindow {
+    /// Is `t` within this window? Open bounds (`None`) never exclude; both
+    /// `None` is all-time. Comparison is on the instant (epoch ms), NOT on the
+    /// RFC3339 string — the sub-second-precision string-compare trap A1's reaper
+    /// and the QC-report ordering bug both taught us to avoid.
+    pub fn contains(&self, t: OffsetDateTime) -> bool {
+        let ms = (t.unix_timestamp_nanos() / 1_000_000) as i64;
+        self.from_ms.is_none_or(|from| ms >= from) && self.to_ms.is_none_or(|to| ms <= to)
+    }
+}
+
+/// D-04 (ADR-0121) slice 2 — the reader fold: count the audit `Entry`s per kind,
+/// within `window`, into the [`ObservedKind`] set [`coverage`] consumes.
+///
+/// **Pure over the entries** (no DB open here): slice 3's transport reads the
+/// entries through serve's existing shared `Handle` (`Ledger::entries()`), so
+/// this module adds no new database opener — the frozen-opener ledger
+/// (cut-gate CHECK 10i) is untouched. The window is applied HERE, on the parsed
+/// instant, so `coverage` receives an already-window-scoped set. A kind that
+/// evidences no control still counts (the report surfaces it as
+/// observed-but-unmapped); the caller passes ALL entries, not a pre-filtered
+/// slice.
+pub fn observed_kinds(entries: &[Entry], window: &TimeWindow) -> Vec<ObservedKind> {
+    let mut counts: Vec<(EventKind, u64)> = Vec::new();
+    for e in entries {
+        if !window.contains(e.time_wall) {
+            continue;
+        }
+        if let Some(slot) = counts.iter_mut().find(|(k, _)| *k == e.kind) {
+            slot.1 += 1;
+        } else {
+            counts.push((e.kind.clone(), 1));
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(kind, count)| ObservedKind { kind, count })
+        .collect()
+}
+
+/// D-04 (ADR-0121) slice 2 — render a [`CoverageReport`] as a structured JSON
+/// value (the shape slice 3's serve route / SPA consumes). Language is honest:
+/// `state` is `evidenced` / `mapped_not_exercised` / `no_automated_evidence`,
+/// never `compliant`; the top-level `disclaimer` states that evidence presence
+/// is not satisfaction.
+pub fn render_report_json(report: &CoverageReport) -> serde_json::Value {
+    let controls: Vec<serde_json::Value> = report
+        .controls
+        .iter()
+        .map(|c| match &c.state {
+            EvidenceState::Evidenced { kinds } => serde_json::json!({
+                "control": c.control,
+                "state": "evidenced",
+                "kinds": kinds.iter().map(|k| serde_json::json!({
+                    "kind": k.kind.as_str(),
+                    "count": k.count,
+                    "rationale": k.rationale,
+                })).collect::<Vec<_>>(),
+            }),
+            EvidenceState::MappedNotExercised { kinds } => serde_json::json!({
+                "control": c.control,
+                "state": "mapped_not_exercised",
+                "kinds": kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
+            }),
+            EvidenceState::NoAutomatedEvidence => serde_json::json!({
+                "control": c.control,
+                "state": "no_automated_evidence",
+            }),
+        })
+        .collect();
+
+    let (mut evidenced, mut mapped, mut none) = (0usize, 0usize, 0usize);
+    for c in &report.controls {
+        match c.state {
+            EvidenceState::Evidenced { .. } => evidenced += 1,
+            EvidenceState::MappedNotExercised { .. } => mapped += 1,
+            EvidenceState::NoAutomatedEvidence => none += 1,
+        }
+    }
+
+    serde_json::json!({
+        "disclaimer":
+            "Shows which ledger events evidence which NIST SP 800-171 control. \
+             Evidence presence is necessary, not sufficient — an assessor decides \
+             control satisfaction. This report does not assert compliance.",
+        "window": { "from_ms": report.window.from_ms, "to_ms": report.window.to_ms },
+        "summary": {
+            "total": report.controls.len(),
+            "evidenced": evidenced,
+            "mapped_not_exercised": mapped,
+            "no_automated_evidence": none,
+        },
+        "controls": controls,
+        "observed_unmapped_kinds":
+            report.observed_unmapped_kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
+    })
+}
+
+/// D-04 (ADR-0121) slice 2 — render a [`CoverageReport`] as a plain-text table
+/// for a terminal / log. Same honest language as the JSON.
+pub fn render_report_table(report: &CoverageReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "NIST SP 800-171 Rev. 2 — ledger evidence coverage");
+    let _ = writeln!(
+        out,
+        "  (evidence present ≠ control satisfied; an assessor grades satisfaction)"
+    );
+    let window = match (report.window.from_ms, report.window.to_ms) {
+        (None, None) => "all time".to_string(),
+        (from, to) => format!("from={from:?} to={to:?} (epoch ms)"),
+    };
+    let _ = writeln!(out, "  window: {window}\n");
+
+    for c in &report.controls {
+        let tag = match &c.state {
+            EvidenceState::Evidenced { kinds } => {
+                let total: u64 = kinds.iter().map(|k| k.count).sum();
+                format!("[EVIDENCED   ] {total} event(s)")
+            }
+            EvidenceState::MappedNotExercised { .. } => "[mapped, none]".to_string(),
+            EvidenceState::NoAutomatedEvidence => "[no auto ev. ]".to_string(),
+        };
+        let _ = writeln!(out, "  {tag}  {}", c.control);
+    }
+
+    let (mut evidenced, mut mapped, mut none) = (0usize, 0usize, 0usize);
+    for c in &report.controls {
+        match c.state {
+            EvidenceState::Evidenced { .. } => evidenced += 1,
+            EvidenceState::MappedNotExercised { .. } => mapped += 1,
+            EvidenceState::NoAutomatedEvidence => none += 1,
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\n  {} of {} controls evidenced, {} mapped-but-unexercised, {} with no automated evidence in ABERP",
+        evidenced,
+        report.controls.len(),
+        mapped,
+        none
+    );
+    if !report.observed_unmapped_kinds.is_empty() {
+        let _ = writeln!(
+            out,
+            "  observed kinds mapped to no control ({}): {}",
+            report.observed_unmapped_kinds.len(),
+            report
+                .observed_unmapped_kinds
+                .iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +626,128 @@ mod tests {
             assert!(controls_for(&l.kind).contains(&l.control));
             assert!(kinds_for(l.control).contains(&l.kind));
         }
+    }
+
+    // ── slice 2: the reader fold + renderers ─────────────────────────────
+
+    /// Seed a fresh in-memory ledger with one event per entry in `kinds` and
+    /// return the decoded entries (same pattern as `audit_query.rs`'s tests).
+    fn seed_entries(kinds: &[EventKind]) -> Vec<Entry> {
+        use aberp_audit_ledger::{Actor, BinaryHash, Ledger, TenantId};
+        let mut ledger = Ledger::open_in_memory(
+            TenantId::new("T").expect("tenant"),
+            BinaryHash::from_bytes([0u8; 32]),
+        )
+        .expect("open in-memory ledger");
+        for k in kinds {
+            let actor = Actor::from_local_cli("01H0000000000000000000000Z".to_string(), "tester");
+            ledger
+                .append(k.clone(), b"{}".to_vec(), actor, None)
+                .expect("append");
+        }
+        ledger.entries().expect("entries")
+    }
+
+    #[test]
+    fn time_window_contains_bounds() {
+        let t = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let ms = 1_700_000_000_000i64;
+        assert!(TimeWindow::default().contains(t), "all-time includes everything");
+        assert!(TimeWindow {
+            from_ms: Some(ms - 1),
+            to_ms: Some(ms + 1)
+        }
+        .contains(t));
+        // Inclusive on both ends.
+        assert!(TimeWindow {
+            from_ms: Some(ms),
+            to_ms: Some(ms)
+        }
+        .contains(t));
+        // Starts after / ends before → excluded.
+        assert!(!TimeWindow {
+            from_ms: Some(ms + 1),
+            to_ms: None
+        }
+        .contains(t));
+        assert!(!TimeWindow {
+            from_ms: None,
+            to_ms: Some(ms - 1)
+        }
+        .contains(t));
+    }
+
+    #[test]
+    fn observed_kinds_counts_and_windows() {
+        let entries = seed_entries(&[
+            EventKind::PersonnelAccessGranted,
+            EventKind::PersonnelAccessGranted,
+            EventKind::CuiMarkingApplied,
+        ]);
+        let obs = observed_kinds(&entries, &TimeWindow::default());
+        let count_of = |k: &EventKind| {
+            obs.iter().find(|o| &o.kind == k).map(|o| o.count).unwrap_or(0)
+        };
+        assert_eq!(count_of(&EventKind::PersonnelAccessGranted), 2);
+        assert_eq!(count_of(&EventKind::CuiMarkingApplied), 1);
+
+        // A window entirely in the past excludes the ~now entries.
+        let past = TimeWindow {
+            from_ms: None,
+            to_ms: Some(0),
+        };
+        assert!(
+            observed_kinds(&entries, &past).is_empty(),
+            "no entry falls before epoch 0"
+        );
+
+        // End-to-end into the fold: the two grants evidence AC 3.1.2.
+        let report = coverage(&obs, TimeWindow::default());
+        assert!(matches!(
+            report
+                .controls
+                .iter()
+                .find(|c| c.control == nist::AC_3_1_2)
+                .unwrap()
+                .state,
+            EvidenceState::Evidenced { .. }
+        ));
+    }
+
+    #[test]
+    fn render_json_is_honest_and_structured() {
+        let obs = vec![ObservedKind {
+            kind: EventKind::CuiMarkingApplied,
+            count: 2,
+        }];
+        let report = coverage(&obs, TimeWindow::default());
+        let v = render_report_json(&report);
+        let s = v.to_string();
+        // No compliance/satisfaction verdict leaks into the rendered output.
+        assert!(!s.contains("compliant"), "must not claim compliant");
+        assert!(!s.contains("satisfied"), "must not claim satisfied");
+        assert!(v["disclaimer"]
+            .as_str()
+            .unwrap()
+            .contains("not sufficient"));
+        assert_eq!(v["summary"]["total"], 110);
+        assert_eq!(v["summary"]["evidenced"], 1); // MP 3.8.4 only
+        let controls = v["controls"].as_array().unwrap();
+        let mp = controls
+            .iter()
+            .find(|c| c["control"] == nist::MP_3_8_4)
+            .unwrap();
+        assert_eq!(mp["state"], "evidenced");
+        assert_eq!(mp["kinds"][0]["kind"], "cui.marking_applied");
+        assert_eq!(mp["kinds"][0]["count"], 2);
+        assert!(!mp["kinds"][0]["rationale"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn render_table_states_the_caveat_and_summary() {
+        let report = coverage(&[], TimeWindow::default());
+        let t = render_report_table(&report);
+        assert!(t.contains("evidence present ≠ control satisfied"));
+        assert!(t.contains("0 of 110 controls evidenced"));
     }
 }
