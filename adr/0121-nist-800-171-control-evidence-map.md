@@ -52,14 +52,26 @@ live somewhere revisable, and the evidence must be **derived**, not stamped.
 ## Decision
 
 Tag at the **kind level, in code, read-side only.** A static
-`EventKind → controls` **evidence map** in `aberp-compliance`, plus a coverage
-report that reads the existing ledger. **No per-event payload field, no new
+`EventKind → controls` **evidence map** (in `apps/aberp`, see the home-crate
+note below), plus a coverage report that reads the existing ledger. **No per-event payload field, no new
 `EventKind`, no schema change, no new firing site.**
 
 ### The evidence map (where the tag lives)
 
-A static table in `crates/aberp-compliance/src/nist_800_171/` keyed on the
-`EventKind` **enum variant** (not its string):
+A static table in **`apps/aberp/src/nist_coverage.rs`** keyed on the `EventKind`
+**enum variant** (not its string).
+
+**Home-crate note (build-time correction).** The map references *both* the
+`nist_800_171` control constants (in `aberp-compliance`) *and* `EventKind` (in
+`aberp-audit-ledger`). `aberp-compliance` is a deliberately lean leaf crate
+(serde-derive only, no runtime deps) that does **not** depend on
+`aberp-audit-ledger`, and must not — dragging the ledger crate (and duckdb) into
+it to key on `EventKind` would wreck that posture. So the map lives in
+`apps/aberp`, which already depends on both — the same home the D-08/D-09/D-10
+feature modules (`cui_marking.rs`, `cyber_incident.rs`, `dpas_rating.rs`) use.
+The control *constants* stay in `aberp-compliance`; only the *mapping* (which
+needs `EventKind`) is aberp-side. This keeps the compile-time enum key intact
+(the point below), which a string key would have sacrificed.
 
 ```rust
 /// One asserted evidentiary link: emitting `kind` contributes evidence toward

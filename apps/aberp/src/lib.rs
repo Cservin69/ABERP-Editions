@@ -58,6 +58,10 @@ pub mod dpas_rating;
 // D-15 — the 21 CFR Part 11 e-signature ceremony: sign a record via the
 // DigitalIdProvider and fire `personnel.signature_applied`.
 pub mod e_signature;
+// D-04 (ADR-0121) — NIST SP 800-171 control-evidence map + coverage fold: a
+// static EventKind→control map read-side over the existing ledger (no new
+// EventKind, no payload field, no schema).
+pub mod nist_coverage;
 // The Defense demo seed — one coherent aerospace job written into the
 // bundled `demo` tenant so the Defense screens have something to render.
 // Demo/dev artifact: reachable only through `aberp demo-seed`, which
