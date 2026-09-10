@@ -1013,6 +1013,128 @@ pub fn schedule_auto_retry_if_eligible(
     Ok(scheduled)
 }
 
+/// D-20 A4 (ADR-0120) — one `Failed` row the auto-retry sweep may re-enqueue.
+/// Purpose-built projection (not [`PricingJobRow`], which omits the CAD path
+/// columns) carrying exactly what the sweep needs: the fields to re-derive the
+/// FULL `QuotePricingFetched` audit payload (deserialize-safety, ADR §review
+/// finding 7), plus the pre-re-enqueue `auto_retry_count` and `failure_kind`
+/// for the audit extras (the re-enqueue clears `failure_kind`, so it must be
+/// read here first).
+#[derive(Debug, Clone)]
+pub struct AutoRetryCandidate {
+    pub quote_id: String,
+    pub tenant_id: String,
+    pub customer_email: String,
+    pub material_grade: String,
+    pub quantity: u32,
+    pub cad_filename: String,
+    pub cad_local_path: String,
+    /// Current count BEFORE this sweep's bump (COALESCE 0).
+    pub auto_retry_count: u32,
+    /// The verdict that preceded the retry (the row still carries it here).
+    pub failure_kind: Option<String>,
+    /// RFC3339, NOT NULL by the query. The sweep parses this in RUST (never a
+    /// SQL compare — the sub-second-precision trap A1's reaper avoids) to
+    /// decide due-ness against `now`.
+    pub next_retry_at: String,
+}
+
+/// D-20 A4 (ADR-0120) — up to `limit` `Failed` rows that carry a schedule
+/// (`next_retry_at IS NOT NULL`, which already means "scheduled AND under cap"
+/// — the cap was enforced when [`schedule_auto_retry_if_eligible`] set it, so
+/// the sweep needs no per-kind cap logic here). Ordered by `next_retry_at ASC`
+/// so the most-overdue come first and a `limit` cut keeps the earliest; the
+/// caller parses each `next_retry_at` in Rust and stops at the first not-yet-due
+/// row (ascending ⇒ all later rows are also future). Mirrors the reaper's
+/// `started_non_terminal_jobs` shape.
+pub fn auto_retry_candidates(
+    conn: &Connection,
+    tenant_id: &str,
+    limit: usize,
+) -> Result<Vec<AutoRetryCandidate>> {
+    ensure_schema(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT quote_id, tenant_id, customer_email, material_grade, quantity,
+                    cad_filename, cad_local_path, COALESCE(auto_retry_count, 0),
+                    failure_kind, next_retry_at
+                FROM quote_pricing_jobs
+                WHERE tenant_id = ? AND state = ? AND next_retry_at IS NOT NULL
+                ORDER BY next_retry_at ASC
+                LIMIT ?",
+        )
+        .context("prepare auto_retry_candidates")?;
+    let rows = stmt
+        .query_map(params![tenant_id, STATE_FAILED, limit as i64], |r| {
+            Ok(AutoRetryCandidate {
+                quote_id: r.get(0)?,
+                tenant_id: r.get(1)?,
+                customer_email: r.get(2)?,
+                material_grade: r.get(3)?,
+                quantity: r.get::<_, i64>(4)?.max(0) as u32,
+                cad_filename: r.get(5)?,
+                cad_local_path: r.get(6)?,
+                auto_retry_count: r.get::<_, i64>(7)?.max(0) as u32,
+                failure_kind: r.get(8)?,
+                next_retry_at: r.get(9)?,
+            })
+        })
+        .context("query auto_retry_candidates")?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.context("row auto_retry_candidates")?);
+    }
+    Ok(out)
+}
+
+/// D-20 A4 (ADR-0120) — atomically re-enqueue one due `Failed` row for
+/// auto-retry: `Failed → Fetched`, clear the error columns + `next_retry_at`,
+/// bump `auto_retry_count`, and — the crux of not re-wedging — set
+/// `fetched_at = now` so the row re-enters at the **BACK** of the FIFO, never
+/// the head (contrast the operator retry, which preserves `fetched_at` on the
+/// operator's explicit "do this next" intent). Returns the post-bump
+/// `auto_retry_count`, or `None` if the row is no longer `Failed` (a concurrent
+/// operator retry / delete raced the sweep — both run under the shared Handle
+/// writer, so this is a clean state-guarded no-op, ADR §review finding 4).
+///
+/// **Does NOT commit** — the caller appends the `QuotePricingFetched` audit row
+/// in the SAME transaction so the re-enqueue and its audit-of-record are
+/// atomic (the same posture as [`retry_job_in_tx`]).
+pub fn auto_retry_reenqueue_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    quote_id: &str,
+    tenant_id: &str,
+    now: OffsetDateTime,
+) -> Result<Option<u32>> {
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format updated_at")?;
+    let rows = tx
+        .execute(
+            "UPDATE quote_pricing_jobs
+                SET state = ?, updated_at = ?, fetched_at = ?,
+                    error_stage = NULL, error_reason = NULL, failure_kind = NULL,
+                    next_retry_at = NULL,
+                    auto_retry_count = COALESCE(auto_retry_count, 0) + 1
+                WHERE quote_id = ? AND tenant_id = ? AND state = ?",
+            params![STATE_FETCHED, ts, ts, quote_id, tenant_id, STATE_FAILED],
+        )
+        .context("auto_retry_reenqueue UPDATE")?;
+    if rows == 0 {
+        // Not Failed any more (operator raced us) — clean no-op.
+        return Ok(None);
+    }
+    let new_count: i64 = tx
+        .query_row(
+            "SELECT COALESCE(auto_retry_count, 0) FROM quote_pricing_jobs
+                WHERE quote_id = ? AND tenant_id = ?",
+            params![quote_id, tenant_id],
+            |r| r.get(0),
+        )
+        .context("read auto_retry_count after re-enqueue")?;
+    Ok(Some(new_count.max(0) as u32))
+}
+
 /// D-PRICEQ — outcome of an operator Retry click, mirroring
 /// [`DeleteJobOutcome`]'s shape. The serve handler maps each variant to an
 /// HTTP status: `Applied` → 200, `NotFound` → 404, `NotRetryable` → 409.
@@ -3929,6 +4051,63 @@ mod tests {
                 .is_none(),
             "absent row schedules nothing"
         );
+    }
+
+    #[test]
+    fn auto_retry_candidates_selects_scheduled_failed_only() {
+        let mut conn = open_mem();
+        // Failed + scheduled → selected. Failed + NULL schedule → excluded.
+        seed_failed(&mut conn, "sched", FailureKind::Transient);
+        schedule_auto_retry_if_eligible(&mut conn, "sched", "T", FailureKind::Transient, fixed_ts())
+            .expect("schedule");
+        seed_failed(&mut conn, "noshed", FailureKind::Permanent); // next_retry_at stays NULL
+
+        let cands = auto_retry_candidates(&conn, "T", 10).expect("candidates");
+        let ids: Vec<&str> = cands.iter().map(|c| c.quote_id.as_str()).collect();
+        assert_eq!(ids, ["sched"], "only the scheduled Failed row is a candidate");
+        assert_eq!(cands[0].auto_retry_count, 0);
+        assert_eq!(cands[0].failure_kind.as_deref(), Some("transient"));
+    }
+
+    #[test]
+    fn auto_retry_reenqueue_moves_to_back_and_guards_state() {
+        let mut conn = open_mem();
+        seed_failed(&mut conn, "re", FailureKind::Transient);
+        schedule_auto_retry_if_eligible(&mut conn, "re", "T", FailureKind::Transient, fixed_ts())
+            .expect("schedule");
+
+        // A later `now` proves fetched_at is reset to the re-enqueue instant.
+        let later = fixed_ts() + time::Duration::hours(1);
+        let tx = conn.transaction().expect("tx");
+        let n = auto_retry_reenqueue_in_tx(&tx, "re", "T", later)
+            .expect("reenqueue")
+            .expect("was Failed");
+        tx.commit().expect("commit");
+        assert_eq!(n, 1, "auto_retry_count bumped to 1");
+
+        // Row is Fetched, schedule cleared, fetched_at moved to `later`.
+        assert_eq!(read_state(&conn, "re", "T").expect("state"), Some(JobState::Fetched));
+        let (count, next) = read_auto_retry(&conn, "re", "T");
+        assert_eq!(count, Some(1));
+        assert!(next.is_none(), "next_retry_at cleared");
+        let fetched_at: String = conn
+            .query_row(
+                "SELECT fetched_at FROM quote_pricing_jobs WHERE quote_id = ? AND tenant_id = ?",
+                params!["re", "T"],
+                |r| r.get(0),
+            )
+            .expect("fetched_at");
+        let expected = later
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        assert_eq!(fetched_at, expected, "fetched_at reset to now (BACK of FIFO)");
+
+        // Now the row is Fetched, a second re-enqueue is a clean no-op (the
+        // state guard — models an operator retry racing the sweep).
+        let tx2 = conn.transaction().expect("tx2");
+        let none = auto_retry_reenqueue_in_tx(&tx2, "re", "T", later).expect("reenqueue2");
+        tx2.commit().expect("commit2");
+        assert!(none.is_none(), "a non-Failed row is a state-guarded no-op");
     }
 
     #[test]

@@ -409,6 +409,10 @@ pub struct PipelineCycleSummary {
     /// D-PRICEQ — jobs the stale-job reaper terminalised this cycle (stuck
     /// in a started, non-terminal state past [`STALE_JOB_REAP_AFTER`]).
     pub reaped: u32,
+    /// D-20 A4 (ADR-0120) — `Failed` rows the auto-retry sweep re-enqueued
+    /// (`Failed → Fetched`, at the BACK of the FIFO) this cycle because their
+    /// backoff had elapsed. Distinct from `enqueued` (new storefront quotes).
+    pub auto_retried: u32,
     /// D-PRICEQ — jobs whose advance returned `Err` this cycle and were
     /// SKIPPED for the rest of the cycle rather than aborting it. Distinct
     /// from `failed`: a `failed` job reached the terminal `Failed` state with
@@ -488,6 +492,13 @@ const STALE_JOB_REAP_AFTER: Duration = Duration::from_secs(30 * 60);
 /// turn one cycle into an unbounded write storm. Anything beyond the cap is
 /// reaped on subsequent cycles.
 const MAX_REAP_PER_CYCLE: usize = 20;
+
+/// D-20 A4 (ADR-0120) — per-cycle cap on auto-retry re-enqueues, so a backlog
+/// of simultaneously-due rows (e.g. after a restart, or a minute-long
+/// disk-full that failed a batch) drains over cycles rather than in one write
+/// storm — the jitter in [`jobs::auto_retry_backoff`] having already spread
+/// their schedules. The queue does not thrash (ADR §review confirmation 5).
+const MAX_AUTO_RETRY_PER_CYCLE: usize = 5;
 
 /// Default valid_until window for an indicative quote, in days. Per
 /// ADR-0004 the storefront requires `YYYY-MM-DD` in the future; 30
@@ -667,6 +678,16 @@ impl PricingPipelineService {
         // FIFO lookup already steps past it. Reaping after the loop would
         // waste one full cadence on every wedge.
         summary.reaped = self.reap_stale_jobs().await;
+
+        // D-20 A4 (ADR-0120) — auto-retry sweep, AFTER the reaper and BEFORE
+        // the advance loop. It re-enqueues `Failed` rows whose backoff elapsed
+        // to `Fetched` at the BACK of the FIFO, so they are eligible THIS cycle
+        // but only PROCESSED once they reach the head behind older work — the
+        // sweep buys eligibility, not a queue-jump. Ordering it after the
+        // reaper is load-bearing: the reaper condemns stuck STARTED rows and
+        // never schedules (stage "reaper"), so it cannot feed the sweep the row
+        // it just condemned (the reap↔retry bounce, ADR §review finding 1).
+        summary.auto_retried = self.sweep_auto_retries().await;
 
         // D-PRICEQ — quote_ids that errored (not FAILED — errored) this
         // cycle. `next_actionable_job` is strict FIFO `LIMIT 1`, so without
@@ -1030,6 +1051,148 @@ impl PricingPipelineService {
         }
     }
 
+    /// D-20 A4 (ADR-0120) — the auto-retry sweep. Re-enqueues up to
+    /// [`MAX_AUTO_RETRY_PER_CYCLE`] `Failed` rows whose backoff has elapsed
+    /// (`next_retry_at <= now`), moving each `Failed → Fetched` at the BACK of
+    /// the FIFO and auditing the re-entry. Runs AFTER the reaper, BEFORE the
+    /// advance loop (see [`Self::poll_once`]).
+    ///
+    /// Due-ness is decided in RUST, not SQL: `next_retry_at` is an RFC3339
+    /// VARCHAR, and those only sort chronologically at matching sub-second
+    /// precision — a `WHERE next_retry_at <= now` string compare would fire
+    /// early or late on a precision mismatch (the exact trap A1's reaper avoids
+    /// for `updated_at`). Candidates arrive ordered `next_retry_at ASC`, so the
+    /// first not-yet-due row ends the scan (every later row is further in the
+    /// future). Each re-enqueue + its `QuotePricingFetched` audit ride ONE
+    /// transaction under the shared Handle writer, so the state change and its
+    /// audit-of-record are atomic and serialised against the operator retry.
+    ///
+    /// Best-effort like the reaper: a fault reaps nothing rather than taking the
+    /// daemon down — the schedule is durable in the row, so the next cycle
+    /// retries the sweep.
+    async fn sweep_auto_retries(&self) -> u32 {
+        let now = OffsetDateTime::now_utc();
+        let db = self.deps.db.clone();
+        let tenant_id = self.deps.tenant.as_str().to_string();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+        let res = spawn_blocking(move || -> Result<u32> {
+            let mut conn = db
+                .write()
+                .context("shared writer: auto-retry sweep (ADR-0098 Gap 1a)")?;
+            audit_ensure_schema(&conn).context("audit schema")?;
+            jobs::ensure_schema(&conn).context("jobs schema")?;
+            let candidates =
+                jobs::auto_retry_candidates(&conn, &tenant_id, MAX_AUTO_RETRY_PER_CYCLE)?;
+            let mut reenqueued = 0u32;
+            for c in candidates {
+                // Parse in Rust (the RFC3339 sub-second trap). A row whose
+                // `next_retry_at` we cannot read is NOT re-enqueued — loud, so a
+                // format drift surfaces rather than silently churning the row.
+                let due_at = match OffsetDateTime::parse(
+                    &c.next_retry_at,
+                    &time::format_description::well_known::Rfc3339,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            quote_id = %c.quote_id,
+                            next_retry_at = %c.next_retry_at,
+                            error = %e,
+                            "auto-retry sweep: unparseable next_retry_at; NOT re-enqueuing"
+                        );
+                        continue;
+                    }
+                };
+                if due_at > now {
+                    // Ordered by next_retry_at ASC — everything after is later.
+                    break;
+                }
+                // Re-enqueue + audit in ONE tx. `failure_kind` is captured off
+                // the candidate BEFORE the re-enqueue clears it (the audit
+                // records the kind that preceded the retry).
+                let tx = conn.transaction().context("open auto-retry tx")?;
+                let new_count = match jobs::auto_retry_reenqueue_in_tx(
+                    &tx,
+                    &c.quote_id,
+                    &tenant_id,
+                    now,
+                )? {
+                    Some(n) => n,
+                    None => {
+                        // Raced by an operator retry/delete — clean no-op. Drop
+                        // the (untouched) tx and move on.
+                        continue;
+                    }
+                };
+                let meta =
+                    LedgerMeta::new(TenantId::new(&tenant_id).context("tenant id")?, binary_hash);
+                let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+                let fetched_at = now
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string());
+                // ADR-0094: reuse `QuotePricingFetched` (the row genuinely
+                // re-enters `Fetched`), NOT a new EventKind. The payload carries
+                // the FULL `QuotePricingFetchedPayload` fields (re-derived from
+                // the row) so a strict reader never trips on a missing one (ADR
+                // §review finding 7), plus the self-describing auto-retry extras
+                // — the struct is not `deny_unknown_fields`, so they ride along.
+                let idempotency_key =
+                    format!("quote_pricing_auto_retry:{}:{}", c.quote_id, new_count);
+                let payload = serde_json::json!({
+                    "quote_id": c.quote_id,
+                    "tenant_id": tenant_id,
+                    "customer_email": c.customer_email,
+                    "material_grade": c.material_grade,
+                    "quantity": c.quantity,
+                    "cad_filename": c.cad_filename,
+                    "cad_local_path": c.cad_local_path,
+                    "actor": "daemon-auto-retry",
+                    "idempotency_key": idempotency_key,
+                    "fetched_at": fetched_at,
+                    // Extras (self-describing; a plain QuotePricingFetched omits
+                    // these, so a reader can tell an auto-retry from a first
+                    // enqueue and read the attempt number + prior verdict).
+                    "auto_retry": true,
+                    "auto_retry_count": new_count,
+                    "failure_kind": c.failure_kind,
+                });
+                let bytes =
+                    serde_json::to_vec(&payload).context("encode auto-retry fetched payload")?;
+                append_in_tx(
+                    &tx,
+                    &meta,
+                    EventKind::QuotePricingFetched,
+                    bytes,
+                    actor,
+                    Some(idempotency_key),
+                )
+                .context("append QuotePricingFetched (auto-retry)")?;
+                tx.commit().context("commit auto-retry re-enqueue")?;
+                tracing::info!(
+                    quote_id = %c.quote_id,
+                    auto_retry_count = new_count,
+                    prior_failure_kind = ?c.failure_kind,
+                    "auto-retry sweep: re-enqueued Failed row to Fetched (back of FIFO)"
+                );
+                reenqueued += 1;
+            }
+            Ok(reenqueued)
+        })
+        .await;
+        match res {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "auto-retry sweep failed");
+                0
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "auto-retry sweep task panicked");
+                0
+            }
+        }
+    }
+
     /// D-PRICEQ — write ONE `quote.pricing_cycle_outcome` audit row for a
     /// NON-IDLE pricing cycle. Before this the cycle result lived only in a
     /// `tracing` line on the launch tty, which prod does not capture to a
@@ -1049,6 +1212,7 @@ impl PricingPipelineService {
             && summary.posted == 0
             && summary.failed == 0
             && summary.reaped == 0
+            && summary.auto_retried == 0
             && summary.errored == 0
             && summary.error.is_none();
         if idle {
@@ -1079,6 +1243,7 @@ impl PricingPipelineService {
                 "posted": summary.posted,
                 "failed": summary.failed,
                 "reaped": summary.reaped,
+                "auto_retried": summary.auto_retried,
                 "errored": summary.errored,
                 "elapsed_ms": summary.elapsed_ms,
                 "error": summary.error,
@@ -8288,6 +8453,180 @@ mod tests {
             |r| r.get::<_, Option<String>>(0),
         )
         .expect("last_attempt_at row")
+    }
+
+    /// D-20 A4 (ADR-0120) — force a `Failed` row with a `failure_kind` and a
+    /// `next_retry_at`, the state the scheduler leaves behind, so the sweep has
+    /// something to act on without running a whole pipeline to a real failure.
+    fn a4_force_failed_scheduled(
+        svc: &PricingPipelineService,
+        qid: &str,
+        failure_kind: &str,
+        next_retry_at: &str,
+        auto_retry_count: Option<i64>,
+    ) {
+        let conn = svc.deps.db.write().expect("force via shared handle");
+        conn.execute(
+            "UPDATE quote_pricing_jobs
+                SET state = 'failed', error_stage = 'post', error_reason = 'blip',
+                    failure_kind = ?, next_retry_at = ?, auto_retry_count = ?
+                WHERE quote_id = ?",
+            duckdb::params![failure_kind, next_retry_at, auto_retry_count, qid],
+        )
+        .expect("force failed+scheduled");
+    }
+
+    /// Count audit rows of `kind` through the SHARED read handle (not a raw
+    /// file reopen like `s430_count_kind`, whose mirror snapshot can lag the
+    /// Handle's just-committed write — the same reads `d_priceq_row` uses).
+    fn a4_count_kind_shared(svc: &PricingPipelineService, kind: &str) -> usize {
+        let conn = svc.deps.db.read().expect("read via shared handle");
+        aberp_audit_ledger::recent_entries(&conn, 500)
+            .expect("recent")
+            .iter()
+            .filter(|e| e.kind.as_str() == kind)
+            .count()
+    }
+
+    fn a4_row_auto_retry(svc: &PricingPipelineService, qid: &str) -> (Option<i64>, Option<String>) {
+        let conn = svc.deps.db.read().expect("read via shared handle");
+        conn.query_row(
+            "SELECT auto_retry_count, next_retry_at FROM quote_pricing_jobs WHERE quote_id = ?",
+            [qid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("auto-retry cols")
+    }
+
+    /// **D-20 A4 — the auto-retry sweep re-enqueues a due Failed row, at the
+    /// BACK of the FIFO, and leaves the not-yet-due and unscheduled ones alone.**
+    ///
+    /// Three Failed rows: one whose backoff elapsed (`next_retry_at` in the
+    /// past), one still waiting it out (in the future), one unscheduled
+    /// (`next_retry_at` NULL — a Permanent failure or a budget-spent row). Only
+    /// the due row moves `Failed → Fetched`, gets `auto_retry_count` bumped and
+    /// `next_retry_at` cleared, and re-enters with a fresh `fetched_at` (BACK of
+    /// FIFO, the head-of-line-wedge guard). Exactly one `quote.pricing_fetched`
+    /// audit row is added for the re-enqueue.
+    #[tokio::test]
+    async fn d_priceq_a4_auto_retry_sweep_reenqueues_only_the_due_row() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("a4sweep.duckdb");
+        let artifacts = s430_temp("art");
+        let due = "00000000-0000-0000-0000-0000000a4001";
+        let notdue = "00000000-0000-0000-0000-0000000a4002";
+        let unscheduled = "00000000-0000-0000-0000-0000000a4003";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+        for q in [due, notdue, unscheduled] {
+            svc.enqueue_one(s430_quote(q, "part.step")).await.unwrap();
+        }
+        let past = (OffsetDateTime::now_utc() - time::Duration::minutes(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let future = (OffsetDateTime::now_utc() + time::Duration::minutes(10))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        a4_force_failed_scheduled(&svc, due, "transient", &past, Some(0));
+        a4_force_failed_scheduled(&svc, notdue, "transient", &future, Some(0));
+        // Unscheduled: Failed with NULL next_retry_at (never selected).
+        {
+            let conn = svc.deps.db.write().expect("force via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs
+                    SET state = 'failed', failure_kind = 'permanent', next_retry_at = NULL
+                    WHERE quote_id = ?",
+                duckdb::params![unscheduled],
+            )
+            .expect("force unscheduled failed");
+        }
+
+        let fetched_before = a4_count_kind_shared(&svc, "quote.pricing_fetched");
+        let reenqueued = svc.sweep_auto_retries().await;
+        assert_eq!(reenqueued, 1, "exactly the one due row is re-enqueued");
+
+        // Due row: back to Fetched, count bumped, schedule cleared.
+        let (due_state, ..) = d_priceq_row(&svc, due);
+        assert_eq!(due_state, "fetched", "the due row re-enters at Fetched");
+        let (due_count, due_next) = a4_row_auto_retry(&svc, due);
+        assert_eq!(due_count, Some(1), "auto_retry_count bumped 0 → 1");
+        assert!(due_next.is_none(), "next_retry_at cleared on re-enqueue");
+
+        // Not-yet-due and unscheduled rows are untouched (still Failed).
+        assert_eq!(d_priceq_row(&svc, notdue).0, "failed", "future schedule waits");
+        assert_eq!(
+            d_priceq_row(&svc, unscheduled).0,
+            "failed",
+            "an unscheduled (NULL next_retry_at) Failed row is never swept"
+        );
+
+        // Exactly one re-enqueue audit row (the due one), on top of the three
+        // enqueue rows.
+        assert_eq!(
+            a4_count_kind_shared(&svc, "quote.pricing_fetched"),
+            fetched_before + 1,
+            "one QuotePricingFetched audit row for the re-enqueue"
+        );
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **D-20 A4 — the reaper never feeds the sweep (the reap↔retry bounce).**
+    ///
+    /// A row the stale-job reaper condemns is `Failed` with `next_retry_at`
+    /// NULL (the reaper classifies Unknown but scheduling lives on the
+    /// advance-loop path, gated `stage != "reaper"`), so the sweep that runs
+    /// right after the reaper in `poll_once` never re-enqueues it. This pins the
+    /// ADR §review finding-1 guard: were scheduling in `emit_failure`, the
+    /// reaper would schedule and this sweep would bounce the row.
+    #[tokio::test]
+    async fn d_priceq_a4_reaper_reap_is_not_swept() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("a4bounce.duckdb");
+        let artifacts = s430_temp("art");
+        let stuck = "00000000-0000-0000-0000-0000000a4004";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+        svc.enqueue_one(s430_quote(stuck, "part.step")).await.unwrap();
+        {
+            let conn = svc.deps.db.write().expect("stage via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET state = 'extracting' WHERE quote_id = ?",
+                duckdb::params![stuck],
+            )
+            .expect("force extracting");
+        }
+        let long_ago = "2020-01-01T00:00:00Z";
+        let now_s = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        d_priceq_backdate(&svc, stuck, long_ago, long_ago);
+        // Reached this window (fresh last_attempt), so the reaper condemns it.
+        {
+            let conn = svc.deps.db.write().expect("stamp via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET last_attempt_at = ? WHERE quote_id = ?",
+                duckdb::params![now_s, stuck],
+            )
+            .expect("stamp last_attempt");
+        }
+
+        assert_eq!(svc.reap_stale_jobs().await, 1, "the stuck row is reaped");
+        // The reap left it Failed with NO schedule.
+        let (_, next_after_reap) = a4_row_auto_retry(&svc, stuck);
+        assert!(
+            next_after_reap.is_none(),
+            "a reaper reap must NOT schedule an auto-retry"
+        );
+        // The sweep that follows the reaper re-enqueues nothing.
+        assert_eq!(
+            svc.sweep_auto_retries().await,
+            0,
+            "the reaped row does not bounce back through the sweep"
+        );
+        assert_eq!(d_priceq_row(&svc, stuck).0, "failed", "it stays Failed for the operator");
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
     }
 
     /// **D-20 A1 — a starved row is not reaped; only a REACHED one is.**
