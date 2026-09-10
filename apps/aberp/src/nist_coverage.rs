@@ -70,61 +70,53 @@ static EVIDENCE_LINKS: &[EvidenceLink] = &[
     EvidenceLink {
         kind: EventKind::PersonnelAccessGranted,
         control: nist::AC_3_1_2, // limit access to permitted transactions/functions
-        rationale:
-            "a per-request access GRANT decision is the enforcement of which \
+        rationale: "a per-request access GRANT decision is the enforcement of which \
              transactions/functions an authenticated operator may perform",
     },
     EvidenceLink {
         kind: EventKind::PersonnelAccessDenied,
         control: nist::AC_3_1_2,
-        rationale:
-            "the DENY side of the same transaction/function access enforcement — \
+        rationale: "the DENY side of the same transaction/function access enforcement — \
              an under-cleared operator is refused and the refusal recorded",
     },
     EvidenceLink {
         kind: EventKind::CuiAccessEvent,
         control: nist::AC_3_1_3, // control the flow of CUI per approved authorizations
-        rationale:
-            "every read of a CUI-marked artifact records an access decision — \
+        rationale: "every read of a CUI-marked artifact records an access decision — \
              the CUI access trail IS the flow-control record",
     },
     // ── Media Protection (MP) ────────────────────────────────────────────
     EvidenceLink {
         kind: EventKind::CuiMarkingApplied,
         control: nist::MP_3_8_4, // mark media with CUI markings and distribution limitations
-        rationale:
-            "applying a typed CuiMarking (category + dissemination controls) to \
+        rationale: "applying a typed CuiMarking (category + dissemination controls) to \
              an artifact is literally marking media with its CUI markings",
     },
     // ── Identification & Authentication (IA) ─────────────────────────────
     EvidenceLink {
         kind: EventKind::PersonnelIdRegistered,
         control: nist::IA_3_5_1, // identify system users, processes, and devices
-        rationale:
-            "registering an operator identity is the act of identifying a system \
+        rationale: "registering an operator identity is the act of identifying a system \
              user before access is mediated",
     },
     // ── Audit & Accountability (AU) ──────────────────────────────────────
     EvidenceLink {
         kind: EventKind::PersonnelSignatureApplied,
         control: nist::AU_3_3_2, // uniquely trace user actions to the user
-        rationale:
-            "an e-signature binds a specific record action to a specific signer \
+        rationale: "an e-signature binds a specific record action to a specific signer \
              identity + algorithm — the strongest unique-traceability record",
     },
     // ── Incident Response (IR) ───────────────────────────────────────────
     EvidenceLink {
         kind: EventKind::IncidentCyberDetected,
         control: nist::IR_3_6_1, // operational incident-handling capability
-        rationale:
-            "an operator-declared cyber incident, captured with its DoD 72h \
+        rationale: "an operator-declared cyber incident, captured with its DoD 72h \
              deadline, evidences an operational incident-handling capability",
     },
     EvidenceLink {
         kind: EventKind::IncidentCyberDetected,
         control: nist::IR_3_6_2, // track, document, report incidents
-        rationale:
-            "the same intake documents the incident (severity, affected flags, \
+        rationale: "the same intake documents the incident (severity, affected flags, \
              detection source) — the tracking/documentation half of 3.6.2",
     },
 ];
@@ -544,8 +536,9 @@ mod tests {
         // AC 3.1.2 — evidenced (grant observed), and the count rides through.
         match state_of(nist::AC_3_1_2) {
             EvidenceState::Evidenced { kinds } => {
-                assert!(kinds.iter().any(|k| k.kind == EventKind::PersonnelAccessGranted
-                    && k.count == 3));
+                assert!(kinds
+                    .iter()
+                    .any(|k| k.kind == EventKind::PersonnelAccessGranted && k.count == 3));
             }
             other => panic!("AC 3.1.2 should be Evidenced, got {other:?}"),
         }
@@ -652,7 +645,10 @@ mod tests {
     fn time_window_contains_bounds() {
         let t = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let ms = 1_700_000_000_000i64;
-        assert!(TimeWindow::default().contains(t), "all-time includes everything");
+        assert!(
+            TimeWindow::default().contains(t),
+            "all-time includes everything"
+        );
         assert!(TimeWindow {
             from_ms: Some(ms - 1),
             to_ms: Some(ms + 1)
@@ -686,7 +682,10 @@ mod tests {
         ]);
         let obs = observed_kinds(&entries, &TimeWindow::default());
         let count_of = |k: &EventKind| {
-            obs.iter().find(|o| &o.kind == k).map(|o| o.count).unwrap_or(0)
+            obs.iter()
+                .find(|o| &o.kind == k)
+                .map(|o| o.count)
+                .unwrap_or(0)
         };
         assert_eq!(count_of(&EventKind::PersonnelAccessGranted), 2);
         assert_eq!(count_of(&EventKind::CuiMarkingApplied), 1);
@@ -726,10 +725,7 @@ mod tests {
         // No compliance/satisfaction verdict leaks into the rendered output.
         assert!(!s.contains("compliant"), "must not claim compliant");
         assert!(!s.contains("satisfied"), "must not claim satisfied");
-        assert!(v["disclaimer"]
-            .as_str()
-            .unwrap()
-            .contains("not sufficient"));
+        assert!(v["disclaimer"].as_str().unwrap().contains("not sufficient"));
         assert_eq!(v["summary"]["total"], 110);
         assert_eq!(v["summary"]["evidenced"], 1); // MP 3.8.4 only
         let controls = v["controls"].as_array().unwrap();

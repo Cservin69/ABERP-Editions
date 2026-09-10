@@ -3944,7 +3944,17 @@ mod tests {
 
     fn seed_failed(conn: &mut Connection, quote_id: &str, kind: FailureKind) {
         insert_fetched_job(
-            conn, quote_id, "T", "b@x", "Bob", "", "AL", 1, "p.stl", "/tmp/p.stl", fixed_ts(),
+            conn,
+            quote_id,
+            "T",
+            "b@x",
+            "Bob",
+            "",
+            "AL",
+            1,
+            "p.stl",
+            "/tmp/p.stl",
+            fixed_ts(),
         )
         .expect("ins");
         set_state(conn, quote_id, "T", JobState::Extracting, fixed_ts()).expect("ex");
@@ -3954,8 +3964,15 @@ mod tests {
     #[test]
     fn auto_retry_backoff_is_exponential_capped_and_jittered() {
         // raw(n) = min(30 << n, 900); result within ±10% of raw, rounded.
-        for (n, raw) in [(0u32, 30i64), (1, 60), (2, 120), (3, 240), (4, 480), (5, 900), (9, 900)]
-        {
+        for (n, raw) in [
+            (0u32, 30i64),
+            (1, 60),
+            (2, 120),
+            (3, 240),
+            (4, 480),
+            (5, 900),
+            (9, 900),
+        ] {
             let d = auto_retry_backoff(n, "quote-abc");
             let s = d.whole_seconds();
             let lo = (raw as f64 * 0.9).floor() as i64;
@@ -3989,18 +4006,28 @@ mod tests {
         seed_failed(&mut conn, "qt", FailureKind::Transient);
 
         // count 0 < 5 → schedules.
-        let scheduled =
-            schedule_auto_retry_if_eligible(&mut conn, "qt", "T", FailureKind::Transient, fixed_ts())
-                .expect("schedule");
+        let scheduled = schedule_auto_retry_if_eligible(
+            &mut conn,
+            "qt",
+            "T",
+            FailureKind::Transient,
+            fixed_ts(),
+        )
+        .expect("schedule");
         assert!(scheduled.is_some(), "under-cap Transient should schedule");
         let (_, next) = read_auto_retry(&conn, "qt", "T");
         assert!(next.is_some(), "next_retry_at stamped");
 
         // At the cap (5) → NULL, no schedule.
         set_auto_retry_count(&conn, "qt", "T", MAX_TRANSIENT_AUTO_RETRIES as i64);
-        let none =
-            schedule_auto_retry_if_eligible(&mut conn, "qt", "T", FailureKind::Transient, fixed_ts())
-                .expect("schedule at cap");
+        let none = schedule_auto_retry_if_eligible(
+            &mut conn,
+            "qt",
+            "T",
+            FailureKind::Transient,
+            fixed_ts(),
+        )
+        .expect("schedule at cap");
         assert!(none.is_none(), "budget-spent Transient must not schedule");
         let (_, next2) = read_auto_retry(&conn, "qt", "T");
         assert!(next2.is_none(), "next_retry_at cleared to NULL at cap");
@@ -4033,9 +4060,15 @@ mod tests {
         let mut conn = open_mem();
         seed_failed(&mut conn, "qp", FailureKind::Permanent);
         assert!(
-            schedule_auto_retry_if_eligible(&mut conn, "qp", "T", FailureKind::Permanent, fixed_ts())
-                .expect("permanent")
-                .is_none(),
+            schedule_auto_retry_if_eligible(
+                &mut conn,
+                "qp",
+                "T",
+                FailureKind::Permanent,
+                fixed_ts()
+            )
+            .expect("permanent")
+            .is_none(),
             "Permanent never auto-retries"
         );
         let (_, next) = read_auto_retry(&conn, "qp", "T");
@@ -4046,9 +4079,15 @@ mod tests {
     fn schedule_missing_row_is_noop() {
         let mut conn = open_mem();
         assert!(
-            schedule_auto_retry_if_eligible(&mut conn, "ghost", "T", FailureKind::Transient, fixed_ts())
-                .expect("missing row ok")
-                .is_none(),
+            schedule_auto_retry_if_eligible(
+                &mut conn,
+                "ghost",
+                "T",
+                FailureKind::Transient,
+                fixed_ts()
+            )
+            .expect("missing row ok")
+            .is_none(),
             "absent row schedules nothing"
         );
     }
@@ -4058,13 +4097,23 @@ mod tests {
         let mut conn = open_mem();
         // Failed + scheduled → selected. Failed + NULL schedule → excluded.
         seed_failed(&mut conn, "sched", FailureKind::Transient);
-        schedule_auto_retry_if_eligible(&mut conn, "sched", "T", FailureKind::Transient, fixed_ts())
-            .expect("schedule");
+        schedule_auto_retry_if_eligible(
+            &mut conn,
+            "sched",
+            "T",
+            FailureKind::Transient,
+            fixed_ts(),
+        )
+        .expect("schedule");
         seed_failed(&mut conn, "noshed", FailureKind::Permanent); // next_retry_at stays NULL
 
         let cands = auto_retry_candidates(&conn, "T", 10).expect("candidates");
         let ids: Vec<&str> = cands.iter().map(|c| c.quote_id.as_str()).collect();
-        assert_eq!(ids, ["sched"], "only the scheduled Failed row is a candidate");
+        assert_eq!(
+            ids,
+            ["sched"],
+            "only the scheduled Failed row is a candidate"
+        );
         assert_eq!(cands[0].auto_retry_count, 0);
         assert_eq!(cands[0].failure_kind.as_deref(), Some("transient"));
     }
@@ -4086,7 +4135,10 @@ mod tests {
         assert_eq!(n, 1, "auto_retry_count bumped to 1");
 
         // Row is Fetched, schedule cleared, fetched_at moved to `later`.
-        assert_eq!(read_state(&conn, "re", "T").expect("state"), Some(JobState::Fetched));
+        assert_eq!(
+            read_state(&conn, "re", "T").expect("state"),
+            Some(JobState::Fetched)
+        );
         let (count, next) = read_auto_retry(&conn, "re", "T");
         assert_eq!(count, Some(1));
         assert!(next.is_none(), "next_retry_at cleared");
@@ -4100,7 +4152,10 @@ mod tests {
         let expected = later
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
-        assert_eq!(fetched_at, expected, "fetched_at reset to now (BACK of FIFO)");
+        assert_eq!(
+            fetched_at, expected,
+            "fetched_at reset to now (BACK of FIFO)"
+        );
 
         // Now the row is Fetched, a second re-enqueue is a clean no-op (the
         // state guard — models an operator retry racing the sweep).
@@ -4127,6 +4182,9 @@ mod tests {
         let (after, next_after) = read_auto_retry(&conn, "qr", "T");
         assert_eq!(after, Some(0), "operator retry resets auto_retry_count");
         assert!(next_after.is_none(), "operator retry clears next_retry_at");
-        assert_eq!(read_state(&conn, "qr", "T").expect("state"), Some(JobState::Fetched));
+        assert_eq!(
+            read_state(&conn, "qr", "T").expect("state"),
+            Some(JobState::Fetched)
+        );
     }
 }

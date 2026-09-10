@@ -1112,19 +1112,15 @@ impl PricingPipelineService {
                 // the candidate BEFORE the re-enqueue clears it (the audit
                 // records the kind that preceded the retry).
                 let tx = conn.transaction().context("open auto-retry tx")?;
-                let new_count = match jobs::auto_retry_reenqueue_in_tx(
-                    &tx,
-                    &c.quote_id,
-                    &tenant_id,
-                    now,
-                )? {
-                    Some(n) => n,
-                    None => {
-                        // Raced by an operator retry/delete — clean no-op. Drop
-                        // the (untouched) tx and move on.
-                        continue;
-                    }
-                };
+                let new_count =
+                    match jobs::auto_retry_reenqueue_in_tx(&tx, &c.quote_id, &tenant_id, now)? {
+                        Some(n) => n,
+                        None => {
+                            // Raced by an operator retry/delete — clean no-op. Drop
+                            // the (untouched) tx and move on.
+                            continue;
+                        }
+                    };
                 let meta =
                     LedgerMeta::new(TenantId::new(&tenant_id).context("tenant id")?, binary_hash);
                 let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
@@ -4205,15 +4201,8 @@ fn emit_failure(
     // backoff is anchored to the same instant the failure was recorded.
     let now = OffsetDateTime::now_utc();
     let failure_kind = classify_failure(stage, reason);
-    let set_outcome = jobs::set_failed(
-        conn,
-        quote_id,
-        tenant_id,
-        stage,
-        reason,
-        failure_kind,
-        now,
-    )?;
+    let set_outcome =
+        jobs::set_failed(conn, quote_id, tenant_id, stage, reason, failure_kind, now)?;
     if !matches!(set_outcome, jobs::TransitionOutcome::Applied) {
         // Already-Failed (prior cycle landed) or NotFound. Skip audit emit
         // to keep one row per terminal-failure transition.
@@ -4245,13 +4234,9 @@ fn emit_failure(
     // reaper (the one `emit_failure` caller that must never schedule) out.
     // Inert until slice 2's sweep reads `next_retry_at`.
     if stage != "reaper" {
-        if let Some(when) = jobs::schedule_auto_retry_if_eligible(
-            conn,
-            quote_id,
-            tenant_id,
-            failure_kind,
-            now,
-        )? {
+        if let Some(when) =
+            jobs::schedule_auto_retry_if_eligible(conn, quote_id, tenant_id, failure_kind, now)?
+        {
             tracing::info!(
                 quote_id = %quote_id,
                 stage = %stage,
@@ -8552,7 +8537,11 @@ mod tests {
         assert!(due_next.is_none(), "next_retry_at cleared on re-enqueue");
 
         // Not-yet-due and unscheduled rows are untouched (still Failed).
-        assert_eq!(d_priceq_row(&svc, notdue).0, "failed", "future schedule waits");
+        assert_eq!(
+            d_priceq_row(&svc, notdue).0,
+            "failed",
+            "future schedule waits"
+        );
         assert_eq!(
             d_priceq_row(&svc, unscheduled).0,
             "failed",
@@ -8586,7 +8575,9 @@ mod tests {
         let artifacts = s430_temp("art");
         let stuck = "00000000-0000-0000-0000-0000000a4004";
         let svc = s430_service(&addr, db.clone(), artifacts.clone());
-        svc.enqueue_one(s430_quote(stuck, "part.step")).await.unwrap();
+        svc.enqueue_one(s430_quote(stuck, "part.step"))
+            .await
+            .unwrap();
         {
             let conn = svc.deps.db.write().expect("stage via shared handle");
             conn.execute(
@@ -8623,7 +8614,11 @@ mod tests {
             0,
             "the reaped row does not bounce back through the sweep"
         );
-        assert_eq!(d_priceq_row(&svc, stuck).0, "failed", "it stays Failed for the operator");
+        assert_eq!(
+            d_priceq_row(&svc, stuck).0,
+            "failed",
+            "it stays Failed for the operator"
+        );
 
         let _ = std::fs::remove_dir_all(&artifacts);
         let _ = std::fs::remove_file(&db);

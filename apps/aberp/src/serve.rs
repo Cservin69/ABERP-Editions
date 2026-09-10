@@ -27616,10 +27616,9 @@ async fn handle_get_nist_coverage(
         to_ms: query.to_ms,
     };
     let state_for_task = state.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        build_nist_coverage_report(&state_for_task, &window)
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || build_nist_coverage_report(&state_for_task, &window))
+            .await;
     match result {
         Ok(Ok(report)) => Json(report).into_response(),
         Ok(Err(e)) => internal_error("get_nist_coverage", e),

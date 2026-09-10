@@ -69,8 +69,8 @@ fn build_state(db_path: PathBuf, scopes: Vec<String>) -> AppState {
         restore_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         catalogue_push: aberp::catalogue_push::CataloguePushHandle::dormant(),
         email_relay_rate_limiter: std::sync::Arc::new(aberp::email_relay::RateLimiter::new()),
-        pipeline_python_resolution:
-            aberp::quote_pricing_pipeline::PythonResolutionHandle::dormant(),
+        pipeline_python_resolution: aberp::quote_pricing_pipeline::PythonResolutionHandle::dormant(
+        ),
         storefront_credential: aberp::storefront_credential::StorefrontCredentialHandle::dormant(),
         email_outbox_daemon: aberp::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(),
         quote_pdf_rerender_queue: aberp::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
@@ -138,8 +138,16 @@ fn coverage_reports_evidenced_controls_from_ledger() {
 
     // All 110 controls present; the two seeded ones evidenced.
     assert_eq!(report["summary"]["total"], 110);
-    assert_eq!(control_state(&report, "3.8.4"), "evidenced", "MP 3.8.4 (marking)");
-    assert_eq!(control_state(&report, "3.1.3"), "evidenced", "AC 3.1.3 (access)");
+    assert_eq!(
+        control_state(&report, "3.8.4"),
+        "evidenced",
+        "MP 3.8.4 (marking)"
+    );
+    assert_eq!(
+        control_state(&report, "3.1.3"),
+        "evidenced",
+        "AC 3.1.3 (access)"
+    );
     // A control with a mapped kind but no event this run is mapped-not-exercised
     // (AC 3.1.2 maps to personnel.access_*, none of which fired here).
     assert_eq!(control_state(&report, "3.1.2"), "mapped_not_exercised");
