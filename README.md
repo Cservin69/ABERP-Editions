@@ -410,10 +410,24 @@ Two more sockets with no EventKind of their own yet:
 - **`aberp export-invoice-bundle`** — a single `.tar.zst` evidence archive
   for one invoice: the chain slice, the NAV request/response archive, and
   a manifest.
+- **`aberp export-shipment-bundle`** (Defense) — the same archive shape for
+  one **shipment**, and the only one that carries the QC documents: the
+  chain slice for the dispatch, the export-control decisions fired at the
+  same boundary, and each issued QC report re-rendered and proven to hash
+  to the SHA-256 the chain pinned at issuance. A report that can no longer
+  be reproduced is left out and **named** in the manifest rather than
+  silently missing.
+
+  It is not an invoice bundle in disguise, and the two do not merge: an
+  outgoing invoice has no provenance back to the shipment it bills
+  ([F1](docs/BACKLOG-designed-to-live.md#f1)), so an auditor wanting both
+  gets two files. The QC report is bound to a shipment, not an invoice, so
+  that is the scope the data already has.
 - **`aberp-verify`** — a separate binary that re-verifies an exported
   bundle from its bytes alone, without trusting the app that produced it,
   and reports every check it ran rather than stopping at the first
-  failure.
+  failure. It reads both bundle shapes, and both manifest versions — a v1
+  archive written before the shipment bundle existed still verifies.
 
 ---
 

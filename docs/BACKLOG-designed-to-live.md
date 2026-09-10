@@ -1305,15 +1305,36 @@ Phase 2: medium per transport, and shared with [D-02](#d-02)/[D-16](#d-16).
 Three items the adversarial pass named that were deliberately NOT closed in
 the round-2 fix. Each is scope, not an oversight.
 
-1. **A WRITER for the `qc/` bundle entry — the AC10 scope gap.** Retention
-   itself is wired: `qcr.report_issued` pins the SHA-256 into the chain, and
-   `aberp-verify` accepts, re-hashes and cross-totals `qc/` entries. What
-   has no producer is the auditor-facing bundle: `qc_archive_path` has zero
-   non-test callers, so no export ever emits a `qc/` file for the verifier
-   to check. Closing it needs the invoice→dispatch→WO→report join that
-   decides which reports belong in an invoice-scoped slice.
-   *Size:* small-to-medium, and it is the last thing between AC10 and a
-   genuinely auditor-ready export.
+1. ~~**A WRITER for the `qc/` bundle entry — the AC10 scope gap.**~~
+   **✅ CLOSED — 2026-09-11, [ADR-0122](../adr/0122-shipment-evidence-bundle-and-the-qc-document-writer.md).**
+   `aberp export-shipment-bundle --dispatch-id dsp_X` emits
+   `bundle/qc/<qcr_id>.pdf`, the bytes hash to the `rendered_sha256` the chain
+   pinned at issuance, and the real `aberp-verify` accepts the archive —
+   pinned end to end by `apps/aberp/tests/shipment_bundle_round_trip.rs`.
+   `qc_archive_path` has a producer.
+
+   **The scope moved, and the entry above said why it had to.** This note
+   asked for "the invoice→dispatch→WO→report join that decides which reports
+   belong in an invoice-scoped slice." **That join does not exist** — see
+   [F1](#f1) below, which ADR-0122 §F1 records in full. The QC report is bound
+   to a *shipment* by construction (`bind_reports_to_dispatch`, inside
+   `mark_shipped`'s single transaction, ADR-0199 §D6), so the evidence export
+   is scoped the same way. The invoice bundle and every money path are
+   untouched. An auditor wanting both gets two files, and that is the honest
+   state of the data rather than a shortfall.
+
+   Along the way the export had to decide what to do when a re-render does not
+   reproduce the pinned bytes. It is a 2×2 on `renderer_version`, not a
+   boolean: **same** renderer with a different SHA refuses the whole export
+   (the frozen rows moved under a frozen report); a **different** renderer
+   omits that document, names it in `manifest.qc_documents_omitted`, and still
+   ships a verifiable bundle — because a bare refuse-on-mismatch would make
+   the first export after any renderer deploy fail for every dispatch, forever,
+   with no operator remedy. That branch exposed [F2](#f2).
+
+   Manifest schema went to **v2** (`scope_kind` / `scope_id`, nullable
+   `invoice_id`) and `aberp-verify` now accepts a **set** of versions, so
+   adding the field did not break the v1 archives already written.
 2. ~~**`plan_drift` cannot see a characteristic PROMOTED from optional to
    required.**~~ **CLOSED in round 3, and the round-2 reasoning above it
    was wrong.** The note claimed detection needed an additive `is_required`
@@ -1753,6 +1774,81 @@ the Portable edition. `cargo tree -p aberp` contains no portal crate, and
 that is the check to re-run if this entry ever grows.
 
 ---
+
+---
+
+## Findings — owner decisions, not scheduled work
+
+Two things ADR-0122 found while closing the `qc/` writer. Neither is a bug in
+what it shipped; both are facts about the tree that someone has to decide
+about, and both are recorded here rather than folded into a slice.
+
+<a id="f1"></a>
+### F1 — an outgoing invoice has no provenance back to the shipment it bills
+
+**Verified at four sites, in shipped code**, while trying to build the
+invoice→dispatch join D-99 residual 1 assumed existed:
+
+1. `mark_shipped` fires `mes.dispatch_shipped` with `spawned_invoice_id` —
+   which holds a `drf_<ULID>` **draft** id, not an invoice id
+   (`apps/aberp/src/invoice_draft.rs:658`, and `BillingInvoiceSpawner`'s own
+   doc says so: "the value is in fact 'spawned-invoice-or-draft id'").
+2. Promotion of that draft to an `inv_*` is **a form-fill, not a
+   transaction**: "the SPA pre-fills the form from a GET to
+   `/api/invoice-drafts/:id`, then DELETEs the draft after the invoice
+   creation succeeds; cross-pipeline atomic promote is deferred to a future
+   PR" (`apps/aberp/src/serve.rs:5188`).
+3. `issue_invoice` records **no** draft reference — it fires
+   `InvoiceSequenceReserved` + `InvoiceDraftCreated` against a freshly minted
+   `inv_*` and never names the `drf_*` the operator copied the numbers from.
+4. The delete that follows NULLs the pointer that might have survived in the
+   row (`delete_draft_in_tx` → `null_spawned_invoice_id_in_tx`,
+   `invoice_draft.rs:555`).
+
+So after an ordinary ship→invoice flow the edge `drf_Y ↔ inv_A` exists
+**nowhere**, and the draft row is gone. `inv_A → dsp_X` is derivable from
+neither the ledger nor the tables.
+
+**Why it matters.** An outgoing invoice's audit trail cannot be connected to
+the work order, the dispatch, the part marks, the export-control screening or
+the QC reports that justify it. For a **NAV** audit that is tolerable — NAV's
+interest starts at the invoice. For a **defense** evidence trail it is the
+seam that matters, and it is cut.
+
+**Blocked on:** nothing external. **Size:** medium — a real
+`POST /api/invoice-drafts/:id/promote` that mints the invoice and deletes the
+draft in one transaction, recording the `drf_*` (and through it the `dsp_*`)
+on the invoice's own audit entry, additively, no new `EventKind` per ADR-0094.
+
+**Owner decision.** This is a billing-pipeline change. Whether it is scheduled,
+and at what priority against the rest of this file, is Ervin's call — it was
+deliberately not bundled behind a compliance feature.
+
+<a id="f2"></a>
+### F2 — the no-store decision has an unstated retention horizon
+
+ADR-0199 §D7 stores no report bytes: the hash is pinned, the document is
+*derivable*, and `aberp-qc-pdf` is a pure renderer so a re-render reproduces
+them. ADR-0122 §D2's honest branch exposes the unstated half: they are
+derivable **from a renderer version that may no longer exist**.
+
+**Bumping `aberp-qc-pdf` makes every previously issued report permanently
+unreproducible by ABERP.** The SHA stays pinned in the chain and remains
+verifiable *against a copy someone kept*, but the application can no longer
+produce one. The crate's own `Cargo.toml` already instructs "bump it in the
+same commit as any change to the rendered bytes", so this is not hypothetical.
+
+Not a defect in what shipped — the export names the omission per document, so
+the horizon is visible in the artifact rather than silent. But §D7 says the
+bytes are derivable full stop, and that is now known to be conditional.
+
+**Owner decision**, between: (a) accept the horizon and say so in §D7;
+(b) keep superseded renderer versions compilable behind a feature so an old
+layout can still be reproduced; (c) store bytes for issued reports after all.
+
+**Blocked on:** nothing external. **Size:** (a) documentation; (b) small-to-
+medium; (c) reopens a decision ADR-0199 took deliberately.
+
 
 ## Expansion slots on a Live capability
 
