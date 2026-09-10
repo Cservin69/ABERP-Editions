@@ -70,6 +70,22 @@
 #   writer) — verified by diffing this gate's whole output before and after.
 #   It is an operator-paced ERP write and stays a v0.2.6 migration target with
 #   the rest of the module.
+# ── ADR-0122: export_shipment_bundle.rs, ONE opener, category (c).
+#   The shipment evidence bundle (`aberp export-shipment-bundle`) is the exact
+#   structural sibling of export_invoice_bundle.rs above: a read-only, one-shot
+#   CLI subcommand in a separate process, out of ADR-0098's in-process scope,
+#   opening the tenant DB once through `Ledger::open` (pragma-fenced, so
+#   CHECK 10j covers it via that central opener).
+#
+#   The count is ONE and is load-bearing at that value. This command needs the
+#   audit chain AND the frozen qc_report rows off the same file, and it must
+#   not take a second opener to get them: two `Connection::open` calls on one
+#   DuckDB file are two database instances contending for the same file lock.
+#   It gets the second view by TRANSFER instead — `Ledger::into_connection`
+#   (ADR-0122 §D4), which consumes the Ledger rather than lending out a
+#   `&Connection` whose provenance CHECK 10P could not trace. So a count of 2
+#   here would mean that design had been abandoned, and this gate should say so.
+1 apps/aberp/src/export_shipment_bundle.rs
 1 apps/aberp/src/export_invoice_bundle.rs
 4 apps/aberp/src/incoming_invoices.rs
 3 apps/aberp/src/print_invoice.rs

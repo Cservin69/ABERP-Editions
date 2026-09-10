@@ -160,3 +160,42 @@ fn the_additive_migration_leaves_three_empty_tables() {
          accountability count"
     );
 }
+
+/// ADR-0122 §D6 — the shipment evidence bundle is Defense-only.
+///
+/// On Portable no QC report can exist at all (`draft_report` refuses, the
+/// routes are not mounted), so an archive with an empty `qc/` directory
+/// would state an absence the EDITION is responsible for, not the shipment.
+/// The subcommand refuses before it opens anything.
+///
+/// Guarded on the Portable arm only: on Defense the gate is open by design,
+/// and the Defense behaviour is covered end to end by
+/// `shipment_bundle_round_trip.rs`.
+#[cfg(not(feature = "production"))]
+#[test]
+fn portable_refuses_to_export_a_shipment_evidence_bundle() {
+    let dir = std::env::temp_dir()
+        .join("aberp-edition-shipment-bundle")
+        .join(ulid::Ulid::new().to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("bundle.tar.zst");
+
+    let err = aberp::export_shipment_bundle::run(&aberp::cli::ExportShipmentBundleArgs {
+        dispatch_id: "dsp_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+        out: out.clone(),
+        allow_overwrite: false,
+        db: dir.join("aberp.duckdb"),
+        tenant: "t".to_string(),
+    })
+    .expect_err("Portable must refuse the shipment evidence bundle");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("refuses QC reporting"),
+        "the refusal must name the edition gate, not fail incidentally: {msg}"
+    );
+    assert!(
+        !out.exists(),
+        "a refused export must leave no archive behind"
+    );
+}

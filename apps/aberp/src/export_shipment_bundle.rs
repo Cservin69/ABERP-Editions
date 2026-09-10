@@ -28,10 +28,22 @@
 //! No closure is taken. A rule that chases every id it meets walks the whole
 //! ledger; one declared hop over a named field is auditable and terminates.
 
-use aberp_audit_ledger::{Entry, EventKind};
-use anyhow::{anyhow, Result};
+use aberp_audit_ledger::{Entry, EventKind, Ledger, TenantId};
+use anyhow::{anyhow, Context, Result};
+use duckdb::Connection;
 use serde::Deserialize;
 use std::collections::BTreeSet;
+
+use crate::binary_hash;
+use crate::cli::ExportShipmentBundleArgs;
+use crate::export_invoice_bundle::{
+    build_chain_jsonl, detect_mirror_agreement, extract_nav_xml, pack_bundle, BundleManifest,
+    MirrorAgreementStatus, NavXmlFile, QcOmission, QcPdfFile, MANIFEST_VERSION,
+    MIRROR_FILE_STATUS_ABSENT_PRE_PR17, MIRROR_FILE_STATUS_VERIFIED, SIGNATURE_STATUS_DEFERRED,
+};
+
+/// `scope_kind` for the per-shipment bundle (ADR-0122 §D5).
+pub(crate) const SCOPE_KIND_DISPATCH: &str = "dispatch";
 
 /// `entity_kind` discriminant for the one `export.*` payload that names a
 /// dispatch polymorphically — `ExportAccessCheckPayload`, written at
@@ -224,6 +236,250 @@ pub fn dispatch_slice(entries: &[Entry], dsp_id: &str) -> Result<Vec<Entry>> {
     // on it.
     slice.sort_by_key(|e| e.seq.as_u64());
     Ok(slice)
+}
+
+/// What became of one QC report the shipment is bound to (ADR-0122 §D2/§D3).
+#[derive(Debug)]
+enum QcDocumentOutcome {
+    /// Re-rendered and its SHA matches the chain pin. Goes in the archive.
+    Bundled(QcPdfFile),
+    /// Belongs to this shipment, is not in the archive, and the manifest
+    /// says so. An auditor must never have to infer a hole in a document set.
+    Omitted(QcOmission),
+}
+
+/// Re-render one issued report and decide what to do with it (ADR-0122 §D2).
+///
+/// # The verdict is a 2x2, not a boolean
+///
+/// `render_report`'s `matches` is a SHA comparison and nothing else, so any
+/// change to `aberp-qc-pdf`'s layout moves every byte of every report ever
+/// issued. Refusing on that alone would make the first export after any
+/// renderer deploy fail for every dispatch, forever, with no operator remedy —
+/// and announce a routine upgrade as tampering.
+///
+/// `aberp-qc-pdf` carries its own crate version rather than the workspace's
+/// `0.0.0` precisely so this question is answerable (`Cargo.toml:4-10`: "was
+/// the RENDERER changed or were the rows TAMPERED with?"), and the version
+/// prints into the page footer, so a bump necessarily changes the bytes.
+///
+/// | stored version | SHA | verdict |
+/// |---|---|---|
+/// | equal | equal | bundle it |
+/// | **equal** | **differs** | **REFUSE the whole export** — the frozen rows moved |
+/// | differs | differs | omit + name it: those bytes are no longer reproducible |
+/// | differs | equal | cannot occur; treated as the ordinary path |
+fn resolve_qc_document(conn: &Connection, tenant: &str, qcr_id: &str) -> Result<QcDocumentOutcome> {
+    let current_renderer = aberp_qc_pdf::QC_PDF_RENDERER_VERSION;
+    match crate::qc_report::render_report(conn, tenant, qcr_id) {
+        Ok((report, bytes, sha, matches)) => {
+            let stored_renderer = report.renderer_version.clone().unwrap_or_default();
+            let same_renderer = stored_renderer == current_renderer;
+            match matches {
+                // Ordinary path, and the `differs`/`equal` cell that cannot
+                // occur: an assertion there could only turn a harmless
+                // surprise into an abort.
+                Some(true) | None => Ok(QcDocumentOutcome::Bundled(QcPdfFile {
+                    archive_path: format!("qc/{qcr_id}.pdf"),
+                    bytes,
+                })),
+                Some(false) if same_renderer => {
+                    let number = &report.report_number;
+                    let pinned = report.rendered_sha256.as_deref().unwrap_or("(unpinned)");
+                    Err(anyhow!(
+                        "QC report {qcr_id} ({number}) re-renders to {sha} but the audit \
+                         chain pins {pinned} — SAME renderer ({current_renderer}), \
+                         DIFFERENT bytes, which means the frozen report rows changed under \
+                         a report that is supposed to be frozen. Refusing to emit an \
+                         evidence bundle from it."
+                    ))
+                }
+                Some(false) => Ok(QcDocumentOutcome::Omitted(QcOmission {
+                    qcr_id: qcr_id.to_string(),
+                    report_number: Some(report.report_number.clone()),
+                    reason: format!(
+                        "renderer_version {stored_renderer} is no longer available \
+                         (current {current_renderer}) — the issued bytes cannot be \
+                         reproduced, and a document that does not hash to its chain pin \
+                         must not be presented as the issued one (ADR-0122 §F2)"
+                    ),
+                })),
+            }
+        }
+        // A report that is no longer CURRENT renders no document at all
+        // (ADR-0199 round 3): its unmarked PDF would read as a valid
+        // certificate. The refusal stands; the omission is NAMED.
+        Err(crate::qc_report::QcReportError::NotCurrent(why)) => {
+            Ok(QcDocumentOutcome::Omitted(QcOmission {
+                qcr_id: qcr_id.to_string(),
+                report_number: None,
+                reason: format!(
+                    "{why} — no document is issued for a report that no longer stands; \
+                     the full record remains on GET /api/qc-reports/{qcr_id} and in \
+                     chain.jsonl"
+                ),
+            }))
+        }
+        Err(e) => Err(anyhow!("render QC report {qcr_id} for the bundle: {e}")),
+    }
+}
+
+/// `aberp export-shipment-bundle` (ADR-0122).
+pub fn run(args: &ExportShipmentBundleArgs) -> Result<()> {
+    // 1. Edition gate (§D6). QC reporting is Defense-only, and on Portable no
+    //    report can exist at all — emitting an archive with an empty `qc/`
+    //    would state an absence the edition, not the shipment, is responsible
+    //    for.
+    crate::build_profile::assert_qc_reporting_allowed("export a shipment evidence bundle")?;
+
+    let tenant = TenantId::new(args.tenant.clone()).ok_or_else(|| {
+        anyhow!(
+            "--tenant value '{}' is empty or has a null byte",
+            args.tenant
+        )
+    })?;
+    if args.out.exists() && !args.allow_overwrite {
+        return Err(anyhow!(
+            "output path {} already exists — pass --allow-overwrite to overwrite",
+            args.out.display()
+        ));
+    }
+
+    let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
+    let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+        .context("open audit ledger for export-shipment-bundle")?;
+
+    // 2. Full-chain verify, same posture as the invoice bundle (ADR-0029 §6):
+    //    a tampered chain must not be exported as if authoritative.
+    let chain_verified_entries = ledger.verify_chain().with_context(|| {
+        format!(
+            "audit-ledger chain verification failed for tenant {} — refusing to emit a \
+             bundle from a tampered chain",
+            args.tenant
+        )
+    })?;
+    let entries = ledger
+        .entries()
+        .context("read audit ledger entries for the shipment slice")?;
+
+    // 3. The slice, and the mirror assertion (ADR-0030 §5 — Open Q2's default
+    //    answer: same code, same refusal). Both read `entries`, so they run
+    //    BEFORE the Ledger is consumed.
+    let slice = dispatch_slice(&entries, &args.dispatch_id)?;
+    let mirror_status = detect_mirror_agreement(&args.db, &entries)?;
+
+    // 4. §D4 — give up the Ledger and keep its Connection. From here there is
+    //    no chain API in scope, which is the point: the connection is
+    //    transferred, never loaned.
+    let conn = ledger.into_connection();
+
+    // 5. Re-render each report the slice's own `qcr.report_issued` entries
+    //    name. Keyed on the ISSUED entries specifically, because those are
+    //    exactly the ones `aberp-verify` will look for a `rendered_sha256` on;
+    //    bundling a document whose issued entry is not in `chain.jsonl` would
+    //    be an orphan the verifier FAILs.
+    let mut qc_files: Vec<QcPdfFile> = Vec::new();
+    let mut qc_omitted: Vec<QcOmission> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for entry in &slice {
+        if entry.kind != EventKind::QcReportIssued {
+            continue;
+        }
+        let probe: ShipmentMembershipProbe =
+            serde_json::from_slice(&entry.payload).unwrap_or_default();
+        let Some(qcr_id) = probe.qcr_id() else {
+            continue;
+        };
+        if !seen.insert(qcr_id.to_string()) {
+            continue;
+        }
+        match resolve_qc_document(&conn, tenant.as_str(), qcr_id)? {
+            QcDocumentOutcome::Bundled(f) => qc_files.push(f),
+            QcDocumentOutcome::Omitted(o) => qc_omitted.push(o),
+        }
+    }
+
+    // 6. Manifest + bodies.
+    let (mirror_file_present, mirror_file_status) = match mirror_status {
+        MirrorAgreementStatus::VerifiedAgreement => (true, MIRROR_FILE_STATUS_VERIFIED),
+        MirrorAgreementStatus::AbsentPrePr17 => (false, MIRROR_FILE_STATUS_ABSENT_PRE_PR17),
+    };
+    let generated_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format manifest generated_at as RFC3339")?;
+    let manifest = BundleManifest {
+        version: MANIFEST_VERSION,
+        scope_kind: SCOPE_KIND_DISPATCH,
+        scope_id: args.dispatch_id.trim(),
+        // §F1 — a shipment cannot be joined back to the invoice that bills it,
+        // so claiming one here would be a fabricated link.
+        invoice_id: None,
+        qc_documents: qc_files.len() as u64,
+        qc_documents_omitted: qc_omitted,
+        tenant_id: tenant.as_str(),
+        generated_at,
+        binary_hash: hex::encode(binary_hash_bytes.as_bytes()),
+        nav_xsd_version: aberp_nav_xsd_validator::NAV_XSD_VERSION,
+        chain_verified: true,
+        chain_verified_entries,
+        entries_in_bundle: slice.len() as u64,
+        signed: false,
+        signature_status: SIGNATURE_STATUS_DEFERRED,
+        mirror_file_present,
+        mirror_file_status,
+    };
+    let manifest_bytes =
+        serde_json::to_vec_pretty(&manifest).context("serialize manifest.json (pretty)")?;
+    let chain_jsonl_bytes = build_chain_jsonl(&slice)?;
+    let mut nav_files: Vec<NavXmlFile> = Vec::new();
+    for entry in &slice {
+        if let Some(nav) = extract_nav_xml(entry)? {
+            nav_files.push(nav);
+        }
+    }
+
+    pack_bundle(
+        &args.out,
+        args.allow_overwrite,
+        &manifest_bytes,
+        &chain_jsonl_bytes,
+        &nav_files,
+        &qc_files,
+    )?;
+
+    let omitted = manifest.qc_documents_omitted.len();
+    tracing::info!(
+        dispatch_id = %args.dispatch_id,
+        out = %args.out.display(),
+        chain_verified_entries,
+        entries_in_bundle = slice.len(),
+        qc_documents = qc_files.len(),
+        qc_documents_omitted = omitted,
+        ?mirror_status,
+        "export-shipment-bundle OK"
+    );
+    println!(
+        "export-shipment-bundle OK: dispatch {} -> wrote bundle to {} (audit chain verified \
+         across {} entries; {} entries in bundle; {} NAV-XML file(s); {} QC document(s)). \
+         {}NOTE: this bundle is UNSIGNED (signing deferred per F5).",
+        args.dispatch_id,
+        args.out.display(),
+        chain_verified_entries,
+        slice.len(),
+        nav_files.len(),
+        qc_files.len(),
+        if omitted == 0 {
+            String::new()
+        } else {
+            // Named, never silent: a document set with a hole in it must say
+            // so on the operator's screen as well as in the manifest.
+            format!(
+                "{omitted} QC document(s) belong to this shipment and are NOT in the \
+                 archive — see manifest.qc_documents_omitted for the reason on each. "
+            )
+        }
+    );
+    Ok(())
 }
 
 #[cfg(test)]

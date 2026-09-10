@@ -76,6 +76,54 @@ impl MembershipProbe {
     }
 }
 
+/// Permissive probe for the SHIPMENT bundle's membership rule, mirror of
+/// the writer's `ShipmentMembershipProbe` (ADR-0122 §D1).
+///
+/// **The field set MUST stay identical to the writer's.** A dispatch is
+/// named by three different field names because the payloads do not agree
+/// on one: `dsp_id` (dispatch + QC-attach kinds), `shipment_id`
+/// (`export.shipment_logged`), and `entity_id` + `entity_kind == "dispatch"`
+/// (`export.access_check`). The writer's round-1 review caught a
+/// single-field version of this rule dropping the whole `export.*` family
+/// out of a defense evidence bundle silently; a verifier that mirrored only
+/// one field would fail every bundle that correctly contains them.
+///
+/// `export.classification_set` is deliberately NOT matched: its
+/// `entity_kind` is `"product"` and its id a `prd_*`, so it is a
+/// determination about a commodity rather than about this shipment.
+#[derive(Debug, Default, Deserialize)]
+struct ShipmentMembershipProbe {
+    dsp_id: Option<String>,
+    shipment_id: Option<String>,
+    entity_id: Option<String>,
+    entity_kind: Option<String>,
+    qcr_id: Option<String>,
+}
+
+impl ShipmentMembershipProbe {
+    fn names_dispatch(&self, target: &str) -> bool {
+        if target.is_empty() {
+            return false;
+        }
+        let eq =
+            |f: &Option<String>| matches!(f.as_deref(), Some(v) if !v.is_empty() && v == target);
+        if eq(&self.dsp_id) || eq(&self.shipment_id) {
+            return true;
+        }
+        if eq(&self.entity_id) {
+            return match self.entity_kind.as_deref() {
+                None => true,
+                Some(k) => k == "dispatch",
+            };
+        }
+        false
+    }
+
+    fn qcr_id(&self) -> Option<&str> {
+        self.qcr_id.as_deref().filter(|s| !s.is_empty())
+    }
+}
+
 /// Run every ADR-0035 §3 check against the unpacked bundle. The
 /// resulting [`Report`] carries one outcome per check.
 ///
@@ -508,24 +556,13 @@ fn check_chain_links_and_gaps(entries: &[Entry], tenant: &TenantId, report: &mut
 /// posture, mirrored: every entry's payload must reference the invoice
 /// id in at least one id-shaped field.
 ///
-/// For a **dispatch** bundle (ADR-0122) the rule is the writer's
-/// two-pass one, and this verifier does not implement it yet — it lands
-/// with the writer in ADR-0122 slice 2. Until then a shipment bundle
-/// FAILs here rather than being waved through: a membership check that
-/// does not know the rule cannot report that the rule held.
+/// For a **dispatch** bundle (ADR-0122) the rule is the writer's two-pass
+/// one, mirrored in [`check_shipment_membership`].
 fn check_bundle_membership(scope: &BundleScope, entries: &[Entry], report: &mut Report) {
     let invoice_id = match scope {
         BundleScope::Invoice(id) => id,
         BundleScope::Dispatch(id) => {
-            report.push(CheckOutcome::fail(
-                "bundle membership",
-                format!(
-                    "this aberp-verify does not implement the dispatch-scope membership \
-                     rule (ADR-0122 §D1), so it cannot attest that the {} entries in \
-                     shipment bundle {id} belong to it — a newer aberp-verify can",
-                    entries.len()
-                ),
-            ));
+            check_shipment_membership(id, entries, report);
             return;
         }
     };
@@ -559,6 +596,74 @@ fn check_bundle_membership(scope: &BundleScope, entries: &[Entry], report: &mut 
                 not_referencing.len(),
                 invoice_id,
                 not_referencing
+            ),
+        ));
+    }
+}
+
+/// §3 check 12, shipment scope — the mirror of ADR-0122 §D1's two passes.
+///
+/// Pass 1: every entry naming the dispatch, over the three-field set.
+/// Pass 2: every entry whose `qcr_id` is one pass 1 collected — ONE declared
+/// hop, no closure, so an entry cannot justify itself by naming a report the
+/// bundle does not otherwise explain.
+///
+/// The hop is why `qcr.report_issued` is legitimately in a shipment bundle
+/// while carrying no `dsp_id`: it is the entry that pins `rendered_sha256`,
+/// and without it in `chain.jsonl` the QC-document check has nothing to
+/// verify a bundled PDF against.
+fn check_shipment_membership(dsp_id: &str, entries: &[Entry], report: &mut Report) {
+    let probes: Vec<ShipmentMembershipProbe> = entries
+        .iter()
+        .map(|e| serde_json::from_slice(&e.payload).unwrap_or_default())
+        .collect();
+
+    let mut explained: Vec<bool> = Vec::with_capacity(entries.len());
+    let mut report_ids: BTreeSet<&str> = BTreeSet::new();
+    for probe in &probes {
+        let hit = probe.names_dispatch(dsp_id);
+        if hit {
+            // Empties never enter the set: this set is built FROM payloads,
+            // so one row carrying `"qcr_id": ""` would otherwise explain
+            // every entry with an empty `qcr_id`.
+            if let Some(q) = probe.qcr_id() {
+                report_ids.insert(q);
+            }
+        }
+        explained.push(hit);
+    }
+    for (i, probe) in probes.iter().enumerate() {
+        if !explained[i] {
+            if let Some(q) = probe.qcr_id() {
+                explained[i] = report_ids.contains(q);
+            }
+        }
+    }
+
+    let unexplained: Vec<u64> = entries
+        .iter()
+        .zip(&explained)
+        .filter(|(_, ok)| !**ok)
+        .map(|(e, _)| e.seq.as_u64())
+        .collect();
+    if unexplained.is_empty() {
+        report.push(CheckOutcome::ok(
+            "bundle membership",
+            format!(
+                "{}/{} entries belong to dispatch {dsp_id} (named directly, or reached by \
+                 the one declared qcr_id hop)",
+                entries.len(),
+                entries.len()
+            ),
+        ));
+    } else {
+        report.push(CheckOutcome::fail(
+            "bundle membership",
+            format!(
+                "{} entries neither name dispatch {dsp_id} nor carry a qcr_id this bundle \
+                 explains (silent-omission failure mode per CLAUDE.md rule 12): seqs {:?}",
+                unexplained.len(),
+                unexplained
             ),
         ));
     }

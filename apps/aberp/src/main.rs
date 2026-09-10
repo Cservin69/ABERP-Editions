@@ -16,9 +16,10 @@ use clap::Parser;
 
 use aberp::{
     cli, demo_seed, drain_pending_retries, drain_submission_queue, export_invoice_bundle,
-    issue_invoice, issue_modification, issue_storno, mark_abandoned, observe_receiver_confirmation,
-    poll_ack, poll_annulment_ack, print_invoice, recover_from_nav, request_technical_annulment,
-    retry_submission, serve, setup_nav_credentials, snapshot, submit_annulment, submit_invoice,
+    export_shipment_bundle, issue_invoice, issue_modification, issue_storno, mark_abandoned,
+    observe_receiver_confirmation, poll_ack, poll_annulment_ack, print_invoice, recover_from_nav,
+    request_technical_annulment, retry_submission, serve, setup_nav_credentials, snapshot,
+    submit_annulment, submit_invoice,
 };
 
 fn main() -> Result<()> {
@@ -41,6 +42,7 @@ fn main() -> Result<()> {
         cli::Command::PollAnnulmentAck(a) => poll_annulment_ack::run(&a),
         cli::Command::ObserveReceiverConfirmation(a) => observe_receiver_confirmation::run(&a),
         cli::Command::ExportInvoiceBundle(a) => export_invoice_bundle::run(&a),
+        cli::Command::ExportShipmentBundle(a) => export_shipment_bundle::run(&a),
         cli::Command::DrainSubmissionQueue(a) => drain_submission_queue::run(&a),
         cli::Command::DrainPendingRetries(a) => drain_pending_retries::run(&a),
         cli::Command::RecoverFromNav(a) => recover_from_nav::run(&a),

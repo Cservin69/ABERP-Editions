@@ -388,6 +388,24 @@ pub enum Command {
     /// clobbering.
     ExportInvoiceBundle(ExportInvoiceBundleArgs),
 
+    /// Produce the audit-evidence archive for one SHIPMENT (ADR-0122).
+    ///
+    /// The sibling of `export-invoice-bundle`, scoped to a dispatch rather
+    /// than an invoice, and the only bundle that carries the QC documents:
+    /// a QC report is bound to a shipment by construction
+    /// (`bind_reports_to_dispatch`, inside `mark_shipped`'s single
+    /// transaction, ADR-0199 §D6).
+    ///
+    /// It is NOT an invoice bundle in disguise. ADR-0122 §F1 records why the
+    /// two cannot be joined: `mark_shipped`'s `spawned_invoice_id` names a
+    /// `drf_*` DRAFT, promotion to an `inv_*` is a form-fill, and the delete
+    /// that follows NULLs the dispatch's own pointer — so an outgoing invoice
+    /// has no provenance back to the shipment it bills, in the ledger or in
+    /// the tables. An auditor wanting both gets two files.
+    ///
+    /// Defense-only (ADR-0199 §D9): QC reporting is compiled out of Portable.
+    ExportShipmentBundle(ExportShipmentBundleArgs),
+
     /// Reconstruct the missing local `InvoiceSubmissionResponse`
     /// audit entry for a state-2 Pending invoice that NAV already
     /// has, per ADR-0009 §5 / ADR-0034 (PR-21). Closes F48 (the
@@ -1484,6 +1502,54 @@ pub struct ExportInvoiceBundleArgs {
     /// `export-invoice-bundle` does not call NAV, so the
     /// keychain is not consulted. Same posture as
     /// `mark-abandoned` / `request-technical-annulment`.)
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+}
+
+/// Args for `aberp export-shipment-bundle` (ADR-0122).
+///
+/// Deliberately the same five-field shape as [`ExportInvoiceBundleArgs`],
+/// with `--dispatch-id` where that one takes `--invoice-id`: an operator who
+/// knows one command knows the other, and the difference between them is the
+/// SCOPE, which is the thing worth noticing.
+#[derive(Debug, Parser)]
+pub struct ExportShipmentBundleArgs {
+    /// Dispatch id (prefixed form, `dsp_<ULID>`) of the shipment whose
+    /// evidence bundle to produce.
+    ///
+    /// Membership is ADR-0122 §D1's two passes: every entry naming this
+    /// dispatch (`dsp_id` / `shipment_id` / `entity_id`), plus ONE declared
+    /// hop over `qcr_id` so each report's `qcr.report_issued` entry — which
+    /// carries the `rendered_sha256` the verifier checks the bundled PDF
+    /// against — lands in `chain.jsonl` too.
+    ///
+    /// Loud-fails on a dispatch the ledger has never seen, and on one that
+    /// never SHIPPED: a created-only or cancelled dispatch yields a one-entry
+    /// slice, which is not empty, and an archive named for a delivery that did
+    /// not happen is indistinguishable from a shipment whose documents were
+    /// dropped (§D1b).
+    #[arg(long = "dispatch-id")]
+    pub dispatch_id: String,
+
+    /// Path to write the `.tar.zst` archive. Refuses to overwrite an existing
+    /// file by default; opt in via [`Self::allow_overwrite`].
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Opt-in to overwriting an existing `--out` file. Default `false`.
+    #[arg(long = "allow-overwrite", default_value_t = false)]
+    pub allow_overwrite: bool,
+
+    /// Path to the tenant DuckDB file. Read-only: the chain is read through
+    /// `Ledger`, and the frozen QC report rows are read through the SAME
+    /// connection (ADR-0122 §D4 — `Ledger::into_connection`), because two
+    /// `Connection::open` calls on one DuckDB file are two instances
+    /// contending for one lock. No DDL, no mutations.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — drives the audit-ledger genesis hash. NAV
+    /// credentials are NOT loaded; this command does not call NAV.
     #[arg(long, default_value = "default")]
     pub tenant: String,
 }

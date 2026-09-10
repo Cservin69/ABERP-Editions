@@ -111,6 +111,20 @@ impl Report {
             .any(|o| matches!(o.level, CheckLevel::Fail))
     }
 
+    /// Every FAIL outcome rendered as `name: detail`, for a caller that
+    /// wants to say WHY a bundle was rejected.
+    ///
+    /// Exists because `assert!(report.is_ok())` on its own prints nothing
+    /// useful: an end-to-end writer→verifier test that fails this way would
+    /// otherwise send the reader back to re-run the verifier by hand.
+    pub fn failure_details(&self) -> Vec<String> {
+        self.outcomes
+            .iter()
+            .filter(|o| matches!(o.level, CheckLevel::Fail))
+            .map(|o| format!("{}: {}", o.name, o.detail))
+            .collect()
+    }
+
     /// Number of outcomes at each level. Used in the summary line.
     pub fn counts(&self) -> (usize, usize, usize) {
         let mut ok = 0;

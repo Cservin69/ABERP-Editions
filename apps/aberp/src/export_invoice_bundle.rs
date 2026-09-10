@@ -124,10 +124,10 @@ use crate::cli::ExportInvoiceBundleArgs;
 ///
 /// Both bundle writers emit this same version. The invoice/shipment
 /// fork lives in `scope_kind`, never in the version number.
-const MANIFEST_VERSION: u32 = 2;
+pub(crate) const MANIFEST_VERSION: u32 = 2;
 
 /// `scope_kind` for the per-invoice bundle (ADR-0029). ADR-0122 §D5.
-const SCOPE_KIND_INVOICE: &str = "invoice";
+pub(crate) const SCOPE_KIND_INVOICE: &str = "invoice";
 
 /// Placeholder string declared in the manifest while the F5
 /// attestation-signing key type remains deferred per ADR-0029
@@ -135,12 +135,12 @@ const SCOPE_KIND_INVOICE: &str = "invoice";
 /// chosen algorithm name (e.g., `"ed25519"`) and adds a
 /// sibling `signature_*` block plus a detached-signature file
 /// inside the archive.
-const SIGNATURE_STATUS_DEFERRED: &str = "deferred-per-f5";
+pub(crate) const SIGNATURE_STATUS_DEFERRED: &str = "deferred-per-f5";
 
 /// Manifest string surfaced when the mirror file is present
 /// and its `entry_hash` for every covered seq matches the DB.
 /// PR-17 / ADR-0030 §5.
-const MIRROR_FILE_STATUS_VERIFIED: &str = "verified-agreement";
+pub(crate) const MIRROR_FILE_STATUS_VERIFIED: &str = "verified-agreement";
 
 /// Manifest string surfaced when the mirror file is absent
 /// (pre-PR-17 DB that has not yet been touched by a post-PR-17
@@ -148,13 +148,13 @@ const MIRROR_FILE_STATUS_VERIFIED: &str = "verified-agreement";
 /// Distinct from `"divergence-detected"` (which the bundle
 /// reader never emits — it refuses the bundle output instead
 /// per ADR-0029 §5 + ADR-0030 §5 + CLAUDE.md rule 12).
-const MIRROR_FILE_STATUS_ABSENT_PRE_PR17: &str = "absent-pre-pr-17";
+pub(crate) const MIRROR_FILE_STATUS_ABSENT_PRE_PR17: &str = "absent-pre-pr-17";
 
 /// Internal top-level directory inside the archive. A NAV
 /// inspector untarring the archive gets a single
 /// `bundle/` subdirectory rather than the files splattered
 /// into cwd (ADR-0029 §3).
-const BUNDLE_DIR: &str = "bundle";
+pub(crate) const BUNDLE_DIR: &str = "bundle";
 
 /// Permissive probe over an audit-ledger entry's payload bytes
 /// per ADR-0029 §2. Captures every invoice-id-shaped field
@@ -326,10 +326,10 @@ impl<'a> ChainJsonlEntry<'a> {
 /// `ChainJsonlEntry` / `aberp_verify::ChainJsonlLine`; the
 /// round-trip is pinned by `tests/verify_bundle_round_trip.rs`.
 #[derive(Debug, Serialize)]
-struct QcOmission {
-    qcr_id: String,
-    report_number: Option<String>,
-    reason: String,
+pub(crate) struct QcOmission {
+    pub(crate) qcr_id: String,
+    pub(crate) report_number: Option<String>,
+    pub(crate) reason: String,
 }
 
 /// Bundle-level manifest fields per ADR-0029 §3 + ADR-0030 §5
@@ -338,37 +338,37 @@ struct QcOmission {
 /// [`tests::manifest_carries_every_adr_0029_field`] and the
 /// PR-17-added [`tests::manifest_mirror_fields_match_agreement_status`].
 #[derive(Debug, Serialize)]
-struct BundleManifest<'a> {
-    version: u32,
+pub(crate) struct BundleManifest<'a> {
+    pub(crate) version: u32,
     /// What this bundle is a slice OF (ADR-0122 §D5) — `"invoice"`
     /// here, `"dispatch"` for the shipment bundle.
-    scope_kind: &'static str,
+    pub(crate) scope_kind: &'static str,
     /// The scope's id. Equal to `invoice_id` on this writer; carried
     /// separately so a reader never has to know which field to look in.
-    scope_id: &'a str,
+    pub(crate) scope_id: &'a str,
     /// `None` on a shipment bundle. Always `Some(_)` here, and still
     /// emitted (as `null` when absent, never omitted) so a reader can
     /// tell "no invoice" from "field dropped".
-    invoice_id: Option<&'a str>,
+    pub(crate) invoice_id: Option<&'a str>,
     /// Count of `qc/` documents in this bundle (ADR-0122 §D2). Always
     /// zero on an invoice bundle: a QC report is bound to a *shipment*,
     /// and §F1 records why the two cannot be joined.
-    qc_documents: u64,
+    pub(crate) qc_documents: u64,
     /// QC documents that belong to this bundle's scope and are absent,
     /// with the reason (ADR-0122 §D3). Always empty on an invoice
     /// bundle, for the same reason `qc_documents` is zero.
-    qc_documents_omitted: Vec<QcOmission>,
-    tenant_id: &'a str,
-    generated_at: String,
-    binary_hash: String,
-    nav_xsd_version: &'static str,
-    chain_verified: bool,
-    chain_verified_entries: u64,
-    entries_in_bundle: u64,
-    signed: bool,
-    signature_status: &'static str,
-    mirror_file_present: bool,
-    mirror_file_status: &'static str,
+    pub(crate) qc_documents_omitted: Vec<QcOmission>,
+    pub(crate) tenant_id: &'a str,
+    pub(crate) generated_at: String,
+    pub(crate) binary_hash: String,
+    pub(crate) nav_xsd_version: &'static str,
+    pub(crate) chain_verified: bool,
+    pub(crate) chain_verified_entries: u64,
+    pub(crate) entries_in_bundle: u64,
+    pub(crate) signed: bool,
+    pub(crate) signature_status: &'static str,
+    pub(crate) mirror_file_present: bool,
+    pub(crate) mirror_file_status: &'static str,
 }
 
 /// PR-17 / ADR-0030 §5. The success-shape outcomes of the
@@ -378,7 +378,7 @@ struct BundleManifest<'a> {
 /// §5 + ADR-0029 §5 + CLAUDE.md rule 12 (the refusal happens
 /// inside `run` before `build_manifest` is called).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MirrorAgreementStatus {
+pub(crate) enum MirrorAgreementStatus {
     /// Mirror file present and every covered seq agrees with
     /// the DB at the `entry_hash` level. Manifest:
     /// `mirror_file_present: true`,
@@ -403,7 +403,10 @@ enum MirrorAgreementStatus {
 /// - Mirror file present but malformed (delegated to
 ///   `read_mirror_entries`'s `MirrorCorrupt` surface).
 /// - Mirror file I/O error other than `NotFound`.
-fn detect_mirror_agreement(db_path: &Path, db_entries: &[Entry]) -> Result<MirrorAgreementStatus> {
+pub(crate) fn detect_mirror_agreement(
+    db_path: &Path,
+    db_entries: &[Entry],
+) -> Result<MirrorAgreementStatus> {
     let mirror_path = mirror_path_for(db_path);
     match read_mirror_entries(&mirror_path) {
         Ok(mirror_entries) => {
@@ -515,17 +518,31 @@ fn build_manifest<'a>(
     })
 }
 
+/// One rendered QC document destined for `bundle/qc/<qcr_id>.pdf`
+/// (ADR-0122 §D2). The archive path is produced by the same rule the
+/// verifier reads it back with — `aberp_verify::qc_archive_path` — but is
+/// computed here rather than imported, because `aberp-verify` is a
+/// DEV-dependency only (ADR-0035 §"Surfaced conflict 1" Reading A).
+#[derive(Debug)]
+pub(crate) struct QcPdfFile {
+    /// Archive-relative path inside `bundle/` — `qc/<qcr_id>.pdf`.
+    pub(crate) archive_path: String,
+    /// The re-rendered document bytes, already proven to hash to the
+    /// `rendered_sha256` the chain pins.
+    pub(crate) bytes: Vec<u8>,
+}
+
 /// One NAV-XML extraction from an audit-ledger entry. Pairs
 /// the archive-relative filename (`nav/<seq>_<kind>.xml`) with
 /// the verbatim bytes lifted from the typed payload.
 #[derive(Debug)]
-struct NavXmlFile {
+pub(crate) struct NavXmlFile {
     /// Archive-relative path inside `bundle/`. The full
     /// in-archive path is `bundle/<archive_path>`.
-    archive_path: String,
+    pub(crate) archive_path: String,
     /// Verbatim bytes (no transformation; same `request_xml`
     /// / `response_xml` bytes the audit payload carries).
-    bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// Extract the verbatim NAV XML bytes (if any) from an entry's
@@ -545,7 +562,7 @@ struct NavXmlFile {
 /// the lexicographic sort breaks; per ADR-0009 §3 the
 /// per-tenant volume bound is comfortably below that for the
 /// foreseeable future.
-fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
+pub(crate) fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
     let bytes = match entry.kind {
         EventKind::InvoiceSubmissionAttempt => {
             let payload: crate::audit_payloads::InvoiceSubmissionAttemptPayload =
@@ -1174,12 +1191,13 @@ const _: () = {
 /// The zstd encoder wraps a `File` writer; the tar Builder
 /// wraps the zstd encoder. Standard streaming pattern — no
 /// in-memory buffer of the full archive.
-fn pack_bundle(
+pub(crate) fn pack_bundle(
     out_path: &Path,
     allow_overwrite: bool,
     manifest_json: &[u8],
     chain_jsonl: &[u8],
     nav_files: &[NavXmlFile],
+    qc_files: &[QcPdfFile],
 ) -> Result<()> {
     if out_path.exists() && !allow_overwrite {
         return Err(anyhow!(
@@ -1199,6 +1217,13 @@ fn pack_bundle(
     append_bytes(&mut builder, "chain.jsonl", chain_jsonl)?;
     for nav in nav_files {
         append_bytes(&mut builder, &nav.archive_path, &nav.bytes)?;
+    }
+    // ADR-0122 §D2 — the `qc/` entries. Always empty for an invoice bundle
+    // (a QC report is bound to a SHIPMENT, ADR-0199 §D6); the parameter is
+    // shared rather than duplicated so both bundle writers pack through ONE
+    // path and cannot drift in archive shape.
+    for qc in qc_files {
+        append_bytes(&mut builder, &qc.archive_path, &qc.bytes)?;
     }
 
     // `into_inner()` finishes the tar stream (writes the
@@ -1241,7 +1266,7 @@ fn append_bytes<W: Write>(builder: &mut tar::Builder<W>, rel: &str, bytes: &[u8]
 /// Build the `chain.jsonl` body: one JSON object per line, one
 /// line per entry, seq-ordered. UTF-8 bytes returned for
 /// direct passing to [`append_bytes`].
-fn build_chain_jsonl(entries: &[Entry]) -> Result<Vec<u8>> {
+pub(crate) fn build_chain_jsonl(entries: &[Entry]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(entries.len() * 256);
     for entry in entries {
         let row = ChainJsonlEntry::from_entry(entry)?;
@@ -1359,6 +1384,7 @@ pub fn run(args: &ExportInvoiceBundleArgs) -> Result<()> {
         &manifest_bytes,
         &chain_jsonl_bytes,
         &nav_files,
+        &[],
     )?;
 
     // 8. Operator-visible summary. The mirror-file caveat is
@@ -2394,7 +2420,15 @@ mod tests {
         // Pack into a tempfile.
         let mut tmp = std::env::temp_dir();
         tmp.push(format!("aberp_bundle_test_{}.tar.zst", ulid::Ulid::new()));
-        pack_bundle(&tmp, false, &manifest_bytes, &chain_jsonl_bytes, &nav_files).unwrap();
+        pack_bundle(
+            &tmp,
+            false,
+            &manifest_bytes,
+            &chain_jsonl_bytes,
+            &nav_files,
+            &[],
+        )
+        .unwrap();
         assert!(tmp.exists(), "pack_bundle must produce an output file");
 
         // Read it back: decompress + untar in memory.
@@ -2445,7 +2479,7 @@ mod tests {
         ));
         // Pre-create the file.
         std::fs::write(&tmp, b"existing").unwrap();
-        let err = pack_bundle(&tmp, false, b"{}", b"", &[]).unwrap_err();
+        let err = pack_bundle(&tmp, false, b"{}", b"", &[], &[]).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("already exists"),

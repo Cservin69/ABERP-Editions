@@ -21,6 +21,7 @@
 #    removed derive_nav_invoice_number (DuckDbBillingStore::open dropped in
 #    retry_submission + recover_from_nav too). The opener set SHRANK by 10;
 #    this pin is refreshed to the new (smaller) reality.
+apps/aberp/src/export_shipment_bundle.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
 apps/aberp/src/export_invoice_bundle.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
 apps/aberp/src/incoming_invoices.rs|get_incoming:let conn = Connection::open(db_path).with_context(|| {
 apps/aberp/src/incoming_invoices.rs|get_nav_xml_path:let conn = Connection::open(db_path).with_context(|| {
