@@ -5092,6 +5092,9 @@ pub fn build_router(state: AppState) -> Router {
             "/api/products/:id/cui-marking",
             get(handle_get_product_cui_marking).post(handle_apply_product_cui_marking),
         )
+        // D-04 (ADR-0121) — NIST SP 800-171 ledger-evidence coverage report
+        // (read-only; ?from_ms=&to_ms= optional assessment window).
+        .route("/api/nist-coverage", get(handle_get_nist_coverage))
         // S231 / PR-227 / ADR-0061 — Stage 3 Phase γ Inventory v1.
         // GET lists the per-product `stock_movements` ledger
         // (descending by at_iso8601, paginated). POST appends one
@@ -27553,6 +27556,75 @@ async fn handle_get_product_cui_marking(
         Ok(Err(e)) => internal_error("get_product_cui_marking", e),
         Err(je) => internal_error(
             "get_product_cui_marking:join",
+            anyhow!("blocking task panicked: {je}"),
+        ),
+    }
+}
+
+/// D-04 (ADR-0121) — optional assessment window for the NIST coverage report,
+/// as epoch-millisecond bounds. Both omitted ⇒ all-time.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct NistCoverageQuery {
+    pub from_ms: Option<i64>,
+    pub to_ms: Option<i64>,
+}
+
+/// D-04 (ADR-0121) — build the NIST SP 800-171 evidence-coverage report as JSON.
+///
+/// Reads THIS tenant's audit entries through the shared `Handle`
+/// (`state.db.read()` + the sanctioned [`aberp_audit_ledger::recent_entries`]
+/// helper with an all-rows limit — NO new database opener, so the frozen-opener
+/// ledger, cut-gate CHECK 10i, is untouched), folds them against the static
+/// evidence map, and renders. Read-only: appends nothing. The report says
+/// "evidence present," never "compliant" — an assessor grades satisfaction
+/// (ADR-0121 honesty rule).
+pub fn build_nist_coverage_report(
+    state: &AppState,
+    window: &crate::nist_coverage::TimeWindow,
+) -> Result<serde_json::Value> {
+    let conn = state
+        .db
+        .read()
+        .context("shared reader: nist-coverage (ADR-0098 Gap 1a)")?;
+    // All entries for this (per-tenant) ledger. `recent_entries` orders by seq
+    // DESC; order is irrelevant to a per-kind count.
+    let entries = aberp_audit_ledger::recent_entries(&conn, u32::MAX)
+        .map_err(|e| anyhow!("read audit entries for nist-coverage: {e}"))?;
+    let observed = crate::nist_coverage::observed_kinds(&entries, window);
+    let report = crate::nist_coverage::coverage(&observed, window.clone());
+    Ok(crate::nist_coverage::render_report_json(&report))
+}
+
+/// `GET /api/nist-coverage` — the NIST SP 800-171 ledger-evidence coverage
+/// report (D-04, ADR-0121). Read-only; requires a ready serve + a valid bearer
+/// token (no per-scope clearance gate in v1 — the report exposes which event
+/// KINDS occurred, not payload contents; a clearance gate is a possible
+/// follow-on).
+async fn handle_get_nist_coverage(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<NistCoverageQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let window = crate::nist_coverage::TimeWindow {
+        from_ms: query.from_ms,
+        to_ms: query.to_ms,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        build_nist_coverage_report(&state_for_task, &window)
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(e)) => internal_error("get_nist_coverage", e),
+        Err(je) => internal_error(
+            "get_nist_coverage:join",
             anyhow!("blocking task panicked: {je}"),
         ),
     }
