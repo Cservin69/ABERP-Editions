@@ -121,6 +121,10 @@ CLAUDE.md
 # Per-session scheduler lock (sessionId + pid); runtime junk, never
 # part of the repo's history.
 .claude/scheduled_tasks.lock
+# Per-session agent worktrees (nested git worktrees) and machine-local
+# tool settings. Session runtime, never part of the repo's history.
+.claude/worktrees/
+.claude/settings.local.json
 
 # --- S279 / PR-265 — pricing-pipeline artifacts -------------
 # Downloaded customer CADs + rendered indicative PDFs land under
