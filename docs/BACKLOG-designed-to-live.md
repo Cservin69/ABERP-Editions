@@ -991,6 +991,24 @@ whole of `run`.
 touches the boot ordering, which is load-bearing for durability (ADR-0110
 D3 / ADR-0111).
 
+> **R3 — ✅ CLOSED (D-21 R3, ADR-0119, 2026-09-09). D-21 COMPLETE.** The
+> reframing held: the genuine in-process direct-`Ledger::append` surface is
+> already EMPTY — ADR-0105 migrated the audit-ledger session api onto
+> `with_ledger`, and a real `Ledger::append` always carries connection
+> provenance the scanner traces (read clone → READ_CLONE, own open →
+> INDEP_OPENER, `db.write()` → HANDLE_WRITE, in `with_ledger` → WITH_LEDGER).
+> So **no code migration was needed** (the ~120-site commit-spanning lock is
+> not built). Instead the proof: CHECK 10P-2 now treats `LEDGER_LOCKED` as
+> **failing-unless-frozen** — it is reached only by an `.append(` with no
+> traceable provenance (a genuine new Domain-B fork risk, or a non-`Ledger`
+> `.append` false-positive). The 16 current sites (all verified false-positives:
+> `Vec::append`, `tar::Builder::append`, and the portal agent's own JSONL audit
+> in a SEPARATE binary) are frozen may-only-shrink; a NEW `LEDGER_LOCKED` reds
+> until routed through `with_ledger`/the Handle or verified a false-positive. A
+> 10P-0 liveness fixture pins the scanner still emits the verdict, and a new
+> negative probe (harness 80/80) proves a provenance-less append reds. Gate-only
+> (no `.rs` change).
+
 **R3 — `append_in_tx` still takes no lock.** The two serialization domains
 (the handle writer mutex, and audit-ledger's `AUDIT_APPEND_LOCK`) remain
 distinct; `Handle::with_ledger` is still the only construct that holds both.

@@ -67,7 +67,7 @@ PROBE_SHARD_INDEX="${PROBE_SHARD_INDEX:-1}"
 # accounting site (which is how a probe stops being a probe), moves the count
 # and goes RED instead of quietly testing less. Adding a probe is a deliberate
 # one-line bump here.
-EXPECTED_PROBES=79
+EXPECTED_PROBES=80
 if [[ ! "$PROBE_SHARD_TOTAL" =~ ^[1-9][0-9]*$ ]] || [[ ! "$PROBE_SHARD_INDEX" =~ ^[1-9][0-9]*$ ]] \
    || (( PROBE_SHARD_INDEX > PROBE_SHARD_TOTAL )); then
   echo "NEGATIVE-PROBES: ✗ FAILED — bad shard spec (1-based, index <= total): PROBE_SHARD_INDEX=$PROBE_SHARD_INDEX PROBE_SHARD_TOTAL=$PROBE_SHARD_TOTAL" >&2
@@ -760,6 +760,12 @@ c="$(fresh)"
 grep -v "db_lock::acquire_or_refuse" "$c/apps/aberp/src/drain_submission_queue.rs" > "$c/apps/aberp/src/drain_submission_queue.rs.tmp"
 mv "$c/apps/aberp/src/drain_submission_queue.rs.tmp" "$c/apps/aberp/src/drain_submission_queue.rs"
 expect_fail "$c" "do NOT acquire the whole-DB lock" "CHECK 10R — an audit-writing CLI that stops acquiring the whole-DB lock is caught (the cross-process fork window stays closed)"
+
+# ── CHECK 10P — D-21 R3 (ADR-0119): LEDGER_LOCKED is now failing-unless-frozen ─
+echo "[CHECK 10P] D-21 R3 — a NEW ledger .append whose connection provenance is NOT traceable (LEDGER_LOCKED, off the frozen residual) — 10P must go red"
+c="$(fresh)"
+printf '\nfn _adr0119r3_probe_unproven_ledger_append() {\n    // A direct ledger append with no traceable connection provenance — the\n    // Domain-B fork risk D-21 R3 proves cannot silently appear. Not on the\n    // frozen LEDGER_LOCKED residual, so 10P-2 must red it.\n    l.append(k, p, a, None).unwrap();\n}\n' >> "$c/apps/aberp/src/serve.rs"
+expect_fail "$c" "a NON-SHARED audit writer appeared outside the frozen residual" "CHECK 10P — a NEW provenance-less ledger append (LEDGER_LOCKED off the frozen residual) is caught (D-21 R3 turns ADR-0105's classification into a proof)"
 
 echo "[CHECK 10P] HARNESS — deleting the scanner must NOT read as \"no violations\"; the gate must say so"
 c="$(fresh)"

@@ -1132,6 +1132,14 @@ else
   printf 'fn h(db: &Db) {\n    let mut l = Ledger::open(p, t, b).unwrap();\n    l.sync_mirror_lockstep(&mp).unwrap();\n}\n' > "$aw_probe"
   awk -f "$aw_scan" "$aw_probe" | grep -q 'INDEP_OPENER' \
     || { flag10P "✗ HARNESS: scanner no longer matches the sync_mirror_lockstep spelling of the MIRROR write — the mirror token is name-keyed again (round 6; blind spot B4 reopened by rename)"; }
+  # D-21 R3 — a `.append(` with NO traceable connection provenance must verdict
+  # LEDGER_LOCKED. If the scanner stopped emitting it, D-21 R3's frozen residual
+  # would "shrink" silently (10P-2 would offer to delete 16 live entries) and a
+  # genuine new unprovable-provenance ledger append would slip through as no
+  # record at all — the name-keyed-bypass class, one verdict over.
+  printf 'fn h() {\n    l.append(k, p, a, None).unwrap();\n}\n' > "$aw_probe"
+  awk -f "$aw_scan" "$aw_probe" | grep -q 'LEDGER_LOCKED' \
+    || { flag10P "✗ HARNESS: scanner no longer verdicts a provenance-less .append as LEDGER_LOCKED — D-21 R3's proof went silent (a new unprovable Domain-B append would produce no record)"; }
   rm -f "$aw_probe"
 
   # 10P-1 — iterate to a FIXPOINT over the caller-owned-tx set (blind spot B2).
@@ -1166,16 +1174,24 @@ else
   # 10P-2 — every unclassifiable / non-shared writer must be on the frozen list.
   aw_cur="$(mktemp "${TMPDIR:-/tmp}/aw_cur.XXXXXX")"
   aw_froz="$(mktemp "${TMPDIR:-/tmp}/aw_froz.XXXXXX")"
-  grep -E ':(READ_CLONE|INDEP_OPENER|UNCLASSIFIED)@' "$aw_out" \
-    | sed -E 's/@L[0-9]+$//; s/:(READ_CLONE|INDEP_OPENER|UNCLASSIFIED)$//' \
+  # D-21 R3 (ADR-0119): LEDGER_LOCKED joins the failing-unless-frozen set. It was
+  # ADR-0105's *classification* ("holds AUDIT_APPEND_LOCK end-to-end"), accepted
+  # without proof. It is reached ONLY when an `.append(` carries no traceable
+  # connection provenance — a genuine new Domain-B fork risk, or a non-Ledger
+  # `.append` (Vec/tar/portal-JSONL) false-positive. Freezing it makes the
+  # in-process direct-`Ledger::append` surface a proof: a NEW one reds until it
+  # is routed through with_ledger / the Handle writer (real ledger write) or
+  # verified a false-positive and added to the frozen residual.
+  grep -E ':(READ_CLONE|INDEP_OPENER|UNCLASSIFIED|LEDGER_LOCKED)@' "$aw_out" \
+    | sed -E 's/@L[0-9]+$//; s/:(READ_CLONE|INDEP_OPENER|UNCLASSIFIED|LEDGER_LOCKED)$//' \
     | sort -u > "$aw_cur" || true
   grep -vE '^#' "$aw_manifest" | sed 's/[[:space:]]*#.*$//;s/[[:space:]]*$//' \
     | grep -vE '^$' | sort -u > "$aw_froz" || true
   aw_grew="$(comm -13 "$aw_froz" "$aw_cur")"
   if [[ -n "$aw_grew" ]]; then
-    flag10P "✗ a NON-SHARED audit writer appeared outside the frozen residual — route it through the shared aberp_db::Handle writer (ADR-0099 R2). Verdicts: READ_CLONE = appends on a db.read() clone; INDEP_OPENER = its own Connection/Ledger; UNCLASSIFIED = provenance not provable:"
+    flag10P "✗ a NON-SHARED audit writer appeared outside the frozen residual — route it through the shared aberp_db::Handle writer (ADR-0099 R2 / D-21 R3). Verdicts: READ_CLONE = appends on a db.read() clone; INDEP_OPENER = its own Connection/Ledger; UNCLASSIFIED = provenance not provable; LEDGER_LOCKED = an append whose connection provenance is not traceable (route it through with_ledger, or add a verified non-ledger .append false-positive to the frozen residual):"
     printf '%s\n' "$aw_grew" | sed 's/^/      /'
-    grep -E ':(READ_CLONE|INDEP_OPENER|UNCLASSIFIED)@' "$aw_out" \
+    grep -E ':(READ_CLONE|INDEP_OPENER|UNCLASSIFIED|LEDGER_LOCKED)@' "$aw_out" \
       | grep -Ff <(printf '%s\n' "$aw_grew") | sed 's/^/        /' || true
   fi
   aw_shrunk="$(comm -23 "$aw_froz" "$aw_cur")"

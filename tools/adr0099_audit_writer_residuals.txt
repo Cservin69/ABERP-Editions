@@ -85,3 +85,44 @@ crates/audit-ledger/src/storage/mod.rs:append
 crates/audit-ledger/src/storage/mod.rs:append_signed
 crates/audit-ledger/src/storage/mod.rs:sync_mirror
 crates/audit-ledger/src/storage/mod.rs:append_reopen
+#
+# ── LEDGER_LOCKED — FROZEN (D-21 R3, ADR-0119) ──────────────────────────────
+# D-21 R3 promoted the scanner's `LEDGER_LOCKED` verdict from ACCEPTED to
+# FAILING-UNLESS-FROZEN (CHECK 10P-2), turning ADR-0105's classification into a
+# proof: the genuine in-process Domain-B writers (the audit-ledger SESSION api)
+# were migrated onto `Handle::with_ledger` in ADR-0105, so the in-process
+# direct-`Ledger::append` surface is EMPTY. A real `Ledger::append` always
+# carries connection provenance the scanner traces — a read clone -> READ_CLONE,
+# an independent open -> INDEP_OPENER, `db.write()` -> HANDLE_WRITE, inside
+# `with_ledger` -> WITH_LEDGER. `LEDGER_LOCKED` is reached ONLY when `.append(`
+# fires with NO traceable connection provenance: i.e. an audit append whose
+# safety the scanner cannot prove (a genuine new Domain-B fork risk), OR the
+# scanner's broad `.append(` matcher firing on a NON-`Ledger` `.append`.
+#
+# EVERY entry below is the latter — a scanner false-positive, verified to write
+# NO aberp `Ledger`:
+#   * mes_manager:boot_from_toml     — `handles.append(&mut spawned)` (Vec::append)
+#   * export_invoice_bundle:append_bytes — `builder.append(&header, bytes)` (tar)
+#   * aberp-portal-agent:*           — `self.audit.append(&Event…)`, the portal
+#     agent's OWN append-only JSONL audit log (ADR-0115 §6.5), in a SEPARATE
+#     binary (`aberp-portal-agent`), never the aberp tenant Ledger.
+# Frozen may-only-shrink: a NEW LEDGER_LOCKED — a real `Ledger::append` with
+# unprovable provenance, or a new non-ledger `.append` — reds until reviewed and
+# either routed through `with_ledger`/the Handle writer (if a real ledger write)
+# or added here (if another verified false-positive).
+apps/aberp/src/export_invoice_bundle.rs:append_bytes
+apps/aberp/src/mes_manager.rs:boot_from_toml
+crates/aberp-portal-agent/src/agent.rs:auth_begin
+crates/aberp-portal-agent/src/agent.rs:auth_finish
+crates/aberp-portal-agent/src/agent.rs:authenticated
+crates/aberp-portal-agent/src/agent.rs:enrol_begin
+crates/aberp-portal-agent/src/agent.rs:enrol_finish
+crates/aberp-portal-agent/src/agent.rs:mint_session
+crates/aberp-portal-agent/src/agent.rs:proxy
+crates/aberp-portal-agent/src/agent.rs:refuse
+crates/aberp-portal-agent/src/canary.rs:record
+crates/aberp-portal-agent/src/main.rs:confirm
+crates/aberp-portal-agent/src/poll.rs:check_silence
+crates/aberp-portal-agent/src/poll.rs:note_heartbeat
+crates/aberp-portal-agent/src/poll.rs:run
+crates/aberp-portal-agent/src/poll.rs:run_forever
