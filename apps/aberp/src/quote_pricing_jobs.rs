@@ -125,6 +125,30 @@ pub const FAILURE_KIND_UNKNOWN: &str = "unknown";
 /// mentions it as evidence that auto-retry exists.
 pub const UNKNOWN_AUTO_RETRY_CAP: u32 = 3;
 
+/// D-20 A4 (ADR-0120) — auto-retry budget for a `Transient`-classified pricing
+/// failure. Five backed-off attempts (≈ 30s+1m+2m+4m+8m ≈ 15m of wall clock)
+/// span comfortably inside the reaper's `STALE_JOB_REAP_AFTER` (30m). A row
+/// that spends this budget rests `Failed` for an operator Retry — the honest
+/// fallback. Larger than [`UNKNOWN_AUTO_RETRY_CAP`] because a `Transient`
+/// verdict is a positive "retrying has a real chance" signal, where `Unknown`
+/// is "we have not seen this before" and earns fewer free attempts. In code,
+/// not config, for the CLAUDE.md-rule-12 reason [`UNKNOWN_AUTO_RETRY_CAP`]'s
+/// doc gives: changing it without an audit-emit change would silently shift
+/// prod behaviour.
+pub const MAX_TRANSIENT_AUTO_RETRIES: u32 = 5;
+
+/// D-20 A4 (ADR-0120) — exponential-backoff base: the first auto-retry
+/// (`auto_retry_backoff(0, ..)`) waits ~30s. `next_retry_at` gates re-entry, so
+/// this is also the floor on how fast a serially-failing row can re-fail-and-
+/// re-enter — no hot loop (the ADR's confirmation 3).
+pub const AUTO_RETRY_BASE_BACKOFF_SECS: u64 = 30;
+
+/// D-20 A4 (ADR-0120) — exponential-backoff ceiling: no single wait exceeds
+/// 15 minutes, so a large `auto_retry_count` (e.g. after a code change lowered
+/// the cap) still schedules inside the reaper's window and never past the point
+/// an operator would expect it to have rested.
+pub const AUTO_RETRY_CEIL_BACKOFF_SECS: u64 = 15 * 60;
+
 /// Closed-vocab failure-kind verdict. Rides on a Failed row's
 /// `failure_kind` column. NULL ↔ legacy pre-PR-271 row → treated as
 /// `Unknown` for daemon scheduling.
@@ -380,6 +404,19 @@ ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS tolerance_manual_review 
 -- never-attempted ⇒ not reapable until the daemon actually reaches it, which
 -- is the conservative direction.
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS last_attempt_at VARCHAR;
+-- D-20 A4 (ADR-0120) — bounded auto-retry-with-backoff for Transient/Unknown
+-- pricing failures.
+-- `auto_retry_count` = how many times the daemon has auto-re-enqueued this row.
+--   NULL/absent ⇒ 0. DISTINCT from `attempt_n` (which counts operator retries
+--   too) so the auto-retry cap is independent of operator action.
+-- `next_retry_at` = RFC3339 instant a Failed row becomes eligible for
+--   auto-retry. NULL ⇒ unscheduled (Permanent, budget-exhausted, or non-failed).
+--   Persisting the schedule in the row is what survives a restart. Compared in
+--   RUST, never in SQL (RFC3339 VARCHARs only sort chronologically at matching
+--   sub-second precision — the trap A1's reaper avoids for updated_at).
+-- Both nullable, no DEFAULT per [[no-sql-specific]]; idempotent ADD COLUMN.
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS auto_retry_count INTEGER;
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS next_retry_at VARCHAR;
 ";
 
 /// Idempotent — call at every writer entry.
@@ -866,6 +903,116 @@ pub fn set_failed(
     })
 }
 
+/// D-20 A4 (ADR-0120) — the wait before auto-retry attempt `count` (0-based:
+/// `count` is the row's CURRENT `auto_retry_count`, so the first retry passes
+/// 0). Exponential `min(BASE * 2^count, CEIL)` with a small deterministic
+/// jitter (±10%, seeded from `quote_id`) so a batch of rows that failed on the
+/// same blip (a one-minute volume unmount) do not all re-enter on the same
+/// tick — a thundering herd against the storefront writeback.
+///
+/// The jitter is deterministic in the quote id (an FNV-1a hash, not a
+/// wall-clock RNG) so a test can assert the exact schedule and a restart
+/// mid-backoff re-derives the same offset from the row alone.
+pub fn auto_retry_backoff(count: u32, quote_id: &str) -> time::Duration {
+    // min(BASE << count, CEIL). `checked_shl` saturates a `count >= 64` shift
+    // (which would be UB) to u64::MAX; the ceiling then wins — and in practice
+    // `count >= 6` already hits the ceiling since BASE=30, CEIL=900.
+    let raw = AUTO_RETRY_BASE_BACKOFF_SECS
+        .checked_shl(count)
+        .unwrap_or(u64::MAX)
+        .min(AUTO_RETRY_CEIL_BACKOFF_SECS);
+    // Deterministic ±10% jitter seeded from the quote id (FNV-1a 64-bit).
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in quote_id.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Top 53 bits → a fraction in [0, 1) (f64 has a 53-bit mantissa), then to
+    // [-0.1, +0.1].
+    let frac = (h >> 11) as f64 / ((1u64 << 53) as f64);
+    let jitter = (frac - 0.5) * 0.2;
+    let secs = (raw as f64 * (1.0 + jitter)).round().max(0.0) as i64;
+    time::Duration::seconds(secs)
+}
+
+/// D-20 A4 (ADR-0120) — decide whether a just-`Failed` row should auto-retry,
+/// and if so stamp its `next_retry_at`; otherwise clear it to NULL.
+///
+/// **Called ONLY on the advance-loop failure path** (right after `emit_failure`
+/// returns `Failed`), NEVER from `emit_failure` itself. The A1 reaper calls
+/// `emit_failure(.., "reaper", ..)` and a reaper reason classifies `Unknown`;
+/// were scheduling inside `emit_failure`, the reaper would auto-schedule the
+/// row it just condemned as stuck and the same cycle's sweep would re-enqueue
+/// it — the reap↔retry bounce the ADR designs out. Keeping it a separate step
+/// on the pipeline-stage failure path means only a genuine stage failure
+/// schedules.
+///
+/// Given the row's current `auto_retry_count` (COALESCE 0) and `failure_kind`:
+/// - `Permanent` ⇒ `next_retry_at = NULL`. Never auto-retried.
+/// - `Transient` ⇒ if `auto_retry_count < MAX_TRANSIENT_AUTO_RETRIES`,
+///   `next_retry_at = now + auto_retry_backoff(count)`; else NULL (budget spent
+///   → operator only).
+/// - `Unknown` ⇒ same, capped at [`UNKNOWN_AUTO_RETRY_CAP`] — the reader that
+///   constant finally gets.
+///
+/// A non-null `next_retry_at` therefore means "scheduled AND under cap"; the
+/// sweep (slice 2) relies on that so it needs no per-kind cap logic. Returns
+/// the scheduled instant (if any) for the caller's log line. No-op (returns
+/// `None`) if the row is gone.
+pub fn schedule_auto_retry_if_eligible(
+    conn: &mut Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    failure_kind: FailureKind,
+    now: OffsetDateTime,
+) -> Result<Option<OffsetDateTime>> {
+    ensure_schema(conn)?;
+    let cap = match failure_kind {
+        FailureKind::Permanent => 0,
+        FailureKind::Transient => MAX_TRANSIENT_AUTO_RETRIES,
+        FailureKind::Unknown => UNKNOWN_AUTO_RETRY_CAP,
+    };
+    // Current auto-retry count (NULL ⇒ 0). Absent row ⇒ nothing to schedule.
+    let count: Option<i64> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT COALESCE(auto_retry_count, 0) FROM quote_pricing_jobs
+                    WHERE quote_id = ? AND tenant_id = ?",
+            )
+            .context("prepare read auto_retry_count")?;
+        let mut rows = stmt
+            .query(params![quote_id, tenant_id])
+            .context("execute read auto_retry_count")?;
+        match rows.next().context("step read auto_retry_count")? {
+            Some(r) => Some(r.get(0).context("get auto_retry_count")?),
+            None => None,
+        }
+    };
+    let Some(count) = count else {
+        return Ok(None);
+    };
+    let count = count.max(0) as u32;
+    let scheduled = if count < cap {
+        Some(now + auto_retry_backoff(count, quote_id))
+    } else {
+        None
+    };
+    let next_retry_at_str = match scheduled {
+        Some(t) => Some(
+            t.format(&time::format_description::well_known::Rfc3339)
+                .context("format next_retry_at")?,
+        ),
+        None => None,
+    };
+    conn.execute(
+        "UPDATE quote_pricing_jobs SET next_retry_at = ?
+            WHERE quote_id = ? AND tenant_id = ?",
+        params![next_retry_at_str, quote_id, tenant_id],
+    )
+    .context("stamp next_retry_at")?;
+    Ok(scheduled)
+}
+
 /// D-PRICEQ — outcome of an operator Retry click, mirroring
 /// [`DeleteJobOutcome`]'s shape. The serve handler maps each variant to an
 /// HTTP status: `Applied` → 200, `NotFound` → 404, `NotRetryable` → 409.
@@ -946,9 +1093,15 @@ pub fn retry_job_in_tx(
         .format(&time::format_description::well_known::Rfc3339)
         .context("format updated_at")?;
     tx.execute(
+        // D-20 A4 (ADR-0120) — an operator's deliberate Retry is a fresh
+        // decision that restarts the auto-retry budget: reset auto_retry_count
+        // = 0 and clear next_retry_at. (It also preserves `fetched_at`, so the
+        // operator's row jumps to the FIFO head on their explicit intent — the
+        // opposite of the auto-retry sweep, which re-enters at the back.)
         "UPDATE quote_pricing_jobs
             SET state = ?, updated_at = ?, error_stage = NULL, error_reason = NULL,
-                failure_kind = NULL, attempt_n = attempt_n + 1
+                failure_kind = NULL, attempt_n = attempt_n + 1,
+                auto_retry_count = 0, next_retry_at = NULL
             WHERE quote_id = ? AND tenant_id = ? AND state = ?",
         params![STATE_FETCHED, ts, quote_id, tenant_id, STATE_FAILED],
     )
@@ -3637,5 +3790,164 @@ mod tests {
         let rows = list_jobs(&conn, "T").expect("list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, JobState::Fetched);
+    }
+
+    // ---- D-20 A4 (ADR-0120) — auto-retry scheduling -------------------------
+
+    /// Read the raw `auto_retry_count` + `next_retry_at` columns for a row.
+    fn read_auto_retry(
+        conn: &Connection,
+        quote_id: &str,
+        tenant_id: &str,
+    ) -> (Option<i64>, Option<String>) {
+        conn.query_row(
+            "SELECT auto_retry_count, next_retry_at FROM quote_pricing_jobs
+                WHERE quote_id = ? AND tenant_id = ?",
+            params![quote_id, tenant_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("read auto-retry cols")
+    }
+
+    /// Force a row's `auto_retry_count` (the sweep bumps this in slice 2; here
+    /// we set it directly to drive the cap boundary).
+    fn set_auto_retry_count(conn: &Connection, quote_id: &str, tenant_id: &str, n: i64) {
+        conn.execute(
+            "UPDATE quote_pricing_jobs SET auto_retry_count = ?
+                WHERE quote_id = ? AND tenant_id = ?",
+            params![n, quote_id, tenant_id],
+        )
+        .expect("set auto_retry_count");
+    }
+
+    fn seed_failed(conn: &mut Connection, quote_id: &str, kind: FailureKind) {
+        insert_fetched_job(
+            conn, quote_id, "T", "b@x", "Bob", "", "AL", 1, "p.stl", "/tmp/p.stl", fixed_ts(),
+        )
+        .expect("ins");
+        set_state(conn, quote_id, "T", JobState::Extracting, fixed_ts()).expect("ex");
+        set_failed(conn, quote_id, "T", "extract", "blip", kind, fixed_ts()).expect("fail");
+    }
+
+    #[test]
+    fn auto_retry_backoff_is_exponential_capped_and_jittered() {
+        // raw(n) = min(30 << n, 900); result within ±10% of raw, rounded.
+        for (n, raw) in [(0u32, 30i64), (1, 60), (2, 120), (3, 240), (4, 480), (5, 900), (9, 900)]
+        {
+            let d = auto_retry_backoff(n, "quote-abc");
+            let s = d.whole_seconds();
+            let lo = (raw as f64 * 0.9).floor() as i64;
+            let hi = (raw as f64 * 1.1).ceil() as i64;
+            assert!(
+                s >= lo && s <= hi,
+                "backoff({n}) = {s}s outside [{lo},{hi}] (raw {raw})"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_retry_backoff_is_deterministic_and_quote_scoped() {
+        // Same quote id → identical (survives a restart; a test can assert it).
+        assert_eq!(
+            auto_retry_backoff(2, "quote-xyz"),
+            auto_retry_backoff(2, "quote-xyz")
+        );
+        // Different quote ids generally land on different jitter offsets, so a
+        // batch that failed on the same blip does not re-enter on one tick.
+        // (Not a hard guarantee for any single pair, but true across a spread.)
+        let distinct: std::collections::BTreeSet<i64> = (0..50)
+            .map(|i| auto_retry_backoff(3, &format!("q{i}")).whole_seconds())
+            .collect();
+        assert!(distinct.len() > 1, "jitter collapsed to a single value");
+    }
+
+    #[test]
+    fn schedule_transient_sets_next_retry_then_caps_at_budget() {
+        let mut conn = open_mem();
+        seed_failed(&mut conn, "qt", FailureKind::Transient);
+
+        // count 0 < 5 → schedules.
+        let scheduled =
+            schedule_auto_retry_if_eligible(&mut conn, "qt", "T", FailureKind::Transient, fixed_ts())
+                .expect("schedule");
+        assert!(scheduled.is_some(), "under-cap Transient should schedule");
+        let (_, next) = read_auto_retry(&conn, "qt", "T");
+        assert!(next.is_some(), "next_retry_at stamped");
+
+        // At the cap (5) → NULL, no schedule.
+        set_auto_retry_count(&conn, "qt", "T", MAX_TRANSIENT_AUTO_RETRIES as i64);
+        let none =
+            schedule_auto_retry_if_eligible(&mut conn, "qt", "T", FailureKind::Transient, fixed_ts())
+                .expect("schedule at cap");
+        assert!(none.is_none(), "budget-spent Transient must not schedule");
+        let (_, next2) = read_auto_retry(&conn, "qt", "T");
+        assert!(next2.is_none(), "next_retry_at cleared to NULL at cap");
+    }
+
+    #[test]
+    fn schedule_unknown_capped_at_three() {
+        let mut conn = open_mem();
+        seed_failed(&mut conn, "qu", FailureKind::Unknown);
+
+        set_auto_retry_count(&conn, "qu", "T", (UNKNOWN_AUTO_RETRY_CAP - 1) as i64);
+        assert!(
+            schedule_auto_retry_if_eligible(&mut conn, "qu", "T", FailureKind::Unknown, fixed_ts())
+                .expect("under cap")
+                .is_some(),
+            "Unknown under its cap schedules"
+        );
+
+        set_auto_retry_count(&conn, "qu", "T", UNKNOWN_AUTO_RETRY_CAP as i64);
+        assert!(
+            schedule_auto_retry_if_eligible(&mut conn, "qu", "T", FailureKind::Unknown, fixed_ts())
+                .expect("at cap")
+                .is_none(),
+            "Unknown at its (lower) cap must not schedule"
+        );
+    }
+
+    #[test]
+    fn schedule_permanent_never_schedules() {
+        let mut conn = open_mem();
+        seed_failed(&mut conn, "qp", FailureKind::Permanent);
+        assert!(
+            schedule_auto_retry_if_eligible(&mut conn, "qp", "T", FailureKind::Permanent, fixed_ts())
+                .expect("permanent")
+                .is_none(),
+            "Permanent never auto-retries"
+        );
+        let (_, next) = read_auto_retry(&conn, "qp", "T");
+        assert!(next.is_none(), "Permanent leaves next_retry_at NULL");
+    }
+
+    #[test]
+    fn schedule_missing_row_is_noop() {
+        let mut conn = open_mem();
+        assert!(
+            schedule_auto_retry_if_eligible(&mut conn, "ghost", "T", FailureKind::Transient, fixed_ts())
+                .expect("missing row ok")
+                .is_none(),
+            "absent row schedules nothing"
+        );
+    }
+
+    #[test]
+    fn operator_retry_resets_auto_retry_budget() {
+        let mut conn = open_mem();
+        seed_failed(&mut conn, "qr", FailureKind::Transient);
+        // Simulate a row mid-auto-retry: count bumped + scheduled.
+        set_auto_retry_count(&conn, "qr", "T", 3);
+        schedule_auto_retry_if_eligible(&mut conn, "qr", "T", FailureKind::Transient, fixed_ts())
+            .expect("schedule");
+        let (before, next_before) = read_auto_retry(&conn, "qr", "T");
+        assert_eq!(before, Some(3));
+        assert!(next_before.is_some());
+
+        // Operator Retry → budget reset to 0 + schedule cleared.
+        retry_job(&mut conn, "qr", "T", fixed_ts()).expect("retry");
+        let (after, next_after) = read_auto_retry(&conn, "qr", "T");
+        assert_eq!(after, Some(0), "operator retry resets auto_retry_count");
+        assert!(next_after.is_none(), "operator retry clears next_retry_at");
+        assert_eq!(read_state(&conn, "qr", "T").expect("state"), Some(JobState::Fetched));
     }
 }

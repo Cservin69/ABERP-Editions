@@ -4036,6 +4036,9 @@ fn emit_failure(
     reason: &str,
     attempt_n: u32,
 ) -> Result<()> {
+    // One `now` for both the Failed stamp and the auto-retry schedule, so the
+    // backoff is anchored to the same instant the failure was recorded.
+    let now = OffsetDateTime::now_utc();
     let failure_kind = classify_failure(stage, reason);
     let set_outcome = jobs::set_failed(
         conn,
@@ -4044,7 +4047,7 @@ fn emit_failure(
         stage,
         reason,
         failure_kind,
-        OffsetDateTime::now_utc(),
+        now,
     )?;
     if !matches!(set_outcome, jobs::TransitionOutcome::Applied) {
         // Already-Failed (prior cycle landed) or NotFound. Skip audit emit
@@ -4066,7 +4069,34 @@ fn emit_failure(
         reason,
         failure_kind,
         attempt_n,
-    )
+    )?;
+    // D-20 A4 (ADR-0120) — schedule a bounded auto-retry, but ONLY on the
+    // genuine pipeline-stage failure path. The A1 reaper calls
+    // `emit_failure(.., "reaper", ..)` and a reaper reason classifies
+    // `Unknown`; scheduling it would let the same cycle's sweep re-enqueue the
+    // row the reaper just condemned as stuck — the reap↔retry bounce the ADR
+    // designs out. `schedule_auto_retry_if_eligible` itself decides eligibility
+    // + cap by `failure_kind`; the `stage != "reaper"` guard is what keeps the
+    // reaper (the one `emit_failure` caller that must never schedule) out.
+    // Inert until slice 2's sweep reads `next_retry_at`.
+    if stage != "reaper" {
+        if let Some(when) = jobs::schedule_auto_retry_if_eligible(
+            conn,
+            quote_id,
+            tenant_id,
+            failure_kind,
+            now,
+        )? {
+            tracing::info!(
+                quote_id = %quote_id,
+                stage = %stage,
+                failure_kind = ?failure_kind,
+                next_retry_at = %when,
+                "auto-retry scheduled (D-20 A4)"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Append the `QuotePricingFailed` + `QuotePricingFailureClassified` audit
