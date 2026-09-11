@@ -261,6 +261,8 @@ async fn fallback_to_per_currency_default_persists_snapshot() {
         // passes `Some(_)` — pin 5 covers the snapshot persistence
         // round-trip via that surface.
         None,
+        // ADR-0123 — no shipment origin on this fixture path.
+        None,
     )
     .await
     .expect("HUF happy path with None bank_account_id must succeed");

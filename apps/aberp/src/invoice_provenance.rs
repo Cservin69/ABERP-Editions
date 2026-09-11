@@ -32,13 +32,14 @@
 //!
 //! # What writes it
 //!
-//! Nothing, in ADR-0123 slice 1. [`record_in_tx`] exists so the shape and the
-//! round trip can be pinned; its caller is the promote route in slice 2, which
-//! derives every field from the `invoice_draft` ROW rather than from a request
-//! body (`[[trust-code-not-operator]]`).
+//! The promote route (`POST /api/invoice-drafts/:id/promote`), through
+//! `issue_invoice::run_single_tx`, inside the SAME transaction that allocates
+//! the invoice and appends its audit entries. Every field is derived from the
+//! `invoice_draft` ROW, never from a request body
+//! (`[[trust-code-not-operator]]`).
 
 use anyhow::{Context, Result};
-use duckdb::{params, Connection, Transaction};
+use duckdb::{params, Connection, OptionalExt, Transaction};
 
 /// Defense-scoped provenance table (ADR-0123 §D2, as refined at build time).
 ///
@@ -79,6 +80,37 @@ pub struct InvoiceShipmentProvenance {
     pub recorded_at_utc: String,
 }
 
+/// The provenance an invoice inherits from the draft it was promoted from,
+/// **as read off the draft ROW** (ADR-0123 §D1).
+///
+/// This type exists to make the trust boundary a type. The operator names
+/// *which* draft (a path segment); everything in here is what the server then
+/// read from that row. An operator can be wrong about which draft they meant;
+/// they cannot forge what the draft says about dispatch and work order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftProvenance {
+    pub source_draft_id: String,
+    pub source_dispatch_id: Option<String>,
+    pub source_wo_id: Option<String>,
+}
+
+impl DraftProvenance {
+    /// Pair this with an invoice id and a timestamp to get the storable row.
+    pub fn for_invoice(
+        &self,
+        invoice_id: &str,
+        recorded_at_utc: &str,
+    ) -> InvoiceShipmentProvenance {
+        InvoiceShipmentProvenance {
+            invoice_id: invoice_id.to_string(),
+            source_draft_id: self.source_draft_id.clone(),
+            source_dispatch_id: self.source_dispatch_id.clone(),
+            source_wo_id: self.source_wo_id.clone(),
+            recorded_at_utc: recorded_at_utc.to_string(),
+        }
+    }
+}
+
 /// Create the table if absent. No-op on a read-only connection, matching
 /// `invoice_draft::ensure_schema`'s ADR-0098 C2 posture.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
@@ -97,8 +129,6 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 /// invoice that commits without its provenance is unrepresentable. A function
 /// that opened its own transaction would make that guarantee impossible to
 /// state.
-///
-/// **No caller in slice 1.** See the module docs.
 pub fn record_in_tx(
     tx: &Transaction<'_>,
     tenant: &str,
@@ -120,6 +150,70 @@ pub fn record_in_tx(
     )
     .context("INSERT invoice_shipment_provenance")?;
     Ok(())
+}
+
+/// Resolve a draft's provenance for promotion, and flip the row to
+/// `Promoted` — both in the CALLER's transaction (ADR-0123 §D1 + §D5).
+///
+/// Returns the provenance the invoice should record. Refuses, rather than
+/// silently proceeding, when:
+///
+/// - the draft does not exist (an operator naming a draft that is not there is
+///   a mistake worth surfacing, not a reason to mint a provenance-less
+///   invoice);
+/// - the draft is already `Promoted` (its invoice exists; promoting twice would
+///   record a second invoice against a row that already answered for one — see
+///   the route's idempotency handling, which distinguishes a replay from a
+///   genuine double-promote).
+pub fn resolve_and_mark_promoted_in_tx(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    drf_id: &str,
+) -> Result<DraftProvenance> {
+    let row: Option<(String, Option<String>, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT drf_id, source_dispatch_id, source_wo_id, state
+               FROM invoice_draft
+              WHERE tenant_id = ?1 AND drf_id = ?2
+              LIMIT 1;",
+            params![tenant, drf_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .context("SELECT invoice_draft for promotion")?;
+
+    let Some((found_id, dispatch, wo, state)) = row else {
+        anyhow::bail!(
+            "invoice draft {drf_id} does not exist — refusing to issue an invoice \
+             against a draft that is not there rather than issuing one with no \
+             recorded shipment origin"
+        );
+    };
+    if crate::invoice_draft::DraftState::parse(state.as_deref())
+        == crate::invoice_draft::DraftState::Promoted
+    {
+        anyhow::bail!(
+            "invoice draft {drf_id} is already promoted — an invoice has been issued \
+             from it. Correct an issued invoice with a storno + a new issuance, never \
+             by promoting the same draft twice"
+        );
+    }
+
+    tx.execute(
+        "UPDATE invoice_draft SET state = ?3 WHERE tenant_id = ?1 AND drf_id = ?2;",
+        params![
+            tenant,
+            drf_id,
+            crate::invoice_draft::DraftState::Promoted.as_str()
+        ],
+    )
+    .context("UPDATE invoice_draft state -> promoted")?;
+
+    Ok(DraftProvenance {
+        source_draft_id: found_id,
+        source_dispatch_id: dispatch,
+        source_wo_id: wo,
+    })
 }
 
 /// Read one invoice's provenance. `None` means this invoice has no recorded

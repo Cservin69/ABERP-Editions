@@ -270,6 +270,8 @@ async fn issue_route_huf_happy_path_writes_audit_pair_and_xml() {
         &UnreachableProvider,
         actor,
         None,
+        // ADR-0123 — no shipment origin on this fixture path.
+        None,
     )
     .await
     .expect("HUF happy path must succeed");
@@ -369,6 +371,8 @@ async fn issue_route_eur_happy_path_stamps_rate_metadata_on_draft() {
         &provider,
         actor,
         None,
+        // ADR-0123 — no shipment origin on this fixture path.
+        None,
     )
     .await
     .expect("EUR happy path must succeed");
@@ -459,6 +463,8 @@ async fn issue_route_rejects_empty_lines_with_loud_error() {
         &UnreachableProvider,
         actor,
         None,
+        // ADR-0123 — no shipment origin on this fixture path.
+        None,
     )
     .await
     .expect_err("empty-lines request must fail loud");
@@ -517,6 +523,8 @@ async fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
         bad_supplier,
         &UnreachableProvider,
         actor,
+        None,
+        // ADR-0123 — no shipment origin on this fixture path.
         None,
     )
     .await
@@ -612,6 +620,8 @@ async fn issue_route_other_buyer_normalizes_community_vat_in_xml_and_audit() {
         fixture_supplier(),
         &UnreachableProvider,
         actor,
+        None,
+        // ADR-0123 — no shipment origin on this fixture path.
         None,
     )
     .await

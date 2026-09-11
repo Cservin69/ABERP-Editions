@@ -501,6 +501,9 @@ pub async fn run_with_provider<P: MnbRatesProvider + ?Sized>(
             // PDF render (PR-D) falls back to the seller.toml
             // legacy-flat-root bank for those rows.
             None,
+            // ADR-0123 — the CLI issues invoices directly, never by promoting
+            // a draft, so it records no shipment origin. Faithful, not missing.
+            None,
         )
         .await?;
 
@@ -568,6 +571,14 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     // forced past any sequence NAV's shared TEST endpoint already holds.
     nav_probe: Option<&dyn NavInvoiceNumberProbe>,
     bank_snapshot: Option<aberp_billing::BankAccountSnapshot>,
+    // ADR-0123 §D1 — the `drf_*` draft being promoted, or `None` for the
+    // ordinary issue path.
+    //
+    // Deliberately a parameter rather than a field on `InvoiceInputJson`:
+    // `input.json` is the operator's submitted body, persisted verbatim beside
+    // the NAV XML. Provenance must be server-derived, and a field there would
+    // let any caller assert a shipment link it had not earned.
+    promote_draft_id: Option<String>,
 ) -> Result<IssuedInvoiceSummary> {
     if input.lines.is_empty() {
         return Err(anyhow!("input has no lines"));
@@ -953,6 +964,9 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         // id (when present on the wire body) for the counter
         // increment that drives the PartnerForm field-selective lock.
         input.customer.partner_id.clone(),
+        // ADR-0123 — the draft being promoted; resolved and flipped inside
+        // `run_single_tx`'s transaction.
+        promote_draft_id,
         // S392 — numbers the NAV pre-flight skipped; recorded in-tx as
         // `InvoiceCheckPerformed(outcome="exists")` audit entries hanging
         // off this issuance (empty when nothing was skipped).
@@ -1196,6 +1210,16 @@ fn run_single_tx<F>(
     // partner read AND so a rolled-back issuance doesn't leave a
     // stale counter. `None` for one-off buyers + CLI callers.
     customer_partner_id: Option<String>,
+    // ADR-0123 §D1 — the `drf_*` draft this issuance is PROMOTING, or `None`
+    // for the ordinary issue path.
+    //
+    // An id, not a resolved provenance: resolving reads the draft row AND flips
+    // its state to `Promoted`, and both must happen inside THIS function's
+    // single transaction alongside the allocation, the audit appends and the
+    // provenance row. Resolving in the route would put the read and the flip
+    // outside the transaction that the invoice commits in — so a rolled-back
+    // issuance would leave a draft marked promoted with no invoice.
+    promote_draft_id: Option<String>,
     // S392 — sequence numbers the NAV pre-flight skipped because NAV's
     // shared TEST endpoint already held them. Each becomes an
     // `InvoiceCheckPerformed(outcome="exists")` audit entry written in
@@ -1297,6 +1321,24 @@ where
         )
         .context("audit_ledger::append_in_tx InvoiceSequenceReserved")?;
 
+        // ADR-0123 §D1/§D5 — resolve the promoted draft and flip it, in THIS
+        // tx. Refuses a missing or already-promoted draft, so the failure is a
+        // rolled-back issuance the operator can retry rather than an invoice
+        // with a silently absent origin.
+        //
+        // Inside `was_fresh`: a REPLAY (same idempotency key — an operator
+        // double-click) must not re-resolve, because the first call already
+        // flipped the draft and the second would refuse on "already promoted",
+        // turning an idempotent retry into a hard failure.
+        let resolved_provenance = match promote_draft_id.as_deref() {
+            Some(drf_id) => Some(crate::invoice_provenance::resolve_and_mark_promoted_in_tx(
+                &tx,
+                ledger_meta.tenant_id().as_str(),
+                drf_id,
+            )?),
+            None => None,
+        };
+
         // PR-18 / ADR-0031 §2 — record the operator's --out path on
         // the audit payload so the drain worker can submit without
         // a per-invocation path argument.
@@ -1342,7 +1384,10 @@ where
         // PR-97 / ADR-0048 — stamp the buyer-kind discriminator.
         .with_customer_vat_status(customer_vat_status)
         // ADR-0102 — stamp the EU community VAT number (Other buyers).
-        .with_customer_community_vat_number(customer_community_vat_number.as_deref());
+        .with_customer_community_vat_number(customer_community_vat_number.as_deref())
+        // ADR-0123 — stamp the shipment origin. A no-op for every path but
+        // promote.
+        .with_shipment_provenance(resolved_provenance.as_ref());
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
@@ -1373,6 +1418,27 @@ where
                 params![ledger_meta.tenant_id().as_str(), partner_id],
             )
             .context("UPDATE partners SET issued_invoice_count (PR-97 / ADR-0048)")?;
+        }
+
+        // ADR-0123 §D1 — record the shipment provenance and flip the draft to
+        // `Promoted`, in this SAME tx. Both live or neither does: an invoice
+        // that committed without its provenance row would be exactly the
+        // silent-absence this ADR exists to remove, and a draft marked
+        // `Promoted` against an invoice that rolled back would refuse the
+        // operator's retry for no reason.
+        //
+        // Inside the `was_fresh` branch on purpose. A REPLAY (same idempotency
+        // key, an operator double-click) must not write a second provenance row
+        // for an invoice that already has one — the PRIMARY KEY would refuse it
+        // and turn a harmless double-click into a failed money path.
+        if let Some(prov) = resolved_provenance.as_ref() {
+            let row = prov.for_invoice(
+                &invoice.id.to_prefixed_string(),
+                &now.format(&time::format_description::well_known::Rfc3339)
+                    .context("format provenance recorded_at as RFC3339")?,
+            );
+            crate::invoice_provenance::record_in_tx(&tx, ledger_meta.tenant_id().as_str(), &row)
+                .context("record invoice shipment provenance (ADR-0123)")?;
         }
     } else {
         tracing::info!("replay path: no new audit entries written");

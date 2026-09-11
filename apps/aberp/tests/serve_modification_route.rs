@@ -363,6 +363,8 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
         // S392 — base fixture does not exercise the NAV number pre-flight.
         None,
         None,
+        // ADR-0123 — no shipment origin on this fixture path.
+        None,
     )
     .await
     .expect("issue base HUF invoice");
@@ -537,6 +539,8 @@ async fn issue_and_finalize_base(
         Actor::from_local_cli("sess".to_string(), "test-user"),
         &NeverProvider,
         None,
+        None,
+        // ADR-0123 — no shipment origin on this fixture path.
         None,
     )
     .await

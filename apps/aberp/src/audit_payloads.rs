@@ -499,6 +499,24 @@ impl InvoiceDraftCreatedPayload {
     /// no-op then so the field stays absent for the byte-identical
     /// backward-compat path. Same idempotent/chainable posture as
     /// [`Self::with_customer_vat_status`].
+    /// ADR-0123 §D2 — stamp the shipment provenance derived from the
+    /// `invoice_draft` row this invoice was promoted from.
+    ///
+    /// `None` is a no-op, which is what every non-promote path passes: an
+    /// invoice issued through the ordinary form records no shipment origin, and
+    /// that absence is the honest answer rather than a missing value.
+    pub fn with_shipment_provenance(
+        mut self,
+        provenance: Option<&crate::invoice_provenance::DraftProvenance>,
+    ) -> Self {
+        if let Some(p) = provenance {
+            self.source_draft_id = Some(p.source_draft_id.clone());
+            self.source_dispatch_id = p.source_dispatch_id.clone();
+            self.source_wo_id = p.source_wo_id.clone();
+        }
+        self
+    }
+
     pub fn with_customer_community_vat_number(mut self, number: Option<&str>) -> Self {
         self.customer_community_vat_number = number
             .map(str::trim)

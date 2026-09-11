@@ -113,7 +113,6 @@ use crate::invoice_currency_metadata::{
     load_invoice_currency_metadata_in_tx, InvoiceCurrencyMetadata,
 };
 use crate::invoice_draft;
-use crate::invoice_provenance;
 use crate::issue_invoice::{self, InvoiceInputJson};
 use crate::issue_modification;
 use crate::issue_preflight::{
@@ -2061,12 +2060,6 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             )
         })?;
         invoice_draft::ensure_schema(&conn).context("ensure invoice_draft schema at serve boot")?;
-        // ADR-0123 — the invoice<->shipment provenance table. Created at boot
-        // beside `invoice_draft` because the promote route (slice 2) writes
-        // both inside ONE transaction, and a missing table there would abort a
-        // money path rather than a boot.
-        invoice_provenance::ensure_schema(&conn)
-            .context("ensure invoice_shipment_provenance schema at serve boot")?;
     }
 
     // S177 / PR-177 — pin the ap_invoice (incoming AP-side mirror)
@@ -4414,6 +4407,10 @@ pub fn ensure_all_tenant_schemas(conn: &mut Connection, tenant: &str) -> anyhow:
     crate::email_relay_queue::ensure_schema(conn)?;
     crate::incoming_invoices::ensure_schema(conn)?;
     crate::invoice_draft::ensure_schema(conn)?;
+    // ADR-0123 — beside `invoice_draft`, because the promote path writes both
+    // inside ONE transaction and a missing table there would abort a money
+    // path rather than a boot.
+    crate::invoice_provenance::ensure_schema(conn)?;
     crate::restore_from_nav_outgoing::ensure_schema(conn)?;
     aberp_inventory::ensure_schema(conn)?;
     aberp_qa::ensure_schema(conn)?;
@@ -5200,6 +5197,12 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/invoice-drafts/:id",
             get(handle_get_invoice_draft).delete(handle_delete_invoice_draft),
+        )
+        // ADR-0123 §D1 — the atomic promote PR-230b deferred. Issues the
+        // invoice AND binds it to this draft's shipment, in one transaction.
+        .route(
+            "/api/invoice-drafts/:id/promote",
+            post(handle_promote_invoice_draft),
         )
         // S177 / PR-177 — AP module v1 BACKEND. Incoming-invoice list +
         // detail + manual ingestion + three closed-vocab status
@@ -8498,6 +8501,71 @@ async fn handle_issue_invoice(
     State(state): State<AppState>,
     Json(request): Json<IssueInvoiceRequest>,
 ) -> Response {
+    // ADR-0123 — the ordinary issue form promotes nothing and therefore
+    // records no shipment origin.
+    issue_or_promote(headers, state, request, None).await
+}
+
+/// ADR-0123 §D1 — `POST /api/invoice-drafts/:id/promote`.
+///
+/// The route PR-230b deferred ("cross-pipeline atomic promote is deferred to a
+/// future PR"). It issues an invoice exactly as the ordinary form does, and
+/// additionally binds it to the `invoice_draft` row named in the path.
+///
+/// # Why the body is still a full `IssueInvoiceRequest`
+///
+/// Because the draft cannot supply one. `invoice_draft` carries `partner_id`,
+/// `product_id`, `qty` and `notes` — and **no price, no currency, no dates, no
+/// bank account**. The design pass assumed promote could mint an invoice from
+/// the row alone; building it showed otherwise.
+///
+/// That does not weaken the trust property, which was never about the
+/// commercial terms. The operator supplies what is theirs to supply; the
+/// **provenance** is read by the server off the row the path names. An operator
+/// can be wrong about which draft they meant — they cannot forge what that
+/// draft says about dispatch and work order.
+///
+/// Defense-only (§D4): Portable's invoice path is left exactly as it is.
+async fn handle_promote_invoice_draft(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(drf_id): AxumPath<String>,
+    Json(request): Json<IssueInvoiceRequest>,
+) -> Response {
+    if !build_profile::storefront_polling_allowed() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "not_permitted",
+                "detail": "ADR-0123 §D4: promoting an invoice draft to an invoice with                            recorded shipment provenance is a Defense-edition capability.                            This build issues invoices through POST /api/invoices, which                            records no shipment origin."
+            })),
+        )
+            .into_response();
+    }
+    if drf_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_draft_id",
+                "detail": "the draft id path segment is empty"
+            })),
+        )
+            .into_response();
+    }
+    issue_or_promote(headers, state, request, Some(drf_id)).await
+}
+
+/// The shared body of the issue and promote routes.
+///
+/// Extracted rather than duplicated: this is a money path, and two copies of it
+/// would drift. `promote_draft_id` is the only difference between the two
+/// callers.
+async fn issue_or_promote(
+    headers: HeaderMap,
+    state: AppState,
+    request: IssueInvoiceRequest,
+    promote_draft_id: Option<String>,
+) -> Response {
     let operator_login = match require_ready(&state) {
         Ok(login) => login,
         Err(resp) => return resp,
@@ -8627,6 +8695,11 @@ async fn handle_issue_invoice(
         provider.as_ref(),
         actor,
         Some(bank_snapshot),
+        // ADR-0123 — `Some(_)` only from the promote route. The ordinary form
+        // records no shipment origin, which is the honest answer: nothing here
+        // names a draft, and ADR-0123 refused inferring the link from
+        // partner + product + qty.
+        promote_draft_id,
     )
     .await
     {
@@ -9036,6 +9109,10 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
     // picker). Threaded down into `issue_from_parsed` so the five
     // `bank_account_*` invoice columns are populated at INSERT time.
     bank_snapshot: Option<aberp_billing::BankAccountSnapshot>,
+    // ADR-0123 §D1 — the `drf_*` draft being promoted, or `None` for the
+    // ordinary issue route. Resolved and state-flipped inside the issuance
+    // transaction, never here.
+    promote_draft_id: Option<String>,
 ) -> Result<issue_invoice::IssuedInvoiceSummary> {
     let xml_path = mint_issued_xml_path(state.tenant.as_str())
         .context("mint server-side NAV-XML output path for issuance")?;
@@ -9137,6 +9214,8 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         // to the five `bank_account_*` invoice columns; surfaced on
         // the list + detail wire shape via `load_invoice_bank_snapshot_in_tx`.
         bank_snapshot,
+        // ADR-0123 — threaded from the caller; resolved in-tx downstream.
+        promote_draft_id,
     )
     .await
 }

@@ -197,6 +197,8 @@ async fn override_round_trips_through_duckdb() {
         &UnreachableProvider,
         actor,
         None,
+        // ADR-0123 — no shipment origin on this fixture path.
+        None,
     )
     .await
     .expect("issue happy path with override");
@@ -232,6 +234,8 @@ async fn override_round_trips_as_none_when_unset() {
         fixture_supplier(),
         &UnreachableProvider,
         actor,
+        None,
+        // ADR-0123 — no shipment origin on this fixture path.
         None,
     )
     .await
@@ -270,6 +274,8 @@ async fn empty_override_normalised_to_none() {
         &UnreachableProvider,
         actor,
         None,
+        // ADR-0123 — no shipment origin on this fixture path.
+        None,
     )
     .await
     .expect("issue happy path with whitespace override");
@@ -306,6 +312,8 @@ async fn malformed_override_rejected_before_issuance() {
         fixture_supplier(),
         &UnreachableProvider,
         actor,
+        None,
+        // ADR-0123 — no shipment origin on this fixture path.
         None,
     )
     .await;
