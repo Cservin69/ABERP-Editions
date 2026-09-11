@@ -260,6 +260,35 @@ pub struct InvoiceDraftCreatedPayload {
     /// (a later `partners.eu_vat_number` edit rewrites none of them).
     #[serde(default)]
     pub customer_community_vat_number: Option<String>,
+    /// ADR-0123 §D2 — the shipment this invoice bills, as derived from the
+    /// `invoice_draft` ROW it was promoted from. `Some(_)` only for invoices
+    /// minted through the promote route; `None` for every invoice issued
+    /// through the ordinary form, and for every invoice predating ADR-0123.
+    ///
+    /// **`None` is a faithful "no recorded shipment origin", never "unknown".**
+    /// ADR-0123 rejected inferring the link from partner + product + qty: a
+    /// heuristic join is wrong exactly when two similar shipments are in
+    /// flight, and a guess written into an append-only ledger cannot be
+    /// withdrawn.
+    ///
+    /// A `drf_*` draft can legitimately have no dispatch (a quote pickup
+    /// passes `source_dispatch_id: None`), so `source_draft_id` may be
+    /// `Some(_)` while this is `None`. That pairing means "promoted, from a
+    /// non-shipment draft" and is not a gap.
+    #[serde(default)]
+    pub source_dispatch_id: Option<String>,
+    /// ADR-0123 §D2 — the work order behind the shipment, carried from the
+    /// same draft row. Same `None` semantics as [`Self::source_dispatch_id`].
+    #[serde(default)]
+    pub source_wo_id: Option<String>,
+    /// ADR-0123 §D2 — the `drf_*` draft this invoice was promoted from.
+    ///
+    /// This is the field that makes the other two auditable: it names the row
+    /// the server read them off, so an inspector can check the derivation
+    /// rather than trust it. Since ADR-0123 §D5 that row is state-flipped
+    /// rather than deleted, so it is still there to check.
+    #[serde(default)]
+    pub source_draft_id: Option<String>,
 }
 
 impl InvoiceDraftCreatedPayload {
@@ -299,6 +328,12 @@ impl InvoiceDraftCreatedPayload {
             // radio choice via `with_customer_vat_status` below.
             customer_vat_status: None,
             customer_community_vat_number: None,
+            // ADR-0123 — populated only by the promote route (slice 2);
+            // every other construction path faithfully records no
+            // shipment origin rather than inferring one.
+            source_dispatch_id: None,
+            source_wo_id: None,
+            source_draft_id: None,
         }
     }
 
@@ -351,6 +386,12 @@ impl InvoiceDraftCreatedPayload {
             // radio choice via `with_customer_vat_status` below.
             customer_vat_status: None,
             customer_community_vat_number: None,
+            // ADR-0123 — populated only by the promote route (slice 2);
+            // every other construction path faithfully records no
+            // shipment origin rather than inferring one.
+            source_dispatch_id: None,
+            source_wo_id: None,
+            source_draft_id: None,
         }
     }
 
@@ -406,6 +447,12 @@ impl InvoiceDraftCreatedPayload {
             // radio choice via `with_customer_vat_status` below.
             customer_vat_status: None,
             customer_community_vat_number: None,
+            // ADR-0123 — populated only by the promote route (slice 2);
+            // every other construction path faithfully records no
+            // shipment origin rather than inferring one.
+            source_dispatch_id: None,
+            source_wo_id: None,
+            source_draft_id: None,
         }
     }
 
@@ -3098,6 +3145,68 @@ mod tests {
         // path treats `None` and `Some("Domestic")` identically per
         // the back-compat shape.
         assert_eq!(decoded.customer_vat_status, None);
+        // ADR-0123 — every non-promote construction path records NO shipment
+        // origin. `None` here is the faithful answer, not a missing value.
+        assert_eq!(decoded.source_dispatch_id, None);
+        assert_eq!(decoded.source_wo_id, None);
+        assert_eq!(decoded.source_draft_id, None);
+    }
+
+    /// ADR-0123 §D2 — the three provenance fields survive a round trip when
+    /// populated, and are emitted as explicit `null` when not.
+    ///
+    /// The **null-not-omitted** half is the load-bearing one. `Option` fields
+    /// here carry `#[serde(default)]` and deliberately NOT
+    /// `skip_serializing_if`: omitting the key would conflate "this invoice has
+    /// no shipment provenance" with "an older binary did not know the field",
+    /// and telling those apart is the entire point of an evidence trail. The
+    /// same distinction is pinned on the dispatch side by
+    /// `shipped_payload_spawned_invoice_id_none_serializes_as_null_not_omitted`.
+    #[test]
+    fn adr0123_provenance_fields_round_trip_and_serialize_as_null_not_omitted() {
+        let invoice = fixture_invoice();
+        let mut p = InvoiceDraftCreatedPayload::from_invoice(&invoice, IdempotencyKey::new());
+
+        // Absent: present in the JSON object, as null.
+        let v: serde_json::Value = serde_json::from_slice(&p.to_bytes()).unwrap();
+        for f in ["source_dispatch_id", "source_wo_id", "source_draft_id"] {
+            assert!(
+                v.get(f).is_some(),
+                "{f} must be PRESENT as null, not dropped from the object"
+            );
+            assert_eq!(v[f], serde_json::Value::Null);
+        }
+
+        // Populated: round-trips by value.
+        p.source_dispatch_id = Some("dsp_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string());
+        p.source_wo_id = Some("wo_1".to_string());
+        p.source_draft_id = Some("drf_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string());
+        let decoded: InvoiceDraftCreatedPayload =
+            serde_json::from_slice(&p.to_bytes()).expect("decode must succeed");
+        assert_eq!(decoded, p);
+    }
+
+    /// A pre-ADR-0123 payload — one whose JSON has none of the three keys —
+    /// still decodes, with the fields defaulting to `None`.
+    ///
+    /// This is what keeps every invoice entry already in the chain readable.
+    /// Without `#[serde(default)]` the new binary would fail to decode its own
+    /// history, which is the failure ADR-0122's manifest-version work was
+    /// about in the bundle layer.
+    #[test]
+    fn a_pre_adr0123_payload_without_the_keys_still_decodes() {
+        let legacy = serde_json::json!({
+            "invoice_id": "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "line_count": 2,
+            "idempotency_key": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        });
+        let decoded: InvoiceDraftCreatedPayload =
+            serde_json::from_slice(&serde_json::to_vec(&legacy).unwrap())
+                .expect("a pre-ADR-0123 entry must still decode");
+        assert_eq!(decoded.source_dispatch_id, None);
+        assert_eq!(decoded.source_wo_id, None);
+        assert_eq!(decoded.source_draft_id, None);
+        assert_eq!(decoded.line_count, 2);
     }
 
     /// PR-97 / ADR-0048 — post-PR-97 shape pin. The

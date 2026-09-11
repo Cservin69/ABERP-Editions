@@ -270,6 +270,10 @@ mod tests {
         let idem = IdempotencyKey::new();
         let mut payload = InvoiceDraftCreatedPayload {
             customer_community_vat_number: None,
+            // ADR-0123 — no shipment origin on this path.
+            source_dispatch_id: None,
+            source_wo_id: None,
+            source_draft_id: None,
             invoice_id: invoice_id.to_string(),
             line_count: line_notes.len(),
             idempotency_key: idem.to_canonical_string(),

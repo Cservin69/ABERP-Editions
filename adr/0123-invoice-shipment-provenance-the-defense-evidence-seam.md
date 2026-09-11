@@ -156,9 +156,29 @@ contains. That is the `[[trust-code-not-operator]]` line.
 
 ### D2 — the reference lives on the invoice, additively
 
-- **Column.** `invoice.source_dispatch_id`, `source_wo_id`, `source_draft_id`
-  — nullable, additive migration, no backfill (pre-ADR-0123 invoices genuinely
-  have no link and must not be made to claim one).
+- **Table.** `invoice_shipment_provenance` in `apps/aberp`, keyed by
+  `(tenant_id, invoice_id)`, carrying `source_draft_id` +
+  `source_dispatch_id` + `source_wo_id`. No backfill — pre-ADR-0123 invoices
+  genuinely have no link and must not be made to claim one.
+
+  > **Correction, made while building slice 1.** The design pass said three
+  > *columns on `invoice`*. That is wrong for this repository: `invoice` lives
+  > in `modules/billing` (`adapters/duckdb_store.rs:93`), which is **shared**,
+  > and Ervin's constraint on F1 was explicit — if the seam touches shared
+  > code, scope the change to Defense. A Defense-scoped table in `apps/aberp`
+  > keeps `modules/billing` untouched by ADR-0123 entirely, and it follows a
+  > precedent already in the tree: `cui_markings` (`crate::cui_marking`) is its
+  > own table rather than columns on `product`, for the same reason — a Defense
+  > compliance concern hangs off a generic entity without reshaping it.
+  >
+  > The "NOT NULLed on delete" property is unaffected and arguably stronger:
+  > `delete_draft_in_tx` reaches `dispatches.spawned_invoice_id` and the
+  > `invoice_draft` row, and has no path to a separate table either.
+  >
+  > **`source_dispatch_id` is NOT unique in that table.** One dispatch
+  > legitimately maps to several invoices over time — D5's storno-and-reissue
+  > case — so a `UNIQUE` there would refuse an ordinary correction. Pinned by
+  > `one_dispatch_may_carry_more_than_one_invoice`.
 - **Audit payload.** Three `Option<String>` fields on
   `InvoiceDraftCreatedPayload`, `#[serde(default)]`, following the four
   additive fields already on it (`nav_xml_path`, `currency`, `exchange_rate`,
@@ -384,8 +404,8 @@ Each slice runs the full local gate suite and integrates to local main before
 the next starts.
 
 1. **Slice 1 — the reference and the state column, with nothing writing them.**
-   The additive migration (`invoice.source_dispatch_id` / `source_wo_id` /
-   `source_draft_id`, and `invoice_draft.state` defaulting to `Staged`), the
+   The `invoice_shipment_provenance` table (see D2's correction) and the
+   additive `invoice_draft.state` migration reading `NULL` as `Staged`, the
    three `Option` payload fields with round-trip pins, and the read helper that
    resolves an invoice's provenance. Inert by construction: nothing populates
    any of it, so the slice is provably behaviour-preserving.

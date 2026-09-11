@@ -117,6 +117,60 @@ ALTER TABLE invoice_draft
     ADD COLUMN IF NOT EXISTS source_quote_id VARCHAR;
 ";
 
+/// ADR-0123 §D5 — additive migration adding `state`.
+///
+/// The draft stops being a thing that is deleted on promotion and becomes the
+/// shipment's standing billing-provenance record: `staged` → `promoted`.
+///
+/// **Why, concretely.** With promote deleting the draft, an ordinary
+/// correction loses the shipment link: storno the invoice, issue a corrected
+/// one, and there is no draft left to promote, so the replacement goes through
+/// the plain form carrying no provenance. Keeping the row costs one nullable
+/// column and survives that.
+///
+/// Pre-ADR-0123 rows fill with `NULL`, which reads as `staged` — faithful,
+/// because nothing had been promoted before this migration existed. DuckDB v1
+/// has no `ADD COLUMN ... NOT NULL DEFAULT`, so nullable + read-side default is
+/// the same convergence the PR-44γ currency ladder documents.
+const INVOICE_DRAFT_ADR0123_MIGRATION_SQL: &str = "
+ALTER TABLE invoice_draft
+    ADD COLUMN IF NOT EXISTS state VARCHAR;
+";
+
+/// Lifecycle of an `invoice_draft` row (ADR-0123 §D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftState {
+    /// Spawned by a shipment (or a quote pickup) and awaiting an invoice.
+    Staged,
+    /// An invoice has been minted from this draft. The row is kept as the
+    /// shipment's provenance record; it is NOT work awaiting an operator.
+    Promoted,
+}
+
+impl DraftState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DraftState::Staged => "staged",
+            DraftState::Promoted => "promoted",
+        }
+    }
+
+    /// Parse a stored value. `NULL` and an unknown string both read as
+    /// [`DraftState::Staged`].
+    ///
+    /// Reading an unknown value as `Staged` is the SAFE direction: `Staged`
+    /// means "still awaiting an invoice", so a row nobody can classify stays
+    /// visible as work rather than silently disappearing from the operator's
+    /// list. The opposite default would hide it.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some("promoted") => DraftState::Promoted,
+            _ => DraftState::Staged,
+        }
+    }
+}
+
 /// Idempotent `CREATE TABLE IF NOT EXISTS` for the `invoice_draft`
 /// table. Same boot-time posture as `incoming_invoices::ensure_schema`
 /// / `restore_from_nav_outgoing::ensure_schema`.
@@ -130,7 +184,9 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(INVOICE_DRAFT_SCHEMA_SQL)
         .context("ensure invoice_draft schema")?;
     conn.execute_batch(INVOICE_DRAFT_S255_MIGRATION_SQL)
-        .context("apply S255 invoice_draft migration (source_quote_id)")
+        .context("apply S255 invoice_draft migration (source_quote_id)")?;
+    conn.execute_batch(INVOICE_DRAFT_ADR0123_MIGRATION_SQL)
+        .context("apply ADR-0123 invoice_draft migration (state)")
 }
 
 // ──────────────────────────────────────────────────────────────────────

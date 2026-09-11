@@ -80,8 +80,13 @@ pub mod export_shipment_bundle;
 pub mod first_launch;
 pub mod fs;
 pub mod incoming_invoices;
+// ADR-0123 — invoice<->shipment provenance (the F1 defense evidence seam).
+// A Defense-scoped table in this crate rather than columns on
+// `modules/billing`'s shared `invoice`, so the frozen prod-invoice line's
+// schema is untouched. Same shape as `cui_marking`.
 pub mod invoice_bank_snapshot;
 pub mod invoice_currency_metadata;
+pub mod invoice_provenance;
 // S236 / PR-230b — pre-allocation Draft state. New `invoice_draft`
 // table + `BillingInvoiceSpawner` replaces `NoopInvoiceSpawner` from
 // PR-230. Closes the Stage 3 → Stage 1 hand-off without burning a

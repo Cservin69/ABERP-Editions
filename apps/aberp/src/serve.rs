@@ -113,6 +113,7 @@ use crate::invoice_currency_metadata::{
     load_invoice_currency_metadata_in_tx, InvoiceCurrencyMetadata,
 };
 use crate::invoice_draft;
+use crate::invoice_provenance;
 use crate::issue_invoice::{self, InvoiceInputJson};
 use crate::issue_modification;
 use crate::issue_preflight::{
@@ -2060,6 +2061,12 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             )
         })?;
         invoice_draft::ensure_schema(&conn).context("ensure invoice_draft schema at serve boot")?;
+        // ADR-0123 — the invoice<->shipment provenance table. Created at boot
+        // beside `invoice_draft` because the promote route (slice 2) writes
+        // both inside ONE transaction, and a missing table there would abort a
+        // money path rather than a boot.
+        invoice_provenance::ensure_schema(&conn)
+            .context("ensure invoice_shipment_provenance schema at serve boot")?;
     }
 
     // S177 / PR-177 — pin the ap_invoice (incoming AP-side mirror)
@@ -34337,6 +34344,10 @@ mod tests {
     fn write_draft(ledger: &mut Ledger, actor: &Actor, invoice_id: &str, idem: IdempotencyKey) {
         let payload = audit_payloads::InvoiceDraftCreatedPayload {
             customer_community_vat_number: None,
+            // ADR-0123 — no shipment origin on this path.
+            source_dispatch_id: None,
+            source_wo_id: None,
+            source_draft_id: None,
             invoice_id: invoice_id.to_string(),
             line_count: 1,
             idempotency_key: idem.to_canonical_string(),

@@ -1275,6 +1275,10 @@ mod tests {
         // with an InvoiceStornoIssued chain-link naming it the storno.
         let draft = audit_payloads::InvoiceDraftCreatedPayload {
             customer_community_vat_number: None,
+            // ADR-0123 — no shipment origin on this path.
+            source_dispatch_id: None,
+            source_wo_id: None,
+            source_draft_id: None,
             invoice_id: "inv_STORNO".to_string(),
             line_count: 1,
             idempotency_key: idem.to_canonical_string(),
