@@ -55,12 +55,22 @@ impl DispatchCreatedPayload {
 /// `mes.dispatch_shipped` payload — emitted once per successful
 /// `mark_shipped` call. Per ADR-0064 §6 + invariant #1 this lands in
 /// the SAME transaction as the dispatch state flip, the
-/// `stock_movement` row, and the `spawned_invoice_id` UPDATE. The
-/// audit-trail walks both ways: from dispatch to invoice via this
-/// payload's `spawned_invoice_id`, and from the invoice draft's own
-/// `InvoiceDraftCreated` audit entry back to the dispatch via the
-/// invoice idempotency-key suffix (`derive_from(dispatch.dsp_id,
-/// "spawn_invoice")`).
+/// `stock_movement` row, and the `spawned_invoice_id` UPDATE.
+///
+/// **CORRECTED 2026-09-11 (ADR-0123 §D8).** This comment claimed the
+/// audit trail "walks both ways", the reverse hop running from the
+/// draft's `InvoiceDraftCreated` entry back to the dispatch via
+/// `derive_from(dispatch.dsp_id, "spawn_invoice")`. `derive_from` was
+/// never implemented anywhere in the tree, the real key is
+/// `format!("{}:spawn_invoice", inputs.idempotency_key)` (no dispatch
+/// id in it), and the draft fires `InvoiceStaged` rather than
+/// `InvoiceDraftCreated`. Only the FORWARD hop existed — and even that
+/// points at a `drf_*` draft, and is NULLed when the draft is deleted.
+///
+/// The reverse hop is real as of ADR-0123, as a typed field on the
+/// invoice (`source_dispatch_id` / `source_wo_id` / `source_draft_id`,
+/// and the `invoice_shipment_provenance` row), never as a substring of
+/// an idempotency key.
 ///
 /// `spawned_invoice_id` is `Option<String>` so the v1 deferred-spawner
 /// posture (the production `InvoiceSpawner` is a no-op in PR-230;

@@ -1000,12 +1000,32 @@ pub enum EventKind {
     ///
     /// Per ADR-0064 §5 + §"Invariants pinned" #1 this entry lands in
     /// the SAME transaction as the dispatch state flip, the
-    /// `stock_movements` row, and the `spawned_invoice_id` UPDATE. The
-    /// audit-trail walks both ways: from dispatch to invoice via this
-    /// payload's `spawned_invoice_id`; from the invoice draft's own
-    /// `InvoiceDraftCreated` entry back to the dispatch via the
-    /// invoice idempotency-key suffix (`derive_from(dispatch.dsp_id,
-    /// "spawn_invoice")`).
+    /// `stock_movements` row, and the `spawned_invoice_id` UPDATE.
+    ///
+    /// # What `spawned_invoice_id` actually holds, and what it does not
+    ///
+    /// It holds a `drf_<ULID>` **draft** id, not an invoice id — the
+    /// spawner returns `draft.drf_id` (`BillingInvoiceSpawner::spawn`).
+    /// The forward hop dispatch → draft is therefore real; it is also
+    /// **cleared** when the draft is deleted
+    /// (`null_spawned_invoice_id_in_tx`), so it is not a durable record.
+    ///
+    /// **CORRECTED 2026-09-11 (ADR-0123 §D8).** This comment previously
+    /// claimed the trail "walks both ways", the reverse hop running from
+    /// the draft's `InvoiceDraftCreated` entry back to the dispatch via
+    /// an idempotency-key suffix `derive_from(dispatch.dsp_id,
+    /// "spawn_invoice")`. Every part of that was false: `derive_from`
+    /// existed in three doc comments and nowhere else in the tree; the
+    /// real key is `format!("{}:spawn_invoice", inputs.idempotency_key)`,
+    /// built from the ship request's key and carrying no dispatch id; and
+    /// the draft fires `InvoiceStaged`, not `InvoiceDraftCreated`.
+    ///
+    /// The reverse hop is now real, and it is a typed field rather than a
+    /// parsed key: an invoice promoted from a draft records
+    /// `source_dispatch_id` / `source_wo_id` / `source_draft_id` on its
+    /// own `InvoiceDraftCreated` payload and in
+    /// `invoice_shipment_provenance` (ADR-0123). An invoice issued
+    /// through the ordinary form still records none — faithfully.
     ///
     /// `mes.` prefix per ADR-0064 §6.
     ///
@@ -1023,13 +1043,27 @@ pub enum EventKind {
     ///
     /// Carries `draft_id` (`drf_<ULID>`), `tenant_id`, `partner_id`,
     /// the operator/adapter `actor` string, the F8 idempotency key,
-    /// and optionally the `source_dispatch_id` so a future audit walk
-    /// can reconstruct "this draft was spawned by dispatch dsp_X
-    /// against partner ptr_Y on behalf of WO wo_Z". The chain
-    /// continues at promotion time via the operator-issued
-    /// `InvoiceSequenceReserved` + `InvoiceDraftCreated` pair, which
-    /// references the draft id in their idempotency key suffix
-    /// (`derive_from(draft.drf_id, "issue")`).
+    /// and optionally the `source_dispatch_id` so an audit walk can
+    /// reconstruct "this draft was spawned by dispatch dsp_X against
+    /// partner ptr_Y on behalf of WO wo_Z".
+    ///
+    /// **CORRECTED 2026-09-11 (ADR-0123 §D8).** This comment previously
+    /// stated that "the chain continues at promotion time via the
+    /// operator-issued `InvoiceSequenceReserved` + `InvoiceDraftCreated`
+    /// pair, which references the draft id in their idempotency key
+    /// suffix (`derive_from(draft.drf_id, "issue")`)". It did not:
+    /// `derive_from` was never implemented, the invoice's idempotency key
+    /// never carried a draft-id suffix, and there was no promotion — the
+    /// SPA issued an invoice from scratch and the draft was deleted
+    /// afterwards, so the chain simply ended here.
+    ///
+    /// It continues now through the promote route, and through a **typed
+    /// field, not a key substring**: the invoice records
+    /// `source_draft_id` (plus `source_dispatch_id` / `source_wo_id`) on
+    /// its `InvoiceDraftCreated` payload and in
+    /// `invoice_shipment_provenance`. An idempotency key remains exactly
+    /// that — it is not a traceability channel, and reading one as
+    /// provenance means parsing a string whose format may change.
     ///
     /// `invoice.` prefix family because the entry is keyed by a
     /// `drf_<ULID>` id; the per-invoice export bundle filters by the
