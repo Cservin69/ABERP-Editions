@@ -93,14 +93,57 @@ fn s344_mock_provider_name_is_mock() {
     assert_eq!(MockProvider::new().name(), "mock");
 }
 
-#[test]
-fn s344_mock_provider_logs_warning_on_construction() {
+/// Run `f` with a scoped `tracing` subscriber installed and return everything
+/// it logged at WARN or above.
+///
+/// # Why this is serialized, and why it rebuilds the interest cache
+///
+/// Both production-guard tests in this module (`MockProvider` and
+/// `UsDodCacProvider`) capture a `tracing` WARN emitted during construction.
+/// Run in parallel they were **flaky** — measured at 2 failures in 120 runs of
+/// the test binary at `--test-threads=16`, each time as a captured buffer that
+/// was simply `""`, and on either test indifferently. Alone, each passes
+/// indefinitely; the crate's suite is fast enough that the pair almost always
+/// interleaves.
+///
+/// The cause is `tracing`'s per-callsite **`Interest` cache**, which is
+/// global while `tracing::subscriber::with_default` is only *thread-local*.
+/// A callsite first reached while no subscriber has ever been set caches
+/// `Interest::never()`, after which the `warn!` macro short-circuits without
+/// ever consulting the current thread's subscriber. Setting a scoped default
+/// rebuilds that cache — which is why a single-threaded reproduction of the
+/// poisoning always passed — so the surviving window is two threads racing
+/// their FIRST `set_default` against each other's callsite registration.
+///
+/// Two things close it, and both are needed:
+///
+/// 1. **One capture at a time** ([`CAPTURE_LOCK`]). The race needs two
+///    concurrent first-time scoped defaults; there is now at most one.
+/// 2. **`rebuild_interest_cache()` after the subscriber is installed.** This
+///    re-asks every callsite, and with a scoped subscriber in place the answer
+///    is `Interest::sometimes()` — "call `enabled()` each time" — which routes
+///    the decision through the thread-local dispatcher instead of a stale
+///    global verdict. It also clears any `never` cached by an earlier test.
+///
+/// What this deliberately does **not** do is weaken the assertion. These tests
+/// exist to prove a stub identity provider announces itself loudly, which is a
+/// production-safety guard; a "fix" that let them pass without the WARN
+/// actually being emitted would be worse than the flake. Deleting the `warn!`
+/// from either provider still reds them.
+fn capture_warn_logs(f: impl FnOnce()) -> String {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
 
-    // An in-memory MakeWriter that accumulates every log line into a shared
-    // buffer, so the test can assert the WARN line was emitted.
+    /// Serializes the WARN-capturing tests. See [`capture_warn_logs`].
+    ///
+    /// Poisoning is ignored on purpose: if one capture test panics, the other
+    /// should still report its own verdict rather than fail with a lock error
+    /// that hides which guard is actually missing.
+    static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+    let _serialized = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    /// An in-memory `MakeWriter` accumulating every log line into one buffer.
     #[derive(Clone)]
     struct BufMaker(Arc<Mutex<Vec<u8>>>);
     struct BufGuard(Arc<Mutex<Vec<u8>>>);
@@ -128,10 +171,22 @@ fn s344_mock_provider_logs_warning_on_construction() {
         .finish();
 
     tracing::subscriber::with_default(subscriber, || {
-        let _p = MockProvider::new();
+        // Order matters: the subscriber must already be the thread's default
+        // when the cache is rebuilt, or the rebuild re-derives the same stale
+        // verdict it is meant to clear.
+        tracing::callsite::rebuild_interest_cache();
+        f();
     });
 
-    let logged = String::from_utf8(buf.lock().unwrap().clone()).expect("utf8 log");
+    let logged = buf.lock().unwrap().clone();
+    String::from_utf8(logged).expect("utf8 log")
+}
+
+#[test]
+fn s344_mock_provider_logs_warning_on_construction() {
+    let logged = capture_warn_logs(|| {
+        let _p = MockProvider::new();
+    });
     assert!(
         logged.contains("MOCK — NOT FOR PRODUCTION USE"),
         "construction must emit the production-guard WARN; got: {logged:?}"
@@ -306,41 +361,9 @@ fn s363_cac_provider_name_is_us_dod_cac() {
 
 #[test]
 fn s363_cac_provider_logs_warning_on_construction() {
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone)]
-    struct BufMaker(Arc<Mutex<Vec<u8>>>);
-    struct BufGuard(Arc<Mutex<Vec<u8>>>);
-    impl Write for BufGuard {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> MakeWriter<'a> for BufMaker {
-        type Writer = BufGuard;
-        fn make_writer(&'a self) -> Self::Writer {
-            BufGuard(self.0.clone())
-        }
-    }
-
-    let buf = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(BufMaker(buf.clone()))
-        .with_max_level(tracing::Level::WARN)
-        .without_time()
-        .finish();
-
-    tracing::subscriber::with_default(subscriber, || {
+    let logged = capture_warn_logs(|| {
         let _p = UsDodCacProvider::new();
     });
-
-    let logged = String::from_utf8(buf.lock().unwrap().clone()).expect("utf8 log");
     assert!(
         logged.contains("US-DoD-CAC STUB — NOT FOR PRODUCTION USE"),
         "construction must emit the production-guard WARN; got: {logged:?}"
