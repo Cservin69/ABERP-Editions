@@ -1171,9 +1171,8 @@ mod tests {
         );
         without.unit_set_sha256 = None;
         let mut with = without.clone();
-        with.unit_set_sha256 = Some(
-            "9f2c0ca1a6b1f0a1d1d3f6e4c7b8a95043210fedcba98765432100123456789ab".into(),
-        );
+        with.unit_set_sha256 =
+            Some("9f2c0ca1a6b1f0a1d1d3f6e4c7b8a95043210fedcba98765432100123456789ab".into());
 
         let a = render(&inputs(&without, &lines)).unwrap();
         let b = render(&inputs(&with, &lines)).unwrap();

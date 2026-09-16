@@ -2929,7 +2929,7 @@ fn a_lot_level_characteristic_measured_as_a_lot_fact_releases_the_shipment() {
 // froze over`", and these two tests are why that claim is false.
 
 #[test]
-fn a_swapped_MIDDLE_serial_must_not_pass_the_drift_check() {
+fn a_swapped_middle_serial_must_not_pass_the_drift_check() {
     let db = setup();
     let mut conn = Connection::open(&db).unwrap();
     let buyer = create_partner(
@@ -2970,7 +2970,9 @@ fn a_swapped_MIDDLE_serial_must_not_pass_the_drift_check() {
 
     let disp = dispatch(&conn, "dsp-mid");
     match resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap() {
-        QcReportGate::Blocked { reason, qcr_id: id, .. } => {
+        QcReportGate::Blocked {
+            reason, qcr_id: id, ..
+        } => {
             assert_eq!(reason, QcReportBlockReason::UnitDrift);
             assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
         }
@@ -3027,7 +3029,9 @@ fn a_rewritten_part_uid_must_not_pass_the_drift_check() {
 
     let disp = dispatch(&conn, "dsp-uid");
     match resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap() {
-        QcReportGate::Blocked { reason, qcr_id: id, .. } => {
+        QcReportGate::Blocked {
+            reason, qcr_id: id, ..
+        } => {
             assert_eq!(reason, QcReportBlockReason::UnitDrift);
             assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
         }

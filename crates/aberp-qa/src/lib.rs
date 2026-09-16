@@ -80,11 +80,10 @@ pub use qc::{
     freeze_report, get_drawing_ref, get_report, issuance_chain_ref, issue_report,
     list_drawing_refs, list_report_lines, list_reports_for_dispatch, list_reports_for_wo,
     record_drawing_ref, record_render, serial_range_of, summarise, unit_set_digest, void_report,
-    Accountability,
-    AccountabilityCounts, CharacteristicDesignator, CharacteristicType, Disposition, DraftLine,
-    FreezeReportInputs, InspectionMethod, NewPartDrawingRef, PartDrawingRef, QcReport,
-    QcReportKind, QcReportLine, QcReportState, QcReportTemplate, ReportCustomer,
-    ReportTraceability, ReportUnit,
+    Accountability, AccountabilityCounts, CharacteristicDesignator, CharacteristicType,
+    Disposition, DraftLine, FreezeReportInputs, InspectionMethod, NewPartDrawingRef,
+    PartDrawingRef, QcReport, QcReportKind, QcReportLine, QcReportState, QcReportTemplate,
+    ReportCustomer, ReportTraceability, ReportUnit,
 };
 
 /// Apply both QA (`V001`) and QC (`V002`) schemas. Idempotent. Extended

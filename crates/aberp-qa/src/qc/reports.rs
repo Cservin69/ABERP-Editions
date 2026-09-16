@@ -2257,7 +2257,10 @@ mod tests {
 
     /// The serial range is a human-readable snapshot, sorted, with a count.
     fn u(uid: &str, serial: &str) -> ReportUnit {
-        ReportUnit { part_uid: uid.into(), part_serial: serial.into() }
+        ReportUnit {
+            part_uid: uid.into(),
+            part_serial: serial.into(),
+        }
     }
 
     /// The collision a delimiter join would have. This is the whole fix.
