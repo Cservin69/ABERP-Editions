@@ -2908,3 +2908,132 @@ fn a_lot_level_characteristic_measured_as_a_lot_fact_releases_the_shipment() {
         QcReportGate::Pass
     );
 }
+
+// ── ADR-0199 residual 10 — the drift key cannot see the unit SET ─────────
+//
+// `serial_range_of` builds `"{first} … {last} ({n} units)"` from
+// `part_serial` ALONE, and `resolve_qc_report_gate` compares that string.
+// Two shapes therefore compare equal when they are not:
+//
+//   A. the same first serial, last serial and count, a DIFFERENT middle;
+//   B. every serial preserved, every `part_uid` REWRITTEN.
+//
+// (B) is the worse one: `part_uid` is what the per-serial measurement join
+// and the NCR belt key on, so it is the identity that decides coverage and
+// the one the comparison cannot see.
+//
+// Both are out-of-band-only, because `record_part_marks` writes the set once
+// and refuses a second write. That is not a mitigation — an out-of-band write
+// is precisely the case this check exists to catch. The code's own comment
+// claims equality here is "exactly `the marks today are the marks the report
+// froze over`", and these two tests are why that claim is false.
+
+#[test]
+fn a_swapped_MIDDLE_serial_must_not_pass_the_drift_check() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    // `issue_report_for` freezes against "wo-def", so the marks and the
+    // dispatch have to live on that work order too.
+    seed_wo(&conn, "wo-def", "3");
+    seed_dispatch(&conn, "dsp-mid", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 3);
+
+    let plan = seed_plan(&conn, "Bore D", "1", true);
+    for u in &units {
+        measure_at(&mut conn, &plan, &u.part_uid, 25.0, now());
+    }
+    let (qcr_id, d) = issue_report_for(&mut conn, &units);
+    assert_eq!(d, Disposition::Accept);
+    let disp = dispatch(&conn, "dsp-mid");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the report covers exactly SN-001, SN-002, SN-003"
+    );
+
+    // Swap ONLY the middle serial, for one that still sorts between the
+    // other two: first, last and count are all unchanged, so the rendered
+    // range string is byte-identical.
+    let mid_uid = &units[1].part_uid;
+    conn.execute(
+        "UPDATE wo_part_marks SET serial_number = 'SN-002X', data_matrix_payload = ?3
+          WHERE tenant_id = ?1 AND part_uid = ?2",
+        params![T, mid_uid, data_matrix_payload(mid_uid, "SN-002X", None)],
+    )
+    .unwrap();
+
+    let disp = dispatch(&conn, "dsp-mid");
+    match resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked { reason, qcr_id: id, .. } => {
+            assert_eq!(reason, QcReportBlockReason::UnitDrift);
+            assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
+        }
+        other => panic!(
+            "a unit the report never enumerated shipped on it: the middle serial \
+             changed and the drift check did not see it — {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn a_rewritten_part_uid_must_not_pass_the_drift_check() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "2");
+    seed_dispatch(&conn, "dsp-uid", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 2);
+
+    let plan = seed_plan(&conn, "Bore D", "1", true);
+    for u in &units {
+        measure_at(&mut conn, &plan, &u.part_uid, 25.0, now());
+    }
+    let (qcr_id, d) = issue_report_for(&mut conn, &units);
+    assert_eq!(d, Disposition::Accept);
+    let disp = dispatch(&conn, "dsp-uid");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the report covers both marked units"
+    );
+
+    // Every serial is preserved; only the UID moves. The measurements that
+    // justified `accept` are keyed on the OLD uid, so after this the units
+    // being shipped have no measurements at all — and the rendered range
+    // string is byte-identical, because it never reads `part_uid`.
+    let fresh = generate_part_uid();
+    conn.execute(
+        "UPDATE wo_part_marks SET part_uid = ?3, data_matrix_payload = ?4
+          WHERE tenant_id = ?1 AND part_uid = ?2",
+        params![
+            T,
+            &units[0].part_uid,
+            &fresh,
+            data_matrix_payload(&fresh, &units[0].part_serial, None)
+        ],
+    )
+    .unwrap();
+
+    let disp = dispatch(&conn, "dsp-uid");
+    match resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked { reason, qcr_id: id, .. } => {
+            assert_eq!(reason, QcReportBlockReason::UnitDrift);
+            assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
+        }
+        other => panic!(
+            "the unit identity the measurement join keys on was rewritten and the \
+             drift check did not see it — {other:?}"
+        ),
+    }
+}
