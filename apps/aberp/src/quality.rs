@@ -942,21 +942,21 @@ pub(crate) fn create_ncr_in_tx(
 /// revocation of the same waiver is refused rather than appended twice, so the
 /// table cannot fill with rows that mean nothing.
 ///
-/// # ROW FIRST, ledger second (§D3) — deliberately the OPPOSITE of the grant
-/// [`grant_ncr_shipment_waiver`] appends BEFORE inserting, because it is the
-/// module's only RELEASE writer and a row without its entry is an unaudited
-/// release. A revocation TIGHTENS the gate, so its residues invert with it:
+/// # ONE transaction on the shared Handle (§D3, revised)
+/// The first draft mirrored [`grant_ncr_shipment_waiver`]'s own
+/// `Connection::open(db_path)` and then argued about ordering: append first
+/// (the grant's choice, because an unaudited RELEASE is the worst residue) or
+/// insert first (a tightening's worst residue being a chain that claims a
+/// withdrawal while the gate still releases).
 ///
-/// - row lands, append fails → the gate blocks with no entry. Recoverable, and
-///   it errs toward refusing to ship.
-/// - append lands, row fails → the chain says the release was withdrawn while
-///   the gate goes on releasing. That is the one to avoid.
-///
-/// Both writers are ordered so the surviving residue leaves the gate REFUSING
-/// rather than releasing. That is the rule; the apparent inconsistency between
-/// them is the rule being applied, not ignored.
+/// **CHECK 10i/10k refused it** — `quality.rs` grew its residual openers from
+/// 11 to 12 and the fingerprint set diverged — and the gate was right twice
+/// over. The ordering question only exists because those two writes are on
+/// different connections. On the shared Handle they are one transaction, so
+/// the revocation row and its ledger entry land together or not at all, and
+/// there is no residue to reason about. ADR-0099's rule, and it makes this
+/// writer strictly stronger than the grant it was copied from.
 pub fn revoke_ncr_shipment_waiver(
-    db_path: &std::path::Path,
     db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
@@ -971,71 +971,74 @@ pub fn revoke_ncr_shipment_waiver(
         ));
     }
 
-    let (revocation, ncr_id, work_order_id) = {
-        let conn = Connection::open(db_path).map_err(|e| {
-            QualityError::Other(anyhow::anyhow!("open DuckDB for waiver revocation: {e}"))
-        })?;
-        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-            .map_err(|e| {
-                QualityError::Other(anyhow::anyhow!(
-                    "PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}"
-                ))
-            })?;
-        ensure_schema(&conn)?;
-        let waiver = list_ncr_shipment_waivers(&conn, tenant.as_str())?
-            .into_iter()
-            .find(|w| w.waiver_id == waiver_id)
-            .ok_or_else(|| QualityError::Invalid(format!("no such waiver: {waiver_id}")))?;
-        if list_ncr_shipment_waiver_revocations(&conn, tenant.as_str())?
-            .iter()
-            .any(|r| r.waiver_id == waiver_id)
-        {
-            return Err(QualityError::IllegalTransition(format!(
-                "waiver {waiver_id} is already revoked — revocation is terminal, and \
-                 re-permitting this shipment takes a NEW waiver"
-            )));
-        }
-        let revocation = NcrShipmentWaiverRevocation {
-            revocation_id: generate_waiver_revocation_id(),
-            waiver_id: waiver.waiver_id.clone(),
-            revoked_by_operator: operator.to_string(),
-            reason: reason.trim().to_string(),
-            revoked_at_utc: now_rfc3339(),
-        };
-        conn.execute(
-            "INSERT INTO ncr_shipment_waiver_revocations \
-             (revocation_id, tenant_id, waiver_id, revoked_by_operator, reason, revoked_at_utc) \
-             VALUES (?1,?2,?3,?4,?5,?6)",
-            params![
-                revocation.revocation_id,
-                tenant.as_str(),
-                revocation.waiver_id,
-                revocation.revoked_by_operator,
-                revocation.reason,
-                revocation.revoked_at_utc,
-            ],
-        )
-        .context("insert ncr_shipment_waiver_revocation row")?;
-        (revocation, waiver.ncr_id, waiver.work_order_id)
+    let mut guard = db
+        .write()
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("shared writer for revocation: {e}")))?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("ensure audit schema: {e}")))?;
+    ensure_schema(&guard)?;
+
+    let waiver = list_ncr_shipment_waivers(&guard, tenant.as_str())?
+        .into_iter()
+        .find(|w| w.waiver_id == waiver_id)
+        .ok_or_else(|| QualityError::Invalid(format!("no such waiver: {waiver_id}")))?;
+    if list_ncr_shipment_waiver_revocations(&guard, tenant.as_str())?
+        .iter()
+        .any(|r| r.waiver_id == waiver_id)
+    {
+        return Err(QualityError::IllegalTransition(format!(
+            "waiver {waiver_id} is already revoked — revocation is terminal, and \
+             re-permitting this shipment takes a NEW waiver"
+        )));
+    }
+
+    let revocation = NcrShipmentWaiverRevocation {
+        revocation_id: generate_waiver_revocation_id(),
+        waiver_id: waiver.waiver_id.clone(),
+        revoked_by_operator: operator.to_string(),
+        reason: reason.trim().to_string(),
+        revoked_at_utc: now_rfc3339(),
     };
 
-    append_event(
-        db,
-        tenant,
-        binary_hash,
-        operator,
+    let tx = guard
+        .transaction()
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("begin revocation tx: {e}")))?;
+    tx.execute(
+        "INSERT INTO ncr_shipment_waiver_revocations \
+         (revocation_id, tenant_id, waiver_id, revoked_by_operator, reason, revoked_at_utc) \
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            revocation.revocation_id,
+            tenant.as_str(),
+            revocation.waiver_id,
+            revocation.revoked_by_operator,
+            revocation.reason,
+            revocation.revoked_at_utc,
+        ],
+    )
+    .context("insert ncr_shipment_waiver_revocation row")?;
+    let meta = LedgerMeta::new(tenant.clone(), binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
         EventKind::NcrShipmentWaiverRevoked,
-        serde_json::json!({
+        serde_json::to_vec(&serde_json::json!({
             "revocation_id": revocation.revocation_id,
             "waiver_id": revocation.waiver_id,
-            "ncr_id": ncr_id,
-            "work_order_id": work_order_id,
+            "ncr_id": waiver.ncr_id,
+            "work_order_id": waiver.work_order_id,
             "reason": revocation.reason,
             "revoked_by_operator": revocation.revoked_by_operator,
             "revoked_at_utc": revocation.revoked_at_utc,
             "operator_user_id": operator,
-        }),
-    )?;
+        }))
+        .expect("serialize revocation payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        None,
+    )
+    .map_err(|e| QualityError::Other(anyhow::anyhow!("append waiver revocation: {e}")))?;
+    tx.commit()
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("commit revocation tx: {e}")))?;
     Ok(revocation)
 }
 

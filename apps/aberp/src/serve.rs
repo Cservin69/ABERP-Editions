@@ -28949,7 +28949,6 @@ async fn handle_revoke_ncr_shipment_waiver(
                 .wait()
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::revoke_ncr_shipment_waiver(
-                state_for_task.db_path.as_path(),
                 &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,

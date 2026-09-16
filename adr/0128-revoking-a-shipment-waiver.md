@@ -51,24 +51,37 @@ back-dated grant silently re-arms a release nobody signed for today. Terminal
 revocation fails toward **refusing to ship**, which is visible and correctable;
 latest-wins fails toward shipping, which is neither.
 
-### D3 — STATED DECISION: row FIRST, ledger second — the mirror of the grant
+### D3 — REVISED: one transaction on the shared Handle, so there is no residue
 
-`grant_ncr_shipment_waiver` appends to the ledger **before** inserting its row,
-deliberately: it is the module's only RELEASE writer, and a row that lands
-without its entry would be an unaudited release.
+**The first draft of this decision was wrong, and the cut-gate caught it.**
 
-A revocation is the opposite act — it *tightens* the gate — so the safe residue
-inverts with it:
+It mirrored `grant_ncr_shipment_waiver`'s own `Connection::open(db_path)` and
+then reasoned carefully about which order to write in:
 
 | | row lands, ledger fails | ledger lands, row fails |
 |---|---|---|
-| **grant** (release) | unaudited release — **worst** | entry for a release that never happened |
-| **revoke** (tighten) | gate blocks, unaudited — recoverable | **gate still releases while the chain says it was revoked — worst** |
+| **grant** (release) | unaudited release — worst | entry for a release that never happened |
+| **revoke** (tighten) | gate blocks, unaudited — recoverable | gate still releases while the chain says it was revoked — worst |
 
-So the revoke writes its row first. Both writers are ledger-first *or*
-row-first according to which residue leaves the gate refusing rather than
-releasing, and this ADR states that as the rule rather than leaving two
-writers looking inconsistent.
+…and concluded row-first. CHECK 10i and CHECK 10k refused the build:
+
+```
+✗ quality.rs grew its residual openers (12 > frozen 11) — the deferred surface
+  may not grow; migrate the new opener onto the Handle
+✗ opener fingerprint set DIVERGED
+  > quality.rs|revoke_ncr_shipment_waiver:let conn = Connection::open(db_path)
+```
+
+The gate was right twice. The ordering question **only exists because the two
+writes are on different connections.** On the shared `aberp_db::Handle` they
+are one transaction: the revocation row and its ledger entry land together or
+not at all, and there is no residue to order. That is ADR-0099's rule, and it
+makes this writer strictly stronger than the grant it was copied from — the
+grant keeps its ledger-first ordering because its opener is in the frozen set
+and migrating it is a separate change with its own blast radius.
+
+The table above is kept because it is still the right way to reason about a
+writer that *cannot* be atomic. It simply does not apply to this one.
 
 ### D4 — STATED DECISION: this earns a new `EventKind`
 
