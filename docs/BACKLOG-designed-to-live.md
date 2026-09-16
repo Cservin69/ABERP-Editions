@@ -1786,6 +1786,18 @@ about, and both are recorded here rather than folded into a slice.
 <a id="f1"></a>
 ### F1 — an outgoing invoice has no provenance back to the shipment it bills
 
+**✅ CLOSED 2026-09-16 — ADR-0123, landed `dc5ff00`.** The finding below is
+kept as the record of what was found; it is no longer the state of the code.
+Six sites were verified in the end, not four. What shipped: a real
+`POST /api/invoice-drafts/:id/promote` that mints the invoice inside
+`run_single_tx`'s existing single transaction, a Defense-scoped
+`invoice_shipment_provenance` table, a draft `state` flip (`Staged` →
+`Promoted`) instead of the delete that used to erase the link, a
+detector that reads the CHAIN rather than the table, and a partner-mismatch
+guard that refuses an unsaved buyer outright. ADR-0123 §D8 also corrected the
+three `EventKind` doc comments that asserted a `derive_from` traceability chain
+which existed at none of its hops and was defined nowhere.
+
 **Verified at four sites, in shipped code**, while trying to build the
 invoice→dispatch join D-99 residual 1 assumed existed:
 
@@ -1826,6 +1838,18 @@ deliberately not bundled behind a compliance feature.
 
 <a id="f2"></a>
 ### F2 — the no-store decision has an unstated retention horizon
+
+**✅ DECIDED 2026-09-16 — ADR-0124, landed `c88618a`.** Option **(a)**:
+accept the horizon, build no reproducibility machinery, correct the overclaim
+in ADR-0199 §D7 and in `qc_report.rs` in place, marked and dated. The finding
+below stands as written.
+
+**One half of the stated reasoning did not survive verification and is recorded
+as an open gap:** the decision rested partly on the issued PDF being retained in
+the e-mail archive. It is not. Phase 1c was never built, no mail path references
+QC at all, and the invoice mail path renders on the fly and retains nothing — so
+there is today **no archival copy of an issued QC report anywhere in ABERP**.
+See ADR-0124 §4. That gap stays Ervin's call.
 
 ADR-0199 §D7 stores no report bytes: the hash is pinned, the document is
 *derivable*, and `aberp-qc-pdf` is a pure renderer so a re-render reproduces

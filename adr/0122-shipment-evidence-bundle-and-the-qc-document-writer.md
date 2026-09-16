@@ -459,6 +459,9 @@ already asserts first, so the subcommand gate is belt-and-braces).
 
 ### F1 — the outgoing invoice has no provenance back to the shipment it bills
 
+**✅ CLOSED 2026-09-16 by ADR-0123 (`dc5ff00`).** Recorded below as it stood
+when this ADR was written. The seam is closed in code; see ADR-0123.
+
 Stated in full in Context. Summary of the mechanism: the dispatch spawns a
 `drf_*` draft; promotion is a form-fill the SPA performs; `issue_invoice`
 records no `drf_*`; the draft is then deleted and its dispatch pointer NULLed.
@@ -479,6 +482,11 @@ call whether it is scheduled, and at what priority relative to the rest of the
 Defense backlog. A backlog entry is added by this ADR's doc slice.
 
 ### F2 — the no-store decision has an unstated retention horizon
+
+**✅ DECIDED 2026-09-16 by ADR-0124 (`c88618a`)** — accept the drift, correct
+the overclaim, build nothing. ADR-0124 §4 records a NEW gap found while
+verifying the reasoning: there is no archival copy of an issued QC report
+anywhere in ABERP.
 
 Surfaced by D2's honest branch. Because ADR-0199 §D7 stores no bytes, a report's
 document exists only for as long as the renderer that produced it does.
