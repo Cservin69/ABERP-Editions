@@ -2702,12 +2702,17 @@ def _cap_is_buried(cap, rim_caps, mouth, sign) -> bool:
     this one, crosses the axis further OUT, and the axis between the two
     runs inside that face's material.
 
-    Three conditions, and every one of them is load-bearing:
+    Three conditions. **One of them is pinned by the corpus and two are
+    not** — see the mutation record at the end of this docstring, which is
+    written down rather than discovered later:
 
     - **Strictly further out.** A tie is never a burial: two faces meeting
       the axis at one level is exactly the case
       :meth:`_EndEvidence._rim_winner` gives every cap at the winning level
-      a vote in, and this must not quietly disenfranchise them.
+      a vote in, and this must not quietly disenfranchise them. Reachable
+      in principle — two SEVERED faces tying at one level would bury each
+      other, and `min` would then jump to a deeper cap — but no part in the
+      corpus ties across a severance, so **nothing here tests it**.
     - **Severed** (:func:`_faces_meet_at_this_mouth`). Where the junction
       survived, the edge is a real barrier and
       :meth:`_EndEvidence._skin_over_axis` already has the evidence. This
@@ -2727,6 +2732,28 @@ def _cap_is_buried(cap, rim_caps, mouth, sign) -> bool:
     face wins although the axis pierces a hole in it. Measured on a
     randomised 108-part boss family: ten parts read the bare plate,
     3.29 mm short on the exemplar, always short.
+
+    # Mutation record (2026-09-16) — 5 killed, 4 SURVIVED
+    Killed: disabling the veto; removing the severance gate (12 reds);
+    inverting it (14); flipping :func:`_point_is_inside_material`'s sign;
+    and removing D3's "buriedness stands alone" fallback in
+    :meth:`_EndEvidence._rim_winner`.
+
+    **Survived, and each is recorded rather than papered over** — a
+    surviving mutation here means *unreachable in this corpus*, not
+    *untested*, and a future change to any of the four will NOT be caught:
+
+    - letting ties bury (the first condition above);
+    - asking the material question at the cap's own point instead of the
+      SEGMENT midpoint — equivalent on every part here, and the midpoint is
+      kept because two surfaces may touch exactly at a cap;
+    - removing :data:`BURIED_BAND_MM`, the same unreachable-band result
+      :func:`_root_is_in_its_own_half`'s ``pad`` already has;
+    - widening :func:`_faces_meet_at_this_mouth` back to the whole solid.
+      This one is EXPECTED to survive: ADR-0125 round 1 measured the two
+      gates as behaviourally identical on the whole corpus and narrowed it
+      on argument, not on evidence. Nothing here can tell them apart, so
+      nothing here will stop someone widening it again.
     """
     level = sign * cap[0]
     for other in rim_caps:
