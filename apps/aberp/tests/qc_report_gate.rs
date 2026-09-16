@@ -3270,7 +3270,9 @@ fn a_post_issuance_stale_calibration_measurement_stops_the_release() {
 
     let disp = dispatch(&conn, "dsp-stale");
     match resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap() {
-        QcReportGate::Blocked { reason, qcr_id: id, .. } => {
+        QcReportGate::Blocked {
+            reason, qcr_id: id, ..
+        } => {
             assert_eq!(reason, QcReportBlockReason::EvidenceDrift);
             assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
         }
@@ -3321,7 +3323,9 @@ fn an_out_of_band_unattributed_measurement_is_a_stated_limit() {
 
     // A failing reading with NOTHING naming what it was taken on.
     let m = meta();
-    let plan_row = aberp_qa::get_inspection_plan(&conn, T, &plan).unwrap().unwrap();
+    let plan_row = aberp_qa::get_inspection_plan(&conn, T, &plan)
+        .unwrap()
+        .unwrap();
     let tx = conn.transaction().unwrap();
     let rec = record_inspection(
         &tx,
