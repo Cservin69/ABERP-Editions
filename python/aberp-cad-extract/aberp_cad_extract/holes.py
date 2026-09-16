@@ -2957,6 +2957,51 @@ class _EdgeFaces:
         return self._faces.get(self._index.FindIndex(edge), ())
 
 
+def _root_is_in_its_own_half(t_root: float, mid: float, at_low: bool, pad: float) -> bool:
+    """Does a candidate root lie in the END it is being offered to?
+
+    The walk already splits evidence at the bore's MIDPOINT so a feature
+    CROSSING the bore cannot be mistaken for one of its ends — but it splits
+    on where the EDGE sits, never on where the ROOT lands. A cap reached
+    through a low-end edge could still contribute a root up in the bore's top
+    half, and :func:`_root_for_end` would then pick it on distance alone.
+
+    That is round 8's N4 one level up. An undercut relief at the BOTTOM of a
+    blind seat has its two poles one relief-diameter apart: the true one below
+    the seat, the phantom up inside the bore. A seat whose relief BREAKS the
+    far face puts them at ``-0.0001`` and ``16.0001`` on a bore spanning
+    ``8..20`` — and nearest-the-mouth picks the phantom by eight HUNDREDTHS of
+    a millimetre (``|16.0001 - 8.04| = 7.96`` against ``|-0.0001 - 8.04| =
+    8.04``). The bore then read 3.9999 deep and THROUGH, entering at
+    ``z = 16.0001`` — a point floating inside solid metal — with its axis
+    INVERTED, against a control of 12.0 BLIND entering at ``z = 20``.
+
+    **This is NOT the side rule rounds 7 and 8 both got wrong.** That one asked
+    which side of the MOUTH a root falls on, and it broke the spherical dimple,
+    whose true root is legitimately inward of where its wall starts — see
+    :func:`_root_for_end` and
+    ``test_r8_a_concave_seat_at_the_MOUTH_keeps_nearest``. This asks the
+    coarser question, which HALF of the bore, and the dimple's true root sits
+    comfortably in its own half. Measured, not argued: the dimple, both domes,
+    the torus wall, the ball-nose and all 50 committed fixtures return
+    bit-identical answers.
+
+    A root exactly at the midpoint is kept for both ends — ``pad`` makes the
+    bound inclusive — because a bore capped at its own middle is a degenerate
+    reading rather than evidence for the far end.
+
+    **The ``pad`` is defensive and is NOT exercised by the corpus.** Mutating
+    the bound to exclude a 2 µm band around the midpoint leaves all 122 tests
+    green, because no fixture and no sweep member lands a root within microns
+    of its own bore's centre. That is recorded rather than papered over: a
+    surviving mutation here means *unreachable*, not *untested*, and a future
+    change to the pad will not be caught by this suite. The direction of the
+    comparison IS pinned — inverting it reds the dome pole, the undercut ball
+    seat and the conical-boss stability pins.
+    """
+    return t_root <= mid + pad if at_low else t_root >= mid - pad
+
+
 def _root_for_end(
     roots: Sequence[Tuple[float, Tuple[float, float, float], bool]],
     t_edge: float,
@@ -3108,6 +3153,9 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
                         root
                         for root in _cap_axis_intersections(face, origin, direction)
                         if (root[0] <= far if at_low else root[0] >= far)
+                        # A root offered to THIS end must lie in this end's own
+                        # half of the bore — see `_root_is_in_its_own_half`.
+                        and _root_is_in_its_own_half(root[0], mid, at_low, pad)
                     ]
                     if not roots:
                         continue

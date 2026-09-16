@@ -2726,9 +2726,19 @@ def test_r7_a_bare_nearest_pick_re_breaks_the_whole_sweep(monkeypatch):
     cutter DIAMETER short and THROUGH — the signature of the inward pole
     winning — and the committed fixtures keep their own guard in
     :func:`test_r6_nearest_root_alone_re_breaks_the_ball_nose`.
+
+    ADR-0112 R9 — :func:`_root_is_in_its_own_half` is a SECOND, independent
+    guard over this same family, so it comes off alongside the on-face
+    preference. Left on, the inward pole never reaches `_root_for_end` and only
+    12 of the 36 cutters go back to reading short — which would quietly turn a
+    revert-proof for the ORIGINAL machinery into a measurement of whichever
+    guard happens to run first.
     """
     import aberp_cad_extract.holes as holes_mod
 
+    monkeypatch.setattr(
+        holes_mod, "_root_is_in_its_own_half", lambda *_a, **_k: True
+    )
     monkeypatch.setattr(
         holes_mod,
         "_root_for_end",
@@ -3234,7 +3244,13 @@ def test_r8_the_undercut_seat_was_short_and_through_before():
     import aberp_cad_extract.holes as holes_mod
 
     original = holes_mod._root_for_end
+    # ADR-0112 R9 — the half-span filter guards this same family from upstream,
+    # so it comes off alongside the on-face preference. With it left on the
+    # inward pole never reaches `_root_for_end` at all and the seats read
+    # CORRECTLY, which would quietly turn this revert-proof into a tautology.
+    original_half = holes_mod._root_is_in_its_own_half
     try:
+        holes_mod._root_is_in_its_own_half = lambda *_a, **_k: True
         holes_mod._root_for_end = (
             lambda roots, t_edge, at_low, radius: min(
                 roots, key=lambda root: abs(root[0] - t_edge)
@@ -3243,6 +3259,7 @@ def test_r8_the_undercut_seat_was_short_and_through_before():
         verdicts = _seat_verdicts(R8_SEAT_RADII, (1e-6, 1e-4, 1e-2))
     finally:
         holes_mod._root_for_end = original
+        holes_mod._root_is_in_its_own_half = original_half
 
     for (radius, undercut), got in verdicts.items():
         nose = radius + undercut
@@ -3373,26 +3390,137 @@ def test_r8_a_concave_seat_at_the_MOUTH_keeps_nearest():
         )
 
 
-def test_r8_two_siblings_of_the_undercut_family_are_flagged_not_fixed():
-    """FLAGGED, and pinned at the value `origin/main` already gave.
+def test_r9_a_seat_whose_relief_breaks_the_far_face_is_not_inverted():
+    """ADR-0112 R9 — residual 2, closed by :func:`_root_is_in_its_own_half`.
 
-    Two neighbours of N4 are NOT closed by this round, are not among
-    D-19's five, and read here exactly as they read before it. Pinned so
-    that "we did not fix these" is a fact in the suite rather than a claim
-    in a commit message, and so that a later round that DOES fix them has
-    to come and change a test on purpose.
+    # The part
+    A Ø16 blind seat entered from the TOP of a 20 mm plate, its floor at
+    ``z = 8`` (so 12 mm of full-diameter wall), with a spherical relief of
+    ``r = 8.0001`` centred on that floor. The relief is a whisker wider than
+    the seat, so it reaches ``z = -0.0001`` on the axis and BREAKS the bottom
+    face.
 
-    1. A spherical relief WIDER than the bore at its MOUTH. Neither pole
-       is on the face — the relief's retained skin is a thin annulus
-       outside the bore — so nearest applies and takes the relief's own
-       pole, about one bore radius below the part's face. A Ø8 through
-       bore in a 20 mm plate reads 16.0.
-    2. An undercut seat deep enough to BREAK the far face. The true pole
-       is then off the part and so on no face either, and the phantom near
-       pole wins again.
+    # What was wrong, and why it is wrong under ANY depth convention
+    The relief's two axial poles are ``16.0001`` and ``-0.0001``. The low-end
+    mouth sits at ``t_edge = 8.04`` (where the relief meets the Ø16 wall), and
+    nearest-the-mouth picked ``16.0001`` by EIGHT HUNDREDTHS of a millimetre
+    (``7.96`` against ``8.04``). That root is 8 mm UP INSIDE the bore, so the
+    bore read::
 
-    Both UNDER-report, which is the expensive direction, so they are worth
-    a backlog line rather than a shrug.
+        depth 3.9999   THROUGH   entry z = 16.0001   axis +Z
+
+    against a control (same seat, no relief) of::
+
+        depth 12.0     BLIND     entry z = 20.0      axis -Z
+
+    An entry point floating inside solid metal and an inverted axis are wrong
+    however one defines depth — which is why this residual was fixable while
+    its sibling waits on a convention ruling.
+
+    # The fix
+    The walk already splits evidence at the bore's midpoint, but only on where
+    the EDGE sits. `_root_is_in_its_own_half` extends that to the ROOT: a
+    low-end cap cannot contribute a root from the bore's upper half. The
+    phantom at ``16.0001`` is above the midpoint ``14`` and is refused; the
+    true pole at ``-0.0001`` stands.
+
+    # The depth, and why this number
+    ``20.0001`` — from the entry face ``z = 20`` down to the relief's tip at
+    ``z = -0.0001``. That is Ervin's D-19 convention applied literally:
+    *measure to the deepest point the tool reaches; conservative, never
+    under-quote.*
+
+    ⚠️ **PENDING Ervin's convention confirmation.** The competing reading is
+    the FULL-DIAMETER bore length, ``12.04`` (``z = 20`` down to where the
+    relief meets ``r = 8`` at ``z = 7.96``), on the grounds that the relief is
+    not cut by this drill — which is the reasoning N1 used to call a
+    point-breakthrough BLIND on the full-diameter depth. Both readings are
+    defensible; the same ruling settles residual 1. If Ervin rules for
+    full-diameter, RE-PIN this number — the structural half of the fix (axis,
+    entry, and the refusal of an upper-half root) is unaffected either way.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCylinder,
+        BRepPrimAPI_MakeSphere,
+    )
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    def plate_with(*tools):
+        shape = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+        for tool in tools:
+            shape = BRepAlgoAPI_Cut(shape, tool).Shape()
+        return shape
+
+    seat = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(20.0, 20.0, 8.0), gp_Dir(0, 0, 1)), 8.0, 30.0
+    ).Shape()
+
+    # The control first: the same seat with no relief, so the numbers this
+    # test asserts are read against a measured reference rather than a memory.
+    control = [
+        h for h in mine_cylindrical_holes(plate_with(seat)) if abs(h.diameter_mm - 16.0) < TOL
+    ]
+    assert len(control) == 1
+    _approx(control[0].depth_mm, 12.0)
+    assert control[0].end_condition is HoleEndCondition.BLIND
+    _approx(control[0].entry_point_mm[2], 20.0)
+    _approx(control[0].axis_unit[2], -1.0)
+
+    part = plate_with(seat, BRepPrimAPI_MakeSphere(gp_Pnt(20.0, 20.0, 8.0), 8.0 + 1e-4).Shape())
+    holes = [h for h in mine_cylindrical_holes(part) if abs(h.diameter_mm - 16.0) < TOL]
+    assert len(holes) == 1
+    hole = holes[0]
+
+    # The structural half — true under either convention.
+    assert hole.end_condition is HoleEndCondition.BLIND, (
+        "the full-diameter seat is still blind; only its relief breaks through"
+    )
+    _approx(hole.entry_point_mm[2], 20.0)
+    assert hole.entry_point_mm[2] > 19.0, (
+        "the entry must be ON the top face, never floating inside the plate "
+        f"as the pre-R9 z=16.0001 did; got {hole.entry_point_mm[2]}"
+    )
+    _approx(hole.axis_unit[2], -1.0)
+    assert hole.axis_unit[2] < 0.0, "the axis must point INTO the part, not out of it"
+    assert hole.depth_mm > control[0].depth_mm, (
+        "a relief that breaks the far face can only make the hole deeper than "
+        f"the same seat without it; got {hole.depth_mm} against {control[0].depth_mm}"
+    )
+
+    # The numeric half — PENDING, see the docstring.
+    _approx(hole.depth_mm, 20.0001)
+
+
+def test_r9_a_mouth_relief_reads_to_the_relief_pole_which_is_CORRECT():
+    """ADR-0112 R9 — this was flagged as a defect. It is not one.
+
+    A Ø8 through bore whose MOUTH carries a spherical relief slightly wider
+    than itself reads 16 - u, the relief sphere's own axial pole: 15.9999 for
+    an undercut of 1e-4, 15.7 for 0.3.
+
+    Round 8 recorded that as an under-report against a "true" 20.0 (the
+    through-plate traverse) and flagged it. Measurement showed the flag was
+    wrong, not the code: this case and
+    ``test_r8_a_concave_seat_at_the_MOUTH_keeps_nearest`` are the SAME rule —
+    both read the relief sphere's axial pole — and that test pins the pole as
+    CORRECT. The two pins encoded opposite conventions, and only one can hold.
+
+    **Ervin ruled: axis-first-material.** The hole's mouth is where the axis
+    first meets the part, which for a relieved mouth is the relief's own floor
+    and not the nominal face above it. So:
+
+    - the dimple reads its pole (17.6 / 16.8 / 15.2 for r = 6 / 8 / 12) — the
+      value that test already pins;
+    - this relief reads ITS pole (16 - u) — the value below;
+
+    and the two agree, as one rule must. The traverse reading would have had
+    to move every dimple pin (17.6 -> 19.1279, and so on) to stay consistent,
+    which is how it was caught.
+
+    What remains genuinely open is not this case. See
+    ``test_r9_a_seat_whose_relief_breaks_the_far_face_is_not_inverted``.
     """
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
     from OCP.BRepPrimAPI import (
@@ -3419,25 +3547,20 @@ def test_r8_two_siblings_of_the_undercut_family_are_flagged_not_fixed():
         )
         holes = [h for h in mine_cylindrical_holes(part) if abs(h.diameter_mm - 8.0) < TOL]
         assert len(holes) == 1, undercut
+        # CORRECT under axis-first-material: the mouth is the relief's own
+        # floor, so the hole starts at the sphere's axial pole (20 - R) and
+        # runs to the far face. The same rule the dimple pin asserts.
         assert holes[0].depth_mm == pytest.approx(expected, abs=1e-3), (
-            "OPEN, pre-existing: a mouth relief still shortens the bore by "
-            f"about its own radius; got {holes[0].depth_mm}"
+            "a relieved mouth reads to the relief's pole; got "
+            f"{holes[0].depth_mm}"
         )
-        assert holes[0].depth_mm < 20.0 - TOL, "and it under-reports"
+        assert holes[0].depth_mm < 20.0 - TOL, (
+            "and it is SHORTER than the plate, because the relief's floor sits "
+            "below the nominal face — not an under-report"
+        )
 
-    # 2 — an undercut seat that breaks the far face
-    part = plate_with(
-        BRepPrimAPI_MakeCylinder(
-            gp_Ax2(gp_Pnt(20.0, 20.0, 8.0), gp_Dir(0, 0, 1)), 8.0, 30.0
-        ).Shape(),
-        BRepPrimAPI_MakeSphere(gp_Pnt(20.0, 20.0, 8.0), 8.0 + 1e-4).Shape(),
-    )
-    holes = [h for h in mine_cylindrical_holes(part) if abs(h.diameter_mm - 16.0) < TOL]
-    assert len(holes) == 1
-    assert holes[0].depth_mm < 20.0 - TOL, (
-        "OPEN, pre-existing: a seat that breaks the far face puts its true "
-        f"pole off the part, so no root is on any face; got {holes[0].depth_mm}"
-    )
+    # 2 — CLOSED by ADR-0112 R9. See
+    # `test_r9_a_seat_whose_relief_breaks_the_far_face_is_not_inverted`.
 
 
 # ── the zero-caps boss-overhang band ─────────────────────────────────────
