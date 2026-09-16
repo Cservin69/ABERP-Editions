@@ -1,7 +1,9 @@
 # ADR-0125 — Cap ownership when the bore consumes the junction (ADR-0112 R3)
 
-- **Status:** **Proposed** (2026-09-16) — **round 1 adversarial complete, its
-  fixes applied below; held for Ervin's go-ahead before any code lands.** The design below is not speculative: it was prototyped and
+- **Status:** **Built** (2026-09-16) — round 1 adversarial complete and its
+  fixes applied; implemented on `feat/adr-0125-buried-veto`
+  (`c49843d` + `01e2b69`), **held off main for Ervin's review**. §8 records
+  what the build measured, including where it contradicted this ADR. The design below is not speculative: it was prototyped and
   measured, and so were four alternatives, three of which are falsified. No
   production code is changed by this ADR.
 - **Date:** 2026-09-16
@@ -250,3 +252,60 @@ going the other way. **The family ships as a pin with the build.**
   faithful to the real structure, and strictly larger: it needs the M2
   reconstruction to work, which measurement says is the harder half.
 - **M1/M2/M3.** Falsified; see §2.
+
+
+## 8. What the build measured (2026-09-16)
+
+Implemented as `_cap_is_buried`, `_point_is_inside_material` and
+`_faces_meet_at_this_mouth`, with the composition of §D3 in `_rim_winner`.
+
+- boss family **10 wrong → 0**; all **50 fixtures bit-identical**;
+- **129 hole tests / 175 in the package, green** (was 122 / 168).
+
+### The counter-pins resolved on measurement, not by re-blessing
+
+§4 required each guard to be shown still solely load-bearing, or retired.
+Each was tested by disabling it **alone, with the veto live**. All three are
+still load-bearing, so none is retired:
+
+| guard | disabled alone, veto live | so |
+|---|---|---|
+| `_skin_over_axis` | still breaks **3 of the 4 straddles** | pin keeps those three |
+| `_mouth_ray_fractions` refinement | still reds the mouth-ray-floor and superset pins | pin kept |
+| `_is_parametric_artifact` | still reds the step-round-trip pin | pin kept |
+
+What changed is only which parts each pin can speak for. The domed shoulder,
+the pinched boss and the seam band are now held by the veto as well, so their
+pins revert **both** mechanisms and assert the old wrong number — which each
+still does, to the digit: round 5's 14.8324 / 12.5838 on the domed shoulder,
+round 7's 20.0 on the pinched boss, and **69 of 81 short, every one at 20.0**
+on the seam band (0 of 81 with the veto live).
+
+The domed shoulder is the satisfying one: round 5 read the sphere's **second**
+crossing, which is a cap with the sphere's own material outside it on the
+axis — buried by definition. The two mechanisms agree because they are looking
+at one thing from two sides.
+
+### ⚠️ Mutation testing contradicted this ADR
+
+9 mutations: **5 killed, 4 survived.** §D1 claimed all three conditions are
+load-bearing. **That was an overclaim** and is corrected in the code.
+
+Killed: veto disabled; severance gate removed (12 reds); gate inverted (14);
+`_point_is_inside_material` sign flipped; §D3 step 3's fallback removed.
+
+Survived — **recorded in `_cap_is_buried`'s docstring as unreachable in this
+corpus, not untested**, on the `_root_is_in_its_own_half` `pad` precedent:
+
+1. **letting ties bury.** Reachable in principle — two severed faces tying at
+   one level would bury each other and `min` would jump to a deeper cap — but
+   no corpus part ties across a severance.
+2. **asking at the cap's own point instead of the segment midpoint.**
+   Equivalent on every part here; the midpoint is kept as the safer form.
+3. **removing `BURIED_BAND_MM`** (§D5's band).
+4. **widening the severance gate back to the whole solid.** This one was
+   *expected* to survive: round 1 measured the two gates as behaviourally
+   identical and narrowed it on argument, not evidence. **Nothing in the suite
+   will stop someone widening it again**, and the code says so.
+
+(1) and (3) are the two §D5 asked to be pinned-or-recorded. They are recorded.
