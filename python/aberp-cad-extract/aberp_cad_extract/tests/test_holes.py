@@ -2214,6 +2214,12 @@ R6_STRADDLES = {
 #: What round 5 returned for each of them, to the digits it returned. Used
 #: by the revert-proof below, and written out here because the numbers are
 #: the finding: every one is SHORTER than the truth.
+#: Straddles whose round-5 answer is ALSO refused by :func:`_cap_is_buried`
+#: (ADR-0125), so the narrowing is no longer solely what holds them. They are
+#: pinned by reverting BOTH mechanisms instead — see
+#: :func:`test_adr0125_the_domed_shoulder_needs_either_mechanism`.
+R6_STRADDLES_THE_VETO_ALSO_COVERS = frozenset({"bore_through_a_domed_shoulder"})
+
 R6_ROUND5_STRADDLES = {
     # fixture: (round 5's depth, round 5's entry z)
     #
@@ -2294,13 +2300,23 @@ def test_r6_ball_nose_blind_bore_is_blind_and_full_depth(fixtures_dir: Path):
 def test_r6_keeping_every_rim_face_re_breaks_the_straddles(
     fixtures_dir: Path, monkeypatch
 ):
-    """REVERT-PROOF for the narrowing, on all four straddles at once.
+    """REVERT-PROOF for the narrowing, on the straddles it ALONE holds.
 
     Put `_EndEvidence._skin_over_axis` back to answering "nothing to say"
     — which is round 5's rule exactly, since an empty answer is what the
     caller falls back on — and every straddle must return the wrong number
     it returned then, to the digit. Anything else means these fixtures have
     stopped covering the defect.
+
+    NARROWED (ADR-0125) from four straddles to three. The domed shoulder is
+    now held by the buried veto as well: round 5 read the sphere's SECOND
+    crossing, which is a cap with the sphere's own material outside it on
+    the axis, so :func:`_cap_is_buried` refuses it independently. Asserting
+    round 5's number there would assert a redundancy that no longer holds,
+    so that fixture moves to
+    :func:`test_adr0125_the_domed_shoulder_needs_either_mechanism`, which
+    reverts both. The narrowing remains SOLELY load-bearing on the other
+    three, which is what this still proves.
     """
     import aberp_cad_extract.holes as holes_mod
 
@@ -2310,6 +2326,8 @@ def test_r6_keeping_every_rim_face_re_breaks_the_straddles(
         lambda self, keys, edges, origin, direction, radius: [],
     )
     for name, (depth, entry_z) in sorted(R6_ROUND5_STRADDLES.items()):
+        if name in R6_STRADDLES_THE_VETO_ALSO_COVERS:
+            continue
         holes = _mine(fixtures_dir / f"{name}.step")
         assert len(holes) == 1, name
         assert holes[0].depth_mm == pytest.approx(depth, abs=TOL), (
@@ -2324,6 +2342,143 @@ def test_r6_keeping_every_rim_face_re_breaks_the_straddles(
             f"{name}: the round-5 answer must be SHORT of the truth — that "
             "is what makes this an under-quote and not a rounding argument"
         )
+
+
+def test_adr0125_the_domed_shoulder_needs_either_mechanism(
+    fixtures_dir: Path, monkeypatch
+):
+    """REVERT-PROOF for the domed shoulder, which now has two holders.
+
+    Round 6's narrowing and ADR-0125's buried veto each fix this fixture on
+    their own, and the reason they agree is that they are looking at the
+    same thing from two sides: round 5 took the sphere's SECOND crossing,
+    which is a cap with the sphere's own material lying outside it along
+    the axis — the definition of buried.
+
+    So neither one alone is revert-proof here any more, and pinning either
+    one alone would assert a redundancy that does not exist. Take BOTH out
+    and round 5's exact numbers come back: 14.8324 deep entering at
+    12.5838, against a truth of 27.4162 entering at 0.0 — 12.58 mm short,
+    and short is the direction nobody sees.
+
+    Measured both ways round: with the narrowing out and the veto live the
+    answer is 27.4162, correct to the bit.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    name = "bore_through_a_domed_shoulder"
+    assert name in R6_STRADDLES_THE_VETO_ALSO_COVERS
+
+    # the veto alone is enough
+    monkeypatch.setattr(
+        holes_mod._EndEvidence,
+        "_skin_over_axis",
+        lambda self, keys, edges, origin, direction, radius: [],
+    )
+    with_veto = _mine(fixtures_dir / f"{name}.step")
+    assert len(with_veto) == 1
+    _approx(with_veto[0].depth_mm, R6_STRADDLES[name][1])
+
+    # take the veto out too, and round 5 returns
+    monkeypatch.setattr(
+        holes_mod, "_cap_is_buried", lambda cap, rim_caps, mouth, sign: False
+    )
+    neither = _mine(fixtures_dir / f"{name}.step")
+    assert len(neither) == 1
+    depth, entry_z = R6_ROUND5_STRADDLES[name]
+    _approx(neither[0].depth_mm, depth)
+    _approx(neither[0].entry_point_mm[2], entry_z)
+    assert neither[0].depth_mm < R6_STRADDLES[name][1] - TOL, (
+        "with both mechanisms out the answer must be SHORT of the truth"
+    )
+
+
+def _filleted_boss(cone_r, cone_h, fillet_r, bore_x, bore_y, bore_r,
+                   plate_z=20.0):
+    """A conical boss on the plate with a FILLETED base.
+
+    The shape the corpus did not have (ADR-0125 round 1, A6): the fillet
+    sits BETWEEN the cone and the plate top, so those two faces never meet
+    at all — which is exactly where :func:`_faces_meet_at_this_mouth` stops
+    suppressing the buried veto. Every other boss in this file has the cone
+    landing straight on the plate, where the gate always suppresses.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCone,
+        BRepPrimAPI_MakeCylinder,
+    )
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, plate_z).Shape()
+    cone = BRepPrimAPI_MakeCone(
+        gp_Ax2(gp_Pnt(20.0, 20.0, plate_z), gp_Dir(0, 0, 1)),
+        cone_r, 0.0, cone_h,
+    ).Shape()
+    fused = BRepAlgoAPI_Fuse(block, cone).Shape()
+    maker = BRepFilletAPI_MakeFillet(fused)
+    filleted = 0
+    explorer = TopExp_Explorer(fused, TopAbs_EDGE)
+    while explorer.More():
+        edge = TopoDS.Edge_s(explorer.Current())
+        explorer.Next()
+        try:
+            curve = BRepAdaptor_Curve(edge)
+            if int(curve.GetType()) != 1:  # circles only
+                continue
+            if abs(float(curve.Value(curve.FirstParameter()).Z()) - plate_z) > 1e-6:
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        maker.Add(fillet_r, edge)
+        filleted += 1
+    assert filleted, "no boss base edge found to fillet"
+    bore = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(bore_x, bore_y, -5.0), gp_Dir(0, 0, 1)), bore_r, 120.0
+    ).Shape()
+    return BRepAlgoAPI_Cut(maker.Shape(), bore).Shape()
+
+
+@pytest.mark.parametrize(
+    ("cone_r", "cone_h", "fillet_r", "offset"),
+    [
+        (10.0, 18.0, 2.0, 1.0),
+        (10.0, 18.0, 3.0, 1.5),
+        (12.0, 22.0, 2.5, 0.8),
+        (9.0, 16.0, 1.5, 2.0),
+        (11.0, 25.0, 4.0, 1.2),
+        (8.0, 14.0, 2.0, 0.5),
+    ],
+)
+def test_adr0125_a_filleted_boss_base_is_where_the_gate_stops_suppressing(
+    cone_r, cone_h, fillet_r, offset
+):
+    """The shape ADR-0125's adversarial round 1 found missing (A6).
+
+    :func:`_faces_meet_at_this_mouth` suppresses the buried veto wherever
+    the two faces still share an edge at the mouth. Put a fillet at the
+    boss's base and they never share one, so the veto is live on a part
+    where nothing is wrong — and nothing in the suite covered that.
+
+    Under convention P the depth runs to the cone's crossing ON THE BORE'S
+    AXIS, ``plate + h * (1 - offset / r)``, because the fillet only
+    reshapes the boss near its base and the axis leaves through the cone
+    well above it.
+
+    Measured before this pin existed: 6/6 correct with the veto and 6/6
+    without it. That is the answer we want, but it was luck until it was
+    asserted.
+    """
+    part = _filleted_boss(cone_r, cone_h, fillet_r, 20.0 + offset, 20.0, 4.0)
+    holes = [h for h in mine_cylindrical_holes(part) if abs(h.diameter_mm - 8.0) < TOL]
+    assert len(holes) == 1
+    _approx(holes[0].depth_mm, 20.0 + cone_h * (1.0 - offset / cone_r))
 
 
 def test_r6_nearest_root_alone_re_breaks_the_ball_nose(
@@ -2893,6 +3048,19 @@ def test_r7_evenly_spaced_rays_alone_re_break_the_boss(monkeypatch):
             k / (holes_mod.MOUTH_RAY_SAMPLES + 1)
             for k in range(1, holes_mod.MOUTH_RAY_SAMPLES + 1)
         ],
+    )
+    # RE-POINTED AGAIN (ADR-0125). The buried veto reaches this part on its
+    # own: with the coarse ladder and the veto live it still answers
+    # 21.7602. So the refinement is no longer SOLELY what holds this part,
+    # and a pin that disabled only the ladder would assert a redundancy
+    # that no longer exists. Both come out, and round 7's 20.0 returns.
+    #
+    # The refinement is NOT thereby idle. Disabling the ladder alone, with
+    # the veto live, still reds `test_r7_the_mouth_ray_floor_is_load_bearing`
+    # and `test_r7_the_refinement_is_a_superset_of_round_6s_ladder` — it is
+    # still solely load-bearing there, which is why it stays.
+    monkeypatch.setattr(
+        holes_mod, "_cap_is_buried", lambda cap, rim_caps, mouth, sign: False
     )
     coarse = mine_cylindrical_holes(part)
     assert len(coarse) == 1
@@ -3609,8 +3777,23 @@ def test_r8_the_zero_caps_boss_band_is_closed():
     assert not wrong, f"{len(wrong)} of the band mis-mined: {wrong[:5]}"
 
 
-def test_r8_the_boss_family_OUTSIDE_the_band_is_improved_not_closed():
-    """FLAGGED, measured, and not closed: the wider boss family.
+def test_adr0125_the_boss_family_OUTSIDE_the_band_is_CLOSED():
+    """CLOSED by ADR-0125 (2026-09-16). Was: flagged, measured, not closed.
+
+    This test asserted ``wrong > 0`` on purpose — a tripwire, so that
+    closing the residual could not happen quietly. ADR-0125 tripped it.
+    The sweep stays exactly as it was and the bound is now ``wrong == 0``,
+    so a regression still reds it.
+
+    What was wrong: where the bore ate the ENTIRE junction between the boss
+    and the plate it stands on, the boss's surviving faces were all
+    outboard behind a real edge, no ray from the axis reached any of them,
+    and the plate's top face won although the axis pierces a hole in it.
+    Ten of these read the bare plate — 3.29 mm short on the exemplar, and
+    short every time. See :func:`_cap_is_buried`.
+
+    The original note follows, unedited.
+
 
     D-19's item 3 names a region — cone heights 14..20 crossed with bore
     offsets 37.0..38.5 — and that region is closed to the bit by the test
@@ -3666,13 +3849,11 @@ def test_r8_the_boss_family_OUTSIDE_the_band_is_improved_not_closed():
             wrong += 1
 
     assert considered > 80, considered
-    assert wrong <= 10, (
-        f"the wider boss family regressed: {wrong}/{considered} wrong "
-        "(round 8 measured 10, round 7 measured 18)"
-    )
-    assert wrong > 0, (
-        "if this family is now clean the flag in D-19 is stale and the "
-        "backlog entry should say so"
+    assert wrong == 0, (
+        f"the wider boss family regressed: {wrong}/{considered} wrong. "
+        "18 were wrong before round 8, 10 after it, and 0 since ADR-0125 "
+        "put the buried veto in. A number above zero here is an "
+        "UNDER-quote, which is the invisible direction"
     )
 
 
@@ -3687,8 +3868,18 @@ def test_r8_a_seam_barrier_re_opens_the_whole_band():
 
     configs = list(_band_configs())
     original = holes_mod._is_parametric_artifact
+    # RE-POINTED (ADR-0125). With the seam marched again but the buried veto
+    # live, 0 of 81 are short — the veto covers this whole band by itself.
+    # With both out, 69 of 81 go short and every one of them reads 20.0,
+    # which is round 8's measurement to the configuration. So the pin now
+    # reverts BOTH, and still asserts what it always did.
+    #
+    # `_is_parametric_artifact` is not thereby redundant: disabling it alone
+    # still reds `test_r8_a_seam_survives_a_step_round_trip_only_geometrically`.
+    original_buried = holes_mod._cap_is_buried
     try:
         holes_mod._is_parametric_artifact = lambda edge, face, neighbours: False
+        holes_mod._cap_is_buried = lambda cap, rim_caps, mouth, sign: False
         short = []
         for height, bore_x, want in configs:
             holes = mine_cylindrical_holes(
@@ -3698,6 +3889,7 @@ def test_r8_a_seam_barrier_re_opens_the_whole_band():
                 short.append((height, bore_x, want, holes[0].depth_mm))
     finally:
         holes_mod._is_parametric_artifact = original
+        holes_mod._cap_is_buried = original_buried
 
     assert len(short) > len(configs) // 2, (
         f"only {len(short)}/{len(configs)} of the band re-broke; the seam "

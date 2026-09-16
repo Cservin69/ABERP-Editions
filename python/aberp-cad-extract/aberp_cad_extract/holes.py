@@ -2580,6 +2580,200 @@ def _skin_reaches_axis(mouth_edges, barriers, origin, e1, e2, radius) -> bool:
     return False
 
 
+#: How far under a face a point must lie before it counts as INSIDE that
+#: face's material, in mm. A point within this band counts as ON the
+#: surface rather than under it, so a cap that merely TOUCHES another
+#: face's carrier is never buried by it: two faces meeting the axis at one
+#: level is a TIE, and :meth:`_EndEvidence._rim_winner` already has a rule
+#: for ties that this must not pre-empt.
+BURIED_BAND_MM: float = 1.0e-6
+
+
+def _face_edges(face) -> List:
+    """Every edge of a face."""
+    edges: List = []
+    explorer = TopExp_Explorer(face, TopAbs_EDGE)
+    while explorer.More():
+        edges.append(TopoDS.Edge_s(explorer.Current()))
+        explorer.Next()
+    return edges
+
+
+def _cap_point(cap) -> Tuple[float, float, float]:
+    """A cap's crossing point on the axis, as plain floats."""
+    point = cap[2]
+    if hasattr(point, "X"):
+        return (float(point.X()), float(point.Y()), float(point.Z()))
+    return (float(point[0]), float(point[1]), float(point[2]))
+
+
+def _point_is_inside_material(point, face) -> bool:
+    """Is ``point`` strictly UNDER ``face``'s skin?
+
+    Asked of the face's untrimmed carrier, and of its ORIENTATION: the
+    surface normal flipped for a ``TopAbs_REVERSED`` face is the outward
+    one, so a point on the negative side of it is inside the material that
+    face bounds.
+
+    **This question is almost meaningless on its own, and that is not a
+    figure of speech.** An untrimmed half-space contains nearly every point
+    of a closed solid — a plate's top face is "inside" its bottom face's
+    half-space, and its bottom face is inside its top's. Asked of every
+    rim face against every cap it drops 423 caps on the boss family and
+    takes it from 10 wrong to 75 (ADR-0125 §2, M3).
+
+    It carries information only where :func:`_cap_is_buried` asks it: about
+    the SEGMENT between two crossings of the same axis, between two faces
+    the bore has severed. Do not lift it out of there.
+    """
+    try:
+        surface = BRep_Tool.Surface_s(face)
+        here = gp_Pnt(float(point[0]), float(point[1]), float(point[2]))
+        projection = GeomAPI_ProjectPointOnSurf(here, surface)
+        if not projection.IsDone() or projection.NbPoints() < 1:
+            return False
+        nearest = projection.NearestPoint()
+        u, v = projection.LowerDistanceParameters()
+        props = GeomLProp_SLProps(surface, u, v, 1, 1.0e-9)
+        if not props.IsNormalDefined():
+            return False
+        normal = props.Normal()
+        out = (float(normal.X()), float(normal.Y()), float(normal.Z()))
+        if face.Orientation() == TopAbs_REVERSED:
+            out = (-out[0], -out[1], -out[2])
+        away = (
+            float(here.X()) - float(nearest.X()),
+            float(here.Y()) - float(nearest.Y()),
+            float(here.Z()) - float(nearest.Z()),
+        )
+        depth = away[0] * out[0] + away[1] * out[1] + away[2] * out[2]
+        return depth < -BURIED_BAND_MM
+    except Exception:  # noqa: BLE001 — a face that will not answer buries nothing
+        return False
+
+
+def _faces_meet_at_this_mouth(one, other, mouth) -> bool:
+    """Do these two faces still share an edge that TOUCHES this mouth?
+
+    Scoped to the mouth, deliberately. Whether two faces also meet on the
+    far side of the part says nothing about whether the bore consumed
+    their junction HERE, which is the only thing :func:`_cap_is_buried`
+    needs to know — and a gate wider than its justification is a latent
+    defect even while nothing exercises it (ADR-0125 round 1, A1).
+
+    "Touches this mouth" is the same test :func:`_rim_barriers` already
+    uses to decide the bore interrupted an edge: a vertex in common with
+    one of the mouth's own edges.
+
+    True when they still meet, which SUPPRESSES the veto — because then
+    the junction survived, the edge between them is a real barrier, and
+    the ray machinery already holds that evidence. An unreadable pair is
+    treated as still joined, so the veto stays out of a case it cannot
+    see.
+    """
+    try:
+        theirs = _face_edges(other)
+        shared = [
+            edge
+            for edge in _face_edges(one)
+            if any(edge.IsSame(his) for his in theirs)
+        ]
+        if not shared:
+            return False
+        ends = [end for edge in mouth for end in _edge_vertices(edge)]
+        if not ends:
+            return True
+        return any(
+            vertex.IsSame(end)
+            for edge in shared
+            for vertex in _edge_vertices(edge)
+            for end in ends
+        )
+    except Exception:  # noqa: BLE001 — an unreadable pair is treated as joined
+        return True
+
+
+def _cap_is_buried(cap, rim_caps, mouth, sign) -> bool:
+    """Is this cap one the axis cannot LEAVE the part through?
+
+    Under convention P the entry is the first material the axis meets
+    coming in from outside. So a cap is buried — and cannot be the entry —
+    when another cap of the same rim, on a face the bore has SEVERED from
+    this one, crosses the axis further OUT, and the axis between the two
+    runs inside that face's material.
+
+    Three conditions. **One of them is pinned by the corpus and two are
+    not** — see the mutation record at the end of this docstring, which is
+    written down rather than discovered later:
+
+    - **Strictly further out.** A tie is never a burial: two faces meeting
+      the axis at one level is exactly the case
+      :meth:`_EndEvidence._rim_winner` gives every cap at the winning level
+      a vote in, and this must not quietly disenfranchise them. Reachable
+      in principle — two SEVERED faces tying at one level would bury each
+      other, and `min` would then jump to a deeper cap — but no part in the
+      corpus ties across a severance, so **nothing here tests it**.
+    - **Severed** (:func:`_faces_meet_at_this_mouth`). Where the junction
+      survived, the edge is a real barrier and
+      :meth:`_EndEvidence._skin_over_axis` already has the evidence. This
+      exists for what that cannot see: a junction the bore consumed whole,
+      leaving the two faces not touching at all. Without this gate the
+      chamfer and corner families of rounds 4 and 5 break — 14 tests.
+    - **Between them, not merely somewhere.** See
+      :func:`_point_is_inside_material` for why asking it any other way
+      answers nothing.
+
+    Why this exists at all (ADR-0112 R3, ADR-0125). Where a bore eats the
+    ENTIRE junction between a boss and the face it stands on, the boss's
+    surviving faces are all outboard, behind a real edge, and no ray from
+    the axis reaches any of them. The ownership question
+    :func:`_skin_reaches_axis` asks — can the axis SEE a piece of this
+    face's mouth — has no true answer left to find, and the plate's top
+    face wins although the axis pierces a hole in it. Measured on a
+    randomised 108-part boss family: ten parts read the bare plate,
+    3.29 mm short on the exemplar, always short.
+
+    # Mutation record (2026-09-16) — 5 killed, 4 SURVIVED
+    Killed: disabling the veto; removing the severance gate (12 reds);
+    inverting it (14); flipping :func:`_point_is_inside_material`'s sign;
+    and removing D3's "buriedness stands alone" fallback in
+    :meth:`_EndEvidence._rim_winner`.
+
+    **Survived, and each is recorded rather than papered over** — a
+    surviving mutation here means *unreachable in this corpus*, not
+    *untested*, and a future change to any of the four will NOT be caught:
+
+    - letting ties bury (the first condition above);
+    - asking the material question at the cap's own point instead of the
+      SEGMENT midpoint — equivalent on every part here, and the midpoint is
+      kept because two surfaces may touch exactly at a cap;
+    - removing :data:`BURIED_BAND_MM`, the same unreachable-band result
+      :func:`_root_is_in_its_own_half`'s ``pad`` already has;
+    - widening :func:`_faces_meet_at_this_mouth` back to the whole solid.
+      This one is EXPECTED to survive: ADR-0125 round 1 measured the two
+      gates as behaviourally identical on the whole corpus and narrowed it
+      on argument, not on evidence. Nothing here can tell them apart, so
+      nothing here will stop someone widening it again.
+    """
+    level = sign * cap[0]
+    for other in rim_caps:
+        if sign * other[0] <= level + 1e-9:
+            continue
+        if other[1].IsSame(cap[1]):
+            continue
+        if _faces_meet_at_this_mouth(cap[1], other[1], mouth):
+            continue
+        here, there = _cap_point(cap), _cap_point(other)
+        midpoint = (
+            (here[0] + there[0]) / 2.0,
+            (here[1] + there[1]) / 2.0,
+            (here[2] + there[2]) / 2.0,
+        )
+        if _point_is_inside_material(midpoint, other[1]):
+            return True
+    return False
+
+
 class _EndEvidence:
     """What the cap walk found at ONE end of a bore.
 
@@ -2810,9 +3004,25 @@ class _EndEvidence:
         # cannot move which rim won — only where, within it, the bore
         # ends.
         standing = self._skin_over_axis(keys, edges, origin, direction, radius)
+        rim_caps = [cap for cap in self.caps if cap[4] in keys]
+        # Reachability narrows; buriedness VETOES (ADR-0125 §D3). The veto is
+        # asked of the WHOLE rim, not of what reachability left, because the
+        # case it exists for is the one where reachability chose wrongly: on
+        # the boss exemplar `standing` is the plate's top face and nothing
+        # else, so a veto confined to `standing` empties it and changes no
+        # answer — measured, the family stays at 10 wrong.
+        alive = [
+            cap for cap in rim_caps if not _cap_is_buried(cap, rim_caps, edges, sign)
+        ]
+        standing_alive = [
+            cap for cap in standing if any(cap is survivor for survivor in alive)
+        ]
+        # If every cap reachability chose is buried, its choice was wrong and
+        # buriedness stands alone; if buriedness would empty the field it
+        # yields, which is round 5's "keep every cap" unchanged.
         level = min(
             sign * cap[0]
-            for cap in (standing or [cap for cap in self.caps if cap[4] in keys])
+            for cap in (standing_alive or alive or standing or rim_caps)
         )
         # The narrowing decides the LEVEL and stops there. Which faces then
         # get a vote on whether the end is OPEN is the round-2 tie rule,
