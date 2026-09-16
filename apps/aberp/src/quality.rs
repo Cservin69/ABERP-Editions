@@ -797,6 +797,112 @@ pub fn create_ncr(
     Ok(ncr)
 }
 
+/// [`create_ncr`], but INSIDE the caller's transaction (ADR-0127 §D2).
+///
+/// # Why this exists
+/// `record_manual_inspection` used to commit the failing measurement, then
+/// call [`create_ncr`] on a second connection, then link the NCR in a third
+/// transaction. A crash or any error between the first commit and the second
+/// leaves a committed FAILING measurement with **no NCR** — the open-NCR belt
+/// reads NCRs, so it saw nothing, and the shipment released on a QC report
+/// that still said `accept`. That is the ADR-0099 lesson the AVL firing sites
+/// already taught: commit, then do the consequence in a second transaction.
+///
+/// Here the measurement, its NCR and the link all ride ONE transaction, so
+/// either the failure and its blocker both land or neither does.
+///
+/// # Photos are refused, not silently dropped
+/// [`create_ncr`] writes photo files to disk before inserting. A filesystem
+/// write cannot be rolled back with the transaction, so this variant refuses a
+/// non-empty `photos` rather than pretend it is atomic. Auto-NCRs carry none.
+///
+/// This does NOT open a connection — it borrows the caller's — so it adds no
+/// write-fork surface for CHECK 10M/10N, and it leaves [`create_ncr`]'s
+/// residual opener exactly where the frozen ledger has it.
+pub(crate) fn create_ncr_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    tenant: &TenantId,
+    binary_hash: BinaryHash,
+    operator: &str,
+    input: NewNcr,
+) -> std::result::Result<Ncr, QualityError> {
+    validate_description(&input.description).map_err(|e| QualityError::Invalid(e.to_string()))?;
+    if !input.photos.is_empty() {
+        return Err(QualityError::Invalid(
+            "create_ncr_in_tx cannot carry photos: a file written to disk does \
+             not roll back with the transaction (ADR-0127 §D2)"
+                .into(),
+        ));
+    }
+    let ncr_id = generate_ncr_id();
+    let now = now_rfc3339();
+    let ncr = Ncr {
+        ncr_id: ncr_id.clone(),
+        discovered_at_utc: now.clone(),
+        discovered_by_operator: operator.to_string(),
+        severity: input.severity,
+        category: input.category,
+        description: input.description.trim().to_string(),
+        affected_part_uids: input.affected_part_uids,
+        affected_wo_ids: input.affected_wo_ids,
+        affected_heat_lots: input.affected_heat_lots,
+        photos: Vec::new(),
+        state: NcrState::Open,
+        closed_at_utc: None,
+        closed_by_operator: None,
+    };
+    ensure_schema(tx)?;
+    tx.execute(
+        "INSERT INTO ncrs (ncr_id, tenant_id, discovered_at_utc, discovered_by_operator, \
+         severity, category, description, affected_part_uids, affected_wo_ids, \
+         affected_heat_lots, photos, state, closed_at_utc, closed_by_operator) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,NULL)",
+        params![
+            ncr.ncr_id,
+            tenant.as_str(),
+            ncr.discovered_at_utc,
+            ncr.discovered_by_operator,
+            ncr.severity.as_db_str(),
+            ncr.category.as_db_str(),
+            ncr.description,
+            encode_array(&ncr.affected_part_uids),
+            encode_array(&ncr.affected_wo_ids),
+            encode_array(&ncr.affected_heat_lots),
+            encode_array(&ncr.photos),
+            ncr.state.as_db_str(),
+        ],
+    )
+    .context("insert ncr row (in tx)")?;
+    tx.execute(
+        "INSERT INTO ncr_transitions (tenant_id, ncr_id, seq, from_state, to_state, operator, at_utc, note) \
+         VALUES (?1,?2,0,'','open',?3,?4,'opened')",
+        params![tenant.as_str(), ncr.ncr_id, operator, ncr.discovered_at_utc],
+    )
+    .context("insert ncr opening transition (in tx)")?;
+
+    let payload = serde_json::json!({
+        "ncr_id": ncr.ncr_id,
+        "severity": ncr.severity.as_db_str(),
+        "category": ncr.category.as_db_str(),
+        "discovered_by_operator": ncr.discovered_by_operator,
+        "discovered_at_utc": ncr.discovered_at_utc,
+        "affected_part_uids": ncr.affected_part_uids,
+        "affected_wo_ids": ncr.affected_wo_ids,
+        "operator_user_id": operator,
+    });
+    let meta = LedgerMeta::new(tenant.clone(), binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        EventKind::NcrCreated,
+        serde_json::to_vec(&payload).expect("serialize ncr payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        None,
+    )
+    .map_err(|e| QualityError::Other(anyhow::anyhow!("append ncr.created (in tx): {e}")))?;
+    Ok(ncr)
+}
+
 /// Apply an NCR state transition (operator-driven). Validates the edge against
 /// [`allowed_transition`]; a `→ Closed` additionally requires a CAPA that
 /// [`Capa::permits_ncr_close`] ([[trust-code-not-operator]]). Appends the

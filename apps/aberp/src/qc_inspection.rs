@@ -21,7 +21,6 @@
 //! — ADR-0092 §Decision). When a real `ProbeIngestionSource` lands it
 //! feeds this same path with `QcSource::Probe`.
 
-use std::path::Path;
 
 use aberp_audit_ledger::{Actor, BinaryHash, LedgerMeta, TenantId};
 use aberp_db::HandleArc;
@@ -107,7 +106,6 @@ fn severity_for(verdict: Verdict) -> Option<crate::quality::NcrSeverity> {
 /// supplied by the caller so the verdict is deterministic (the route
 /// passes `OffsetDateTime::now_utc()` + the tenant's configured window).
 pub fn record_manual_inspection(
-    db_path: &Path,
     db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
@@ -134,8 +132,9 @@ pub fn record_manual_inspection(
     };
     let session_id = Ulid::new().to_string();
 
-    // ── Phase 1: record the row + verdict events (own connection) ──
-    let (recorded, plan) = {
+    // ── ONE transaction: the row, its verdict events, and (on a failing
+    //    verdict) the auto-NCR and its link — ADR-0127 §D2. ──
+    let (recorded, auto_ncr) = {
         let mut guard = db.write().map_err(|e| {
             QcRecordError::Other(anyhow::anyhow!("shared writer for inspection record: {e}"))
         })?;
@@ -181,85 +180,121 @@ pub fn record_manual_inspection(
                 recorded_by: operator.to_string(),
             },
         )?;
-        tx.commit()
-            .map_err(|e| QcRecordError::Other(anyhow::anyhow!("commit inspection tx: {e}")))?;
-        (recorded, plan)
-    };
 
-    let mut inspection = recorded.inspection;
-
-    // ── Phase 2: auto-NCR on a failing verdict (mirrors S440 receiving) ──
-    let auto_ncr = if let Some(severity) = severity_for(recorded.verdict) {
-        let band = format!("[{}, {}]", plan.lower_tol, plan.upper_tol);
-        let description = format!(
-            "Inspection failed: feature {feature} measured {actual} {units} \
-             (nominal {nominal}, tolerance band {band}). Verdict: {tier}. \
-             Inspection ID: {qci}.",
-            feature = plan.feature_name.trim(),
-            actual = inspection.actual_value,
-            units = inspection.units,
-            nominal = plan.nominal_value,
-            band = band,
-            tier = recorded.verdict.as_str(),
-            qci = inspection.qci_id,
-        );
-        let ncr = crate::quality::create_ncr(
-            db_path,
-            db,
-            tenant.clone(),
-            binary_hash,
-            operator,
-            crate::quality::NewNcr {
-                severity,
-                category: crate::quality::NcrCategory::Workmanship,
-                description,
-                affected_part_uids: req.part_uid.clone().into_iter().collect(),
-                affected_wo_ids: req.wo_id.clone().into_iter().collect(),
-                affected_heat_lots: req.heat_lot.clone().into_iter().collect(),
-                photos: vec![],
-            },
-        )
-        .map_err(map_quality_err)?;
-
-        // Link the NCR back onto the inspection row + emit QcAutoNcrCreated
-        // (own connection, opened only after create_ncr's handle is gone).
-        {
-            let mut guard = db.write().map_err(|e| {
-                QcRecordError::Other(anyhow::anyhow!("shared writer for auto-NCR link: {e}"))
-            })?;
-            aberp_audit_ledger::ensure_schema(&guard).map_err(|e| {
-                QcRecordError::Other(anyhow::anyhow!("ensure audit schema (link): {e}"))
-            })?;
-            let link_meta = LedgerMeta::new(tenant.clone(), binary_hash);
-            let link_ctx = QcWriteContext {
-                tenant: tenant.as_str(),
-                actor: ActorKind::SpaOperator {
-                    operator_login: operator.to_string(),
+        // ── ADR-0127 §D2 — the auto-NCR rides THIS transaction ───────────
+        //
+        // It used to be three: commit the measurement, create the NCR on a
+        // second connection, link it in a third. A crash or any error between
+        // the first commit and the second left a committed FAILING measurement
+        // with NO NCR — the open-NCR belt reads NCRs, so it saw nothing, and
+        // the shipment released on a QC report that still said `accept`
+        // (reproduced in `a_late_failure_with_no_ncr_must_not_release_the_shipment`).
+        //
+        // Either the failure and the thing that blocks on it both land, or
+        // neither does. ADR-0099's rule, and the shape `mark_shipped` already
+        // uses.
+        let auto_ncr = if let Some(severity) = severity_for(recorded.verdict) {
+            let band = format!("[{}, {}]", plan.lower_tol, plan.upper_tol);
+            let description = format!(
+                "Inspection failed: feature {feature} measured {actual} {units} \
+                 (nominal {nominal}, tolerance band {band}). Verdict: {tier}. \
+                 Inspection ID: {qci}.",
+                feature = plan.feature_name.trim(),
+                actual = recorded.inspection.actual_value,
+                units = recorded.inspection.units,
+                nominal = plan.nominal_value,
+                band = band,
+                tier = recorded.verdict.as_str(),
+                qci = recorded.inspection.qci_id,
+            );
+            let ncr = crate::quality::create_ncr_in_tx(
+                &tx,
+                &tenant,
+                binary_hash,
+                operator,
+                crate::quality::NewNcr {
+                    severity,
+                    category: crate::quality::NcrCategory::Workmanship,
+                    description,
+                    affected_part_uids: req.part_uid.clone().into_iter().collect(),
+                    affected_wo_ids: req.wo_id.clone().into_iter().collect(),
+                    affected_heat_lots: req.heat_lot.clone().into_iter().collect(),
+                    photos: vec![],
                 },
-                ledger_meta: &link_meta,
-                ledger_actor: Actor::from_local_cli(session_id.clone(), operator),
-            };
-            let tx2 = guard
-                .transaction()
-                .map_err(|e| QcRecordError::Other(anyhow::anyhow!("begin link tx: {e}")))?;
+            )
+            .map_err(map_quality_err)?;
             link_auto_ncr(
-                &tx2,
-                &link_ctx,
-                &inspection.qci_id,
+                &tx,
+                &ctx,
+                &recorded.inspection.qci_id,
                 &ncr.ncr_id,
                 recorded.verdict,
             )?;
-            tx2.commit()
-                .map_err(|e| QcRecordError::Other(anyhow::anyhow!("commit link tx: {e}")))?;
-        }
-        inspection.auto_ncr_id = Some(ncr.ncr_id.clone());
-        Some(ncr)
-    } else {
-        None
+            Some(ncr)
+        } else {
+            None
+        };
+
+        tx.commit()
+            .map_err(|e| QcRecordError::Other(anyhow::anyhow!("commit inspection tx: {e}")))?;
+        (recorded, auto_ncr)
     };
+
+    let mut inspection = recorded.inspection;
+    if let Some(ncr) = &auto_ncr {
+        inspection.auto_ncr_id = Some(ncr.ncr_id.clone());
+    }
 
     Ok(InspectionResult {
         inspection,
         auto_ncr,
     })
+}
+
+#[cfg(test)]
+mod adr0127_predicate_pin {
+    use super::*;
+
+    /// ADR-0127 §D3 — the auto-NCR decision is made TWICE and the two must
+    /// never disagree.
+    ///
+    /// `severity_for` (here, the LIVE operator path) decides whether a
+    /// measurement spawns an NCR. `Verdict::is_failing` decides what
+    /// `RecordedInspection::auto_ncr_recommended` reports to any other
+    /// caller. They agree today and nothing made them; a new `Verdict`
+    /// variant would simply fall into whatever each `match` happens to do,
+    /// and the divergence would be invisible until a failing measurement
+    /// quietly shipped without an NCR.
+    ///
+    /// The `match` below is exhaustive on purpose. **Adding a variant must
+    /// fail to COMPILE here**, so the person adding it has to decide both
+    /// sides rather than inherit one by accident.
+    #[test]
+    fn the_two_auto_ncr_predicates_cannot_diverge() {
+        let every = [
+            Verdict::Pass,
+            Verdict::Minor,
+            Verdict::Major,
+            Verdict::Critical,
+            Verdict::CalibrationStale,
+        ];
+        for verdict in every {
+            // Exhaustiveness tripwire: a new variant reds this arm at compile
+            // time, before the assertion below ever runs.
+            match verdict {
+                Verdict::Pass
+                | Verdict::Minor
+                | Verdict::Major
+                | Verdict::Critical
+                | Verdict::CalibrationStale => {}
+            }
+            assert_eq!(
+                severity_for(verdict).is_some(),
+                verdict.is_failing(),
+                "the operator path and the crate disagree about whether \
+                 {verdict:?} spawns an NCR — one of them will ship a failing \
+                 measurement with nothing blocking it"
+            );
+        }
+    }
 }

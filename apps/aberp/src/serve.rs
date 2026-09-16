@@ -29493,7 +29493,6 @@ async fn handle_record_qc_inspection(
             };
             let now = time::OffsetDateTime::now_utc();
             crate::qc_inspection::record_manual_inspection(
-                &state_for_task.db_path,
                 &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
