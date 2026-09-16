@@ -21,7 +21,6 @@
 //! — ADR-0092 §Decision). When a real `ProbeIngestionSource` lands it
 //! feeds this same path with `QcSource::Probe`.
 
-
 use aberp_audit_ledger::{Actor, BinaryHash, LedgerMeta, TenantId};
 use aberp_db::HandleArc;
 use aberp_inventory::ActorKind;

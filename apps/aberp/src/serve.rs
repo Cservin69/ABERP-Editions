@@ -18830,7 +18830,6 @@ pub fn resolve_qc_report_gate_with_capability(
         });
     }
 
-
     let reason = match current.disposition {
         aberp_qa::Disposition::Reject => QcReportBlockReason::Rejected,
         _ => QcReportBlockReason::Incomplete,

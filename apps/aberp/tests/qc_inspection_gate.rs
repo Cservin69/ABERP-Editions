@@ -20,8 +20,9 @@ use aberp::part_marking::{
 };
 use aberp::partners::{create_partner, CustomerType, PartnerInputs, PartnerKind};
 use aberp::qc_inspection::{record_manual_inspection, ManualInspectionRequest};
-use aberp::serve::{QcReportBlockReason, 
-    resolve_open_ncr_gate, resolve_qc_report_gate_with_capability, OpenNcrGate, QcReportGate,
+use aberp::serve::{
+    resolve_open_ncr_gate, resolve_qc_report_gate_with_capability, OpenNcrGate,
+    QcReportBlockReason, QcReportGate,
 };
 
 use aberp_audit_ledger::{

@@ -892,7 +892,7 @@ pub(crate) fn create_ncr_in_tx(
     });
     let meta = LedgerMeta::new(tenant.clone(), binary_hash);
     aberp_audit_ledger::append_in_tx(
-        &tx,
+        tx,
         &meta,
         EventKind::NcrCreated,
         serde_json::to_vec(&payload).expect("serialize ncr payload"),
