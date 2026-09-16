@@ -1,14 +1,15 @@
 # ADR-0125 — Cap ownership when the bore consumes the junction (ADR-0112 R3)
 
-- **Status:** **Proposed** (2026-09-16) — **held for Ervin's review before any
-  code lands.** The design below is not speculative: it was prototyped and
+- **Status:** **Proposed** (2026-09-16) — **round 1 adversarial complete, its
+  fixes applied below; held for Ervin's go-ahead before any code lands.** The design below is not speculative: it was prototyped and
   measured, and so were four alternatives, three of which are falsified. No
   production code is changed by this ADR.
 - **Date:** 2026-09-16
 - **Deciders:** pending.
 - **Related:** ADR-0112 R3 (the residual), `docs/_measurement-adr-0112-r3-boss-barrier.md`
-  (the measurement this builds on), D-19 (drilling cycle-time pricing — the
-  money path this feeds).
+  (the measurement this builds on), `docs/_adversarial-adr-0125-cap-ownership-round1.md`
+  (round 1 — FIX-FIRST; A1, A2, A5 and A6 are folded in below), D-19 (drilling
+  cycle-time pricing — the money path this feeds).
 
 ## 1. Context — a measured under-quote the current model cannot reach
 
@@ -85,9 +86,21 @@ half-space is true of almost every point of a closed solid (a plate's top face
 is "inside" its bottom face's half-space), so the question only carries
 information when asked about **the segment between two crossings**.
 
-### D2 — The veto applies only where the two faces NO LONGER MEET
+### D2 — The veto applies only where the two faces NO LONGER MEET AT THIS MOUTH
 
-If the two faces still share an edge on the solid, the junction survived, the
+**Amended after round 1 (A1).** The gate asks whether the two faces share an
+edge *that touches this rim* — an edge with a vertex in common with one of this
+mouth's edges, which is the same `cut`-vertex test `_rim_barriers` already uses
+to decide the bore interrupted an edge. Whether the faces also meet on the far
+side of the part says nothing about whether the bore consumed their junction
+**here**.
+
+Measured: the mouth-scoped gate and the original whole-solid gate are
+behaviourally indistinguishable on everything the corpus can see — family 0
+wrong, 178 caps dropped, 50 fixtures bit-identical, the same four tests red —
+so the narrower one costs nothing and closes the surface by construction.
+
+If the two faces still share such an edge, the junction survived, the
 existing barrier machinery already has that evidence, and the veto must keep its
 hands off. The veto exists precisely for what that machinery cannot see: a
 junction the bore **consumed**, leaving the two faces not touching at all.
@@ -111,6 +124,27 @@ Step 3 is load-bearing and is where R3 is actually won: in the exemplar
 `standing` is `[Plane 20.0]` and nothing else, so a veto that could only filter
 *within* `standing` leaves it empty and changes no answer. Measured: applying
 the veto inside `standing` only leaves the family at **10 wrong**.
+
+### D3b — The veto can over-quote, never under-quote
+
+**Added after round 1 (A2).** `_rim_winner` takes `min(sign * cap[0])` and the
+veto only ever **removes** caps. Removing members of a `min` moves the level
+outward, so the entry moves away from the material and the hole is reported
+**deeper**:
+
+> The buried veto can make a hole deeper. It can never make one shallower.
+
+Measured across the family: **10 deeper, 98 unchanged, 0 shallower.**
+
+Its failure mode is therefore over-quote — the visible direction, and the side
+D-19's convention deliberately errs on. This does **not** make it safe to wave
+through: an over-quote is still wrong, and an entry pushed into mid-air above
+the part is the rounds 4/5 failure class exactly.
+
+What bounds that: every cap carries the mouth edge that found it (`cap[5]`), so
+a cap the veto promotes always belongs to a face that **bounds the solid at
+this mouth**. The veto cannot promote an unbounded carrier with no edge in the
+rim — round 4's hijack.
 
 ### D4 — Scope: the geometry layer only, no pricing change
 
@@ -150,12 +184,33 @@ wrong answer returns. Under M5 it does not, because the veto independently gets
 those parts right. **That is subsumption, not regression** — the fixtures are
 bit-identical and no real assertion moved.
 
-**It is still a decision, and it must not be settled by re-blessing.** Each of
-the three guards must be either (a) shown still solely load-bearing on some
-other part, and its counter-pin re-pointed there — which is exactly what round 8
-already did once for (3) — or (b) found genuinely redundant and removed together
-with its pin. Quietly relaxing a counter-pin to green is the one outcome this
-ADR forbids: these guards are the reason rounds 6, 7 and 8 stayed closed.
+**It is still a decision, and it must not be settled by re-blessing.**
+Per pin, the required action (round 1, A5):
+
+- (1) is a tripwire firing correctly — **rewrite it as closed**, keeping the
+  sweep with `wrong == 0` so a regression still reds it.
+- (2)–(4) must be **re-pointed to a part where the guard is still solely
+  load-bearing**: disable the guard *and* the buried veto together, and assert
+  the old wrong answer returns. That keeps the pin honest about what it
+  protects instead of asserting a redundancy that no longer holds. Round 8
+  already did exactly this once for (3), so precedent and technique both exist.
+  Only if no such part can be found is a guard genuinely redundant — and then
+  it and its pin go together, deliberately.
+
+Quietly relaxing a counter-pin to green is the one outcome this ADR forbids:
+these guards are the reason rounds 6, 7 and 8 stayed closed.
+
+### A6 — the corpus has no filleted boss base, and must get one
+
+The corpus has conical bosses and it has fillets, but no boss with a **filleted
+base** — precisely the shape where D2's gate stops suppressing, because the
+fillet sits between cone and plate top so those two faces never meet at all.
+
+Six such parts were built (cone radii 8–12, heights 14–25, fillet radii
+1.5–4.0, bore offsets 0.5–2.0): baseline 6/6 correct, under the proposal 6/6
+correct and unchanged. The gate permits the veto there and it does no harm —
+but that was luck until measured, and nothing in the suite would have caught it
+going the other way. **The family ships as a pin with the build.**
 
 ## 5. Adversarial surfaces — attack these before Accepted
 
