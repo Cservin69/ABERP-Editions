@@ -772,6 +772,29 @@ pub fn compute_disposition(
 /// encoding, **not** `None`. Otherwise "no digest because there are no units"
 /// could not be told from "no digest because this report predates ADR-0126",
 /// and the gate's legacy fallback would fire on lot-only reports forever.
+///
+/// # Mutation record (2026-09-16) — 8 killed, 2 survived
+/// Killed: reverting the gate to the `serial_range` comparison; making the
+/// legacy fallback a blanket pass; deduping the multiset; dropping the
+/// `part_uid` bytes; dropping the `part_serial` bytes; dropping BOTH length
+/// prefixes (a true delimiter join); removing the sort; and freezing no
+/// digest at all.
+///
+/// **The first draft of the injectivity pin did not kill any of those last
+/// four**, and the mutants are why. It used `("AB","C")` against
+/// `("A","BC")`, which is not a collision for a `:`-delimited encoding at all
+/// — `:AB:C` and `:A:BC` are different strings — and it compared values whose
+/// lengths and sort positions differed, so the surviving parts of the
+/// encoding separated them for the wrong reason. The pins now use a genuine
+/// collision (the delimiter INSIDE a field) and same-length, single-pair
+/// values, so content is what they measure.
+///
+/// **Survived, recorded rather than papered over:** dropping *only* the uid
+/// length prefix, and dropping *only* the serial length prefix. In each case
+/// the remaining prefix still disambiguates the split, and no collision could
+/// be constructed for either — they are plausibly equivalent mutants rather
+/// than gaps. Dropping both is killed, which is the property the design
+/// actually claims.
 pub fn unit_set_digest(units: &[ReportUnit]) -> String {
     use sha2::{Digest, Sha256};
 
@@ -2252,11 +2275,48 @@ mod tests {
     }
 
     /// A field boundary must not be forgeable by putting the delimiter INTO a
-    /// serial — the reason the prefix is a byte length and not a separator.
+    /// field — the reason the prefix is a byte LENGTH and not a separator.
+    ///
+    /// These are the mutation-proof cases. An earlier draft of this pin used
+    /// `("AB","C")` against `("A","BC")`, which is **not** a collision for a
+    /// `:`-delimited encoding (`:AB:C` and `:A:BC` are different strings) —
+    /// so it passed even with the length prefixes removed. A genuine
+    /// collision needs the delimiter inside a field.
     #[test]
-    fn a_serial_containing_the_delimiter_cannot_forge_a_boundary() {
-        assert_ne!(unit_set_digest(&[u("p1", "5:HELLO")]), unit_set_digest(&[u("p1", "5"), u("HELLO", "")]));
+    fn a_field_containing_the_delimiter_cannot_forge_a_boundary() {
+        // Delimiter-joined, both of these are ":A:B:C" — identical. Only the
+        // length prefix separates them.
+        assert_ne!(
+            unit_set_digest(&[u("A:B", "C")]),
+            unit_set_digest(&[u("A", "B:C")]),
+            "a delimiter-joined encoding collides here; the length prefix is \
+             the whole reason it does not"
+        );
         assert_ne!(unit_set_digest(&[u("", "")]), unit_set_digest(&[]));
+    }
+
+    /// Every field of every pair must be INSIDE the hash — content, not just
+    /// length, and not merely reflected in the sort order.
+    ///
+    /// Same-length values are the point: hashing only the length prefix, or
+    /// relying on the sort to reorder the remaining fields, both pass a test
+    /// whose values differ in length or in sort position. These do not.
+    #[test]
+    fn both_fields_are_hashed_by_content_not_merely_by_length() {
+        // one pair, so the sort cannot separate them; equal lengths, so the
+        // length prefix cannot either. Only the uid bytes differ.
+        assert_ne!(
+            unit_set_digest(&[u("aa", "SN-001")]),
+            unit_set_digest(&[u("ab", "SN-001")]),
+            "part_uid content must reach the hash — it is the identity the \
+             measurement join and the NCR belt key on"
+        );
+        // …and the same for the serial.
+        assert_ne!(
+            unit_set_digest(&[u("p1", "aa")]),
+            unit_set_digest(&[u("p1", "ab")]),
+            "part_serial content must reach the hash"
+        );
     }
 
     /// `wo_part_marks` has no unique constraint, so a duplicated row is a
