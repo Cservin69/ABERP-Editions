@@ -1,7 +1,8 @@
 # ADR-0126 — The unit-set digest: what the drift check must actually see
 
-- **Status:** **Proposed** (2026-09-16) — held for Ervin's review before the
-  fix lands. The defect is **reproduced**, not argued: two red tests on
+- **Status:** **Accepted** (2026-09-16) — round 1 adversarial complete
+  (**FIX-FIRST**); A1–A4 folded in below. Built on
+  `feat/adr-0126-unit-set-digest`, held for Ervin's review, not merged. The defect is **reproduced**, not argued: two red tests on
   `feat/adr-0126-unit-set-digest` (`f2ab042`) drive the real gate and it
   returns `Pass` in both.
 - **Date:** 2026-09-16
@@ -76,6 +77,15 @@ present bug is entirely the consequence of using one for the other.
 
 ### D2 — The encoding must be INJECTIVE, and this is the part to get right
 
+**It is a MULTISET, not a set (round 1, A3).** `wo_part_marks` has no primary
+key and no unique constraint of any kind — nothing at the schema level stops
+two rows sharing a `part_uid`, or a row being duplicated outright.
+`record_part_marks`'s refuse-second-write is the only thing holding that line,
+and it is exactly the protection this ADR assumes is absent. So the encoding
+sorts and hashes **every** pair and **never dedupes**: a duplicated row is
+itself drift and must move the digest. A future "optimisation" that dedupes
+here silently reopens the hole, and a test pins the duplicate case.
+
 Each unit contributes both fields; pairs are sorted by `(part_uid,
 part_serial)`; **every field is length-prefixed**, not delimiter-joined:
 
@@ -102,11 +112,21 @@ whole distinction collapses.
 - an additive `unit_set_sha256` field on the existing `qcr.report_issued`
   payload, which is what makes it tamper-evident.
 
-Per ADR-0094 this is **no new `EventKind`** — an additive `Option` field with
-`#[serde(default)]`, matching the four such fields the struct already carries.
-`EventKind`'s doc comment **is** the schema contract, enforced by
-`export_payload_field_names_match_the_eventkind_docs`, so the doc comment is
-updated in the same commit or the gate reds.
+Per ADR-0094 this is **no new `EventKind`** — an additive field, matching the
+additive fields this family already carries.
+
+**⚠️ Corrected after round 1 (A1). The enforcement this originally cited does
+not cover this payload.** `export_payload_field_names_match_the_eventkind_docs`
+(`crates/aberp-dispatch/src/audit.rs:328`) pins **only the three `export.*`
+typed payloads**, each against a hardcoded key list. `qcr.report_issued` is
+built inline with `json!{…}` (`reports.rs:1128`), and **nothing anywhere pins
+its key set**. On the `qcr.*` family the doc comment is unenforced prose.
+
+So this ADR **creates** the enforcement rather than citing it: a new pin
+freezes and issues a report and asserts the emitted `qcr.report_issued`
+payload's exact key set, on the export test's "no more, no fewer" discipline.
+That protects this change and closes a gap that predates it. The doc comment is
+updated by discipline **and** by that new pin.
 
 Both, because they answer different questions. The column answers "did the
 marks change since issuance" cheaply. The ledger entry answers "was the column
@@ -131,15 +151,44 @@ no-backfill posture — an honest absence beats a reconstructed guess in an
 evidence trail.
 
 So: digest present → compare digests. Digest absent → fall back to the range
-comparison **and record that the strong check did not run**. This leaves legacy
-reports exactly where they are today (no regression) and makes every report
-issued from now on strongly checked. The weakness ages out as reports are
-superseded, and until then it is visible rather than assumed.
+comparison.
+
+**⚠️ Sharpened after round 1 (A4).** The first draft said this "records that
+the strong check did not run" without ever saying where, which is decoration.
+Stated honestly instead: **this slice surfaces the degradation nowhere.** A
+legacy report and a digest-bearing one are indistinguishable at the API and in
+the evidence bundle. What exists is the column — `unit_set_sha256 IS NULL` is
+the query that separates them, and it is exact.
+
+Surfacing it belongs with ADR-0122 §D3's omission block, which already has the
+machine-readable shape for "this evidence is missing and here is why". That is
+**named as the follow-on and deliberately not built here**, because widening
+this slice into the bundle writer trades a closed hole for two open ones.
+
+This leaves legacy reports exactly where they are today — no regression — and
+makes every report issued from now on strongly checked.
 
 **Rejected: blocking every pre-digest report.** It is the stricter reading, but
 it strands already-issued evidence on a technicality about when it was issued,
 and the exposure it removes is the one that existed before this ADR anyway.
 Flagged for Ervin — if he wants the strict form, it is a one-line change.
+
+### D5b — Correct the THIRD copy of ADR-0124's overclaim (round 1, A2)
+
+`QcReportIssued`'s own doc comment still reads:
+
+> "The BYTES ARE NOT STORED anywhere — the report re-renders deterministically
+> from the frozen `qc_report_lines`, and this chain entry proves the bytes
+> anyone re-renders are the bytes that were issued (ADR-0199 §D7)."
+
+That is the exact sentence ADR-0124 exists to correct. ADR-0124 §3 states the
+claim is corrected "in both places" — ADR-0199 §D7 and `qc_report.rs:397`.
+There is a **third** copy, and it is the worst: it sits in the artifact this
+codebase calls its schema contract, on the load-bearing event.
+
+Corrected here, marked and dated. This ADR is already editing that doc comment
+to add the payload field, so leaving the stale claim beside the new one would
+be a deliberate omission.
 
 ### D6 — Correct the false comment, dated
 
