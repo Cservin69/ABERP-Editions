@@ -18187,7 +18187,14 @@ pub fn resolve_open_ncr_gate(
     // has `affected_part_uids: []`, so the unit join matched nothing while a
     // real Open NCR stood against the order.
     let blocking =
-        crate::quality::open_ncr_ids_blocking_wo(&ncrs, &waivers, &dispatch.wo_id, &part_uids);
+        crate::quality::open_ncr_ids_blocking_wo(
+            &ncrs,
+            &waivers,
+            // ADR-0128 — a revoked waiver stops disarming the belt, terminally.
+            &crate::quality::list_ncr_shipment_waiver_revocations(conn, tenant)?,
+            &dispatch.wo_id,
+            &part_uids,
+        );
     if blocking.is_empty() {
         Ok(OpenNcrGate::Pass)
     } else {
