@@ -115,11 +115,91 @@ whenever the bore's wall leaves the boss below z = 20 — and the cap evidence
 above shows the boss was never weighed, not that a second convention was
 applied. A part cannot be P for 98 members of a family and W for 10.
 
-## What a fix has to do
+## ⚠️ CORRECTION — the fix does NOT belong in `_barrier_track`
 
-Stop the march where the edge stops being an edge. The failure is not the ray
-test and not the cap walk; it is `_barrier_track` reconstructing edge past a
-vertex the bore did not create. Any fix must keep the 26 correct parts that also
-exhaust the march budget, and must leave the 43 committed fixtures bit-identical.
+The section this replaces concluded "stop the march where the edge stops being
+an edge". **That was wrong, and building it proved it wrong.** Two candidate
+fixes were built and measured; both are falsified. Recorded here because the
+falsifications are what locate the real defect.
 
-Not built. Held for Ervin.
+### Attempt 1 — drop un-re-emerged marches. REJECTED
+
+The walk's own premise is re-emergence: the bore took the MIDDLE out of an edge,
+so the curve leads back to the other stub, and leaving the footprint is what
+proves it. A march that burns its whole budget without leaving never re-emerged,
+so it is not a barrier. Implemented; measured on the 108:
+
+```
+before: 10 wrong        after: 11 wrong   (the same 10, plus a new regression)
+```
+
+It fixed nothing and broke a part that was right — so an un-re-emerged march is
+doing necessary work elsewhere, and the runaway is a real artefact that is **not
+the blocker**. Patch kept at `scratchpad/attempt1-reemergence.patch`.
+
+**Why it could not have worked**, found by logging which barrier blocks each
+ray: the rays to the cone are blocked by the plate's **real** top edge at
+x = 40 — 27 rays each — not by the runaways. The fabricated barrier is genuinely
+fabricated and genuinely harmless.
+
+### Attempt 2 — reconstruct the division the bore consumed. REJECTED
+
+Better diagnosis: in 8 of the 10 failures the bore eats the **entire junction**
+between boss and plate top (`off + r20 <= br`, 8/8 with **zero** false positives
+across all 108). The edge that should divide the plate's top face from the boss
+is not merely mis-marched — it does not exist, so the plate's top face has a
+clear ray to the axis it does not own.
+
+That edge is recoverable from the faces' untrimmed carriers, exactly as
+`_cap_axis_intersections` recovers surfaces the bore removed. Implemented with
+`GeomAPI_IntSS` over each rim face pair (18 reconstructed divisions on the
+exemplar). Measured: **still 10 wrong**, and the cap log says why:
+
+```
+cand=[Cone 23.2906, Cone 23.2906, Plane 20.0, Cone 23.2906]   kept=[]
+```
+
+The reconstructed boss-base circle **encircles the axis**, so it blocks every
+ray — to the cone as well as to the plate. `standing` goes empty, the caller
+falls back to "keep every cap", and `min(20.0, 23.2906) = 20.0` returns the same
+wrong answer.
+
+## The actual root cause — a limit of the ownership MODEL
+
+`_skin_reaches_axis` decides ownership by **reachability**: the owner of the
+axis must have a piece of mouth the axis can see. When the bore consumes the
+owner's entire footprint around the axis, the owner has no such mouth — its only
+surviving faces are outboard, behind a real edge. No barrier scheme can repair
+that, because the fault is not a missing or spurious barrier: **the evidence the
+model needs is not in the topology at all.**
+
+Note too that the filter is not merely mis-ranking. `_rim_winner` takes the
+INNERMOST crossing among reaching faces, so keeping every cap also yields 20.0
+(`min(20.0, 23.2906)`). Only actively *dropping* the plate's top face reaches
+23.2907 — which is exactly what the filter does correctly on the passing twin.
+
+The correct criterion is skin **continuation**, not zero crossings: a ray from
+the axis to the cone's outboard mouth crosses the boss-base circle
+(cone → plate-top) and then the plate's top edge at x = 40 (plate-top → cone
+overhang), ending on the same skin it started on. Two changes, same owner. The
+present test counts any crossing as disqualifying because the tracks carry no
+side information — they are polylines, with no record of which face lies on
+each side.
+
+## What this needs — and why it is not being patched in here
+
+A fix means either carrying face-side information on every barrier and replacing
+reachability with a parity/continuation test, or replacing the ray test with a
+direct "is this cap buried under another rim face's material at the axis"
+predicate. Both change the **core reckoning** of `_rim_winner` — the same core
+that rounds 4, 5 and 6 each broke in turn, each time on a money path.
+
+That is an ADR-level design change with its own adversarial round, not a patch
+smuggled into a residual cleanup. **R3 is therefore measured and characterised,
+not fixed.** The existing pin already bounds it (`wrong <= 10`) and records it as
+open; nothing regressed.
+
+This is not a depth-convention question. Under P the exemplar's answer is
+unambiguous: the bore's axis meets cone material at z = 23.2907 and the
+extractor reports 20.0, 3.29 mm shallow. The convention is settled; the
+extractor cannot yet reach it.
