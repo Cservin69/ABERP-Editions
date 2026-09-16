@@ -431,10 +431,19 @@ pub fn read_draft(conn: &Connection, tenant: &str, drf_id: &str) -> Result<Optio
 pub fn list_drafts(conn: &Connection, tenant: &str) -> Result<Vec<InvoiceDraft>> {
     let mut stmt = conn
         .prepare(
+            // ADR-0123 §D5 — STAGED rows only. A promoted draft is not
+            // outstanding work: its invoice exists, and listing it invites a
+            // second promote (refused, but noisy) and misrepresents the queue
+            // as deeper than it is.
+            //
+            // `state IS NULL` is included deliberately: every row written
+            // before the ADR-0123 migration carries NULL, and those ARE still
+            // awaiting an invoice. Matching only `= 'staged'` would silently
+            // empty the operator's list on the first boot after upgrade.
             "SELECT drf_id, tenant_id, partner_id, source_dispatch_id, source_wo_id,
                     source_quote_id, product_id, qty, notes, created_at
              FROM invoice_draft
-             WHERE tenant_id = ?
+             WHERE tenant_id = ? AND (state IS NULL OR state <> 'promoted')
              ORDER BY created_at DESC;",
         )
         .context("prepare list_drafts")?;
@@ -579,7 +588,7 @@ pub fn delete_draft_in_tx(
     // holds a write lock on the rows it touches.
     let prior_row = tx
         .query_row(
-            "SELECT partner_id, source_dispatch_id, source_wo_id, source_quote_id
+            "SELECT partner_id, source_dispatch_id, source_wo_id, source_quote_id, state
              FROM invoice_draft
              WHERE tenant_id = ? AND drf_id = ?
              LIMIT 1;",
@@ -590,12 +599,40 @@ pub fn delete_draft_in_tx(
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .ok();
 
-    let Some((partner_id, source_dispatch_id, source_wo_id, source_quote_id)) = prior_row else {
+    // ADR-0123 §D5 — a PROMOTED draft is not deletable by an operator.
+    //
+    // The invoice's own link survives a delete either way — it lives in
+    // `invoice_shipment_provenance` and in the hash-chained
+    // `InvoiceDraftCreated` payload, neither of which this function can reach.
+    // What the draft row carries is the ability to CHECK that link: §D2 keeps
+    // `source_draft_id` precisely so an inspector can look at the row the
+    // server derived the dispatch from, rather than take the derivation on
+    // trust. Deleting it downgrades a checkable derivation to an assertion,
+    // and that is not an operator-level action.
+    //
+    // Read inside the same tx as the DELETE, so the check cannot be raced by a
+    // concurrent promote: the tx holds a write lock on the rows it touches.
+    if let Some((_, _, _, _, state)) = prior_row.as_ref() {
+        if DraftState::parse(state.as_deref()) == DraftState::Promoted {
+            return Err(anyhow!(
+                "invoice draft {} has been promoted — an invoice was issued from it, and \
+                 this row is the record an auditor checks that invoice's shipment \
+                 provenance against. It is not deletable. (The invoice itself is \
+                 corrected with a storno + a new issuance, never by deleting its \
+                 provenance.)",
+                inputs.drf_id
+            ));
+        }
+    }
+
+    let Some((partner_id, source_dispatch_id, source_wo_id, source_quote_id, _state)) = prior_row
+    else {
         return Ok(DeleteDraftOutcome {
             deleted: false,
             dispatch_pointers_cleared: 0,

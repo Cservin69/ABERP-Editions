@@ -1335,6 +1335,7 @@ where
                 &tx,
                 ledger_meta.tenant_id().as_str(),
                 drf_id,
+                customer_partner_id.as_deref(),
             )?),
             None => None,
         };

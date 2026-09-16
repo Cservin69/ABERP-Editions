@@ -2235,9 +2235,30 @@ pub async fn get_invoice_draft(
     forward_get(&state, &path, true).await
 }
 
+/// ADR-0123 §D1 — `POST /api/invoice-drafts/<drf_id>/promote`.
+///
+/// Issues an invoice AND binds it to the shipment the named draft came from,
+/// in one backend transaction. The body is the ordinary issue body: the draft
+/// carries partner / product / qty but NO price, currency, dates or bank, so
+/// the operator still supplies the commercial terms. What the operator does
+/// NOT supply is the provenance — the server reads that off the draft row.
+#[tauri::command]
+pub async fn promote_invoice_draft(
+    state: State<'_, AppState>,
+    drf_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_qa_or_routing_op_id(&drf_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/invoice-drafts/{drf_id}/promote");
+    forward_post(&state, &path, body).await
+}
+
 /// S236 / PR-230b — `DELETE /api/invoice-drafts/:id`. No-op idempotent
 /// on absent rows (the backend returns 404 silently mapped to
 /// `Ok(())`); the inline quick-action on Draft list rows calls here.
+///
+/// ADR-0123 §D5 — the backend REFUSES a promoted draft: that row is what an
+/// auditor checks the invoice's shipment provenance against.
 #[tauri::command]
 pub async fn delete_invoice_draft(
     state: State<'_, AppState>,

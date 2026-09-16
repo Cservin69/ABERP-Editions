@@ -5099,6 +5099,12 @@ pub fn build_router(state: AppState) -> Router {
         // D-04 (ADR-0121) — NIST SP 800-171 ledger-evidence coverage report
         // (read-only; ?from_ms=&to_ms= optional assessment window).
         .route("/api/nist-coverage", get(handle_get_nist_coverage))
+        // ADR-0123 §D3 — the invoice-provenance detector. Read-side fold over
+        // the ledger; no new EventKind, no firing site, no schema.
+        .route(
+            "/api/shipment-invoice-provenance",
+            get(handle_get_shipment_invoice_provenance),
+        )
         // S231 / PR-227 / ADR-0061 — Stage 3 Phase γ Inventory v1.
         // GET lists the per-product `stock_movements` ledger
         // (descending by at_iso8601, paginated). POST appends one
@@ -27679,6 +27685,74 @@ pub fn build_nist_coverage_report(
     let observed = crate::nist_coverage::observed_kinds(&entries, window);
     let report = crate::nist_coverage::coverage(&observed, window.clone());
     Ok(crate::nist_coverage::render_report_json(&report))
+}
+
+/// Fold this tenant's chain into the shipment-invoice-provenance report
+/// (ADR-0123 §D3).
+///
+/// Reads through the shared `Handle` with the sanctioned `recent_entries`
+/// helper — NO new database opener, so the frozen-opener ledger (cut-gate
+/// CHECK 10i) is untouched. Read-only: appends nothing.
+pub fn build_shipment_provenance_report(
+    state: &AppState,
+) -> Result<crate::invoice_provenance::ShipmentProvenanceReport> {
+    let conn = state
+        .db
+        .read()
+        .context("shared reader: shipment-invoice-provenance (ADR-0098 Gap 1a)")?;
+    let entries = aberp_audit_ledger::recent_entries(&conn, u32::MAX)
+        .map_err(|e| anyhow!("read audit entries for shipment-invoice-provenance: {e}"))?;
+    crate::invoice_provenance::fold_shipment_provenance(&entries)
+}
+
+/// `GET /api/shipment-invoice-provenance` — which shipments have an invoice
+/// that records them as its origin (ADR-0123 §D3).
+///
+/// This is the DETECTOR, not a blocker. An operator can still issue an invoice
+/// through the ordinary form and leave a shipment unlinked; ADR-0123 refused to
+/// forbid that, because every available blocking rule is a heuristic and a
+/// wrong refusal on a money path is worse than a missing link. So the hole is
+/// made countable instead of invisible.
+///
+/// **A non-zero `shipments_with_no_recorded_invoice` is expected**, not an
+/// alarm: warranty replacements, free samples and consignment movements are
+/// genuine shipped dispatches that will never be invoiced.
+///
+/// Defense-only, matching the promote route it measures.
+async fn handle_get_shipment_invoice_provenance(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if !build_profile::storefront_polling_allowed() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "not_permitted",
+                "detail": "ADR-0123 §D4: shipment-invoice provenance is a Defense-edition \
+                           capability. This build has no promote route to measure."
+            })),
+        )
+            .into_response();
+    }
+    match tokio::task::spawn_blocking({
+        let state = state.clone();
+        move || build_shipment_provenance_report(&state)
+    })
+    .await
+    {
+        Ok(Ok(report)) => (StatusCode::OK, Json(report)).into_response(),
+        Ok(Err(e)) => internal_error("build_shipment_provenance_report", e),
+        Err(e) => internal_error(
+            "build_shipment_provenance_report:join",
+            anyhow!("join error: {e}"),
+        ),
+    }
 }
 
 /// `GET /api/nist-coverage` — the NIST SP 800-171 ledger-evidence coverage

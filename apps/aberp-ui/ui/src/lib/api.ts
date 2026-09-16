@@ -509,6 +509,23 @@ export async function deleteInvoiceDraft(drfId: string): Promise<void> {
   return invoke<void>("delete_invoice_draft", { drfId });
 }
 
+/** ADR-0123 §D1 — issue an invoice FROM a draft, so the invoice records the
+ * shipment it bills.
+ *
+ * Same body as {@link issueInvoice}: the draft carries partner / product /
+ * qty but no price, currency, dates or bank, so the operator still supplies
+ * the commercial terms. The provenance is the part they do NOT supply — the
+ * server reads it off the draft row named in the path.
+ *
+ * Refuses (and issues nothing) when the draft is already promoted, does not
+ * exist, or belongs to a different buyer than the one being billed. */
+export async function promoteInvoiceDraft(
+  drfId: string,
+  body: IssueInvoiceRequest,
+): Promise<IssueInvoiceResponse> {
+  return invoke<IssueInvoiceResponse>("promote_invoice_draft", { drfId, body });
+}
+
 export async function getInvoice(invoiceId: string): Promise<InvoiceDetail> {
   return invoke<InvoiceDetail>("get_invoice", { invoiceId });
 }

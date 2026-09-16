@@ -162,6 +162,13 @@ street = "Fo utca 1."
 /// Seed a shipped dispatch with a staged draft, exactly as the spawner does
 /// inside `mark_shipped`. Returns the draft id.
 fn seed_staged_draft(state: &AppState) -> String {
+    seed_staged_draft_for(state, DSP)
+}
+
+/// One draft per dispatch is enforced by the schema
+/// (`UNIQUE (tenant_id, source_dispatch_id)`), so a test seeding two drafts
+/// must give them distinct dispatches.
+fn seed_staged_draft_for(state: &AppState, dsp: &str) -> String {
     let drf_id = format!("drf_{}", Ulid::new());
     let guard = state.db.write().expect("writer");
     guard
@@ -171,7 +178,7 @@ fn seed_staged_draft(state: &AppState) -> String {
                 product_id, qty, notes, created_at, state
              ) VALUES (?1, ?2, 'ptr_x', ?3, ?4, 'prd_bracket', '1', NULL,
                        '2026-09-11T00:00:00Z', 'staged');",
-            params![&drf_id, TEST_TENANT, DSP, WO],
+            params![&drf_id, TEST_TENANT, dsp, WO],
         )
         .expect("seed invoice_draft");
     drop(guard);
@@ -211,13 +218,44 @@ fn chain_payload(state: &AppState, invoice_id: &str) -> InvoiceDraftCreatedPaylo
     panic!("no InvoiceDraftCreated entry for {invoice_id}");
 }
 
+/// Issue (or promote) with an explicit saved-partner id on the buyer, which is
+/// what the partner-mismatch guard compares against.
+async fn promote_as_partner(
+    state: &AppState,
+    drf_id: Option<String>,
+    partner_id: &str,
+) -> anyhow::Result<aberp::issue_invoice::IssuedInvoiceSummary> {
+    let mut req = fixture_request();
+    req.customer.partner_id = Some(partner_id.to_string());
+    serve::issue_invoice_request(
+        state,
+        req,
+        fixture_supplier(),
+        &UnreachableProvider,
+        Actor::from_local_cli(Ulid::new().to_string(), "test-user"),
+        None,
+        drf_id,
+    )
+    .await
+}
+
+/// Promote (or issue) naming the seeded draft's own buyer, `ptr_x`.
+///
+/// Every promote here names a partner because ADR-0123's guard REQUIRES it: a
+/// shipment-linked invoice must bill the party the goods went to, and a one-off
+/// buyer cannot be checked against that. The unnamed-buyer case is its own test
+/// below.
 async fn promote(
     state: &AppState,
     drf_id: Option<String>,
 ) -> aberp::issue_invoice::IssuedInvoiceSummary {
+    let mut req = fixture_request();
+    if drf_id.is_some() {
+        req.customer.partner_id = Some("ptr_x".to_string());
+    }
     serve::issue_invoice_request(
         state,
-        fixture_request(),
+        req,
         fixture_supplier(),
         &UnreachableProvider,
         Actor::from_local_cli(Ulid::new().to_string(), "test-user"),
@@ -410,4 +448,282 @@ async fn the_ordinary_issue_path_records_no_provenance_and_infers_nothing() {
     );
     // And the untouched draft is still outstanding work.
     assert_eq!(draft_state(&state, &drf_id), DraftState::Staged);
+}
+
+// ── ADR-0123 §D5 — the two protections on the draft row ─────────────────
+
+/// **A promoted draft is not deletable.**
+///
+/// The invoice's link survives a delete either way (proven above). What the
+/// draft row carries is the ability to CHECK that link — §D2 keeps
+/// `source_draft_id` so an inspector can inspect the row the server derived
+/// the dispatch from instead of trusting the derivation. Deleting it
+/// downgrades a checkable derivation to an assertion.
+#[tokio::test(flavor = "current_thread")]
+async fn a_promoted_draft_cannot_be_deleted_by_an_operator() {
+    let dir = test_dir("nodelete");
+    std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+    let drf_id = seed_staged_draft(&state);
+    let summary = promote(&state, Some(drf_id.clone())).await;
+
+    let mut guard = state.db.write().expect("writer");
+    let tx = guard.transaction().expect("tx");
+    let err = aberp::invoice_draft::delete_draft_in_tx(
+        &tx,
+        &aberp_audit_ledger::LedgerMeta::new(
+            TenantId::new(TEST_TENANT.to_string()).unwrap(),
+            BinaryHash::from_bytes([0u8; 32]),
+        ),
+        Actor::from_local_cli("s".to_string(), "op"),
+        aberp::invoice_draft::DeleteDraftInputs {
+            tenant: TEST_TENANT.to_string(),
+            drf_id: drf_id.clone(),
+            actor: "op".to_string(),
+        },
+    )
+    .expect_err("a promoted draft must refuse deletion");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("has been promoted") && msg.contains(&drf_id),
+        "the refusal must name the draft and say why: {msg}"
+    );
+    drop(tx);
+    drop(guard);
+
+    // The row is still there — and so is the invoice's link.
+    assert_eq!(draft_state(&state, &drf_id), DraftState::Promoted);
+    let conn = state.db.read().expect("read");
+    assert!(
+        aberp::invoice_provenance::get_for_invoice(&conn, TEST_TENANT, &summary.invoice_id)
+            .expect("read")
+            .is_some()
+    );
+}
+
+/// A STAGED draft is still deletable — the protection is targeted, not a
+/// blanket freeze on the delete route.
+#[tokio::test(flavor = "current_thread")]
+async fn a_staged_draft_is_still_deletable() {
+    let dir = test_dir("stageddelete");
+    std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+    let drf_id = seed_staged_draft(&state);
+
+    let mut guard = state.db.write().expect("writer");
+    let tx = guard.transaction().expect("tx");
+    let outcome = aberp::invoice_draft::delete_draft_in_tx(
+        &tx,
+        &aberp_audit_ledger::LedgerMeta::new(
+            TenantId::new(TEST_TENANT.to_string()).unwrap(),
+            BinaryHash::from_bytes([0u8; 32]),
+        ),
+        Actor::from_local_cli("s".to_string(), "op"),
+        aberp::invoice_draft::DeleteDraftInputs {
+            tenant: TEST_TENANT.to_string(),
+            drf_id: drf_id.clone(),
+            actor: "op".to_string(),
+        },
+    )
+    .expect("a staged draft deletes as before");
+    assert!(outcome.deleted);
+    tx.commit().expect("commit");
+}
+
+/// **A promoted draft leaves the operator's work list; a staged one stays.**
+///
+/// Pre-ADR-0123 rows carry `state IS NULL` and MUST still list — matching only
+/// `= 'staged'` would silently empty the queue on the first boot after the
+/// migration, which is the failure mode worth pinning.
+#[tokio::test(flavor = "current_thread")]
+async fn the_draft_list_shows_staged_and_legacy_rows_but_not_promoted_ones() {
+    let dir = test_dir("listfilter");
+    std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+
+    let staged = seed_staged_draft_for(&state, DSP);
+    let promoted = seed_staged_draft_for(&state, "dsp_01BRZ3NDEKTSV4RRFFQ69G5FAV");
+    let legacy = format!("drf_{}", Ulid::new());
+    {
+        let guard = state.db.write().expect("writer");
+        // A pre-migration row: state IS NULL.
+        guard
+            .execute(
+                "INSERT INTO invoice_draft (
+                    drf_id, tenant_id, partner_id, source_dispatch_id, source_wo_id,
+                    product_id, qty, notes, created_at, state
+                 ) VALUES (?1, ?2, 'ptr_x', NULL, NULL, 'prd_bracket', '1', NULL,
+                           '2026-09-01T00:00:00Z', NULL);",
+                params![&legacy, TEST_TENANT],
+            )
+            .expect("seed legacy draft");
+        guard
+            .execute(
+                "UPDATE invoice_draft SET state = 'promoted'
+                  WHERE tenant_id = ?1 AND drf_id = ?2;",
+                params![TEST_TENANT, &promoted],
+            )
+            .expect("flip");
+        drop(guard);
+    }
+
+    let conn = state.db.read().expect("read");
+    let ids: Vec<String> = aberp::invoice_draft::list_drafts(&conn, TEST_TENANT)
+        .expect("list drafts")
+        .into_iter()
+        .map(|d| d.drf_id)
+        .collect();
+    assert!(ids.contains(&staged), "a staged draft is outstanding work");
+    assert!(
+        ids.contains(&legacy),
+        "a pre-migration NULL-state row is still outstanding work — matching \
+         only `= 'staged'` would empty the queue on the first boot after upgrade"
+    );
+    assert!(
+        !ids.contains(&promoted),
+        "a promoted draft is not outstanding work"
+    );
+}
+
+/// **The sharpest hazard in the promote flow: the operator edits the buyer.**
+///
+/// The form opens prefilled from the draft; nothing stops the operator
+/// changing the customer before submitting. If that were allowed to proceed,
+/// the invoice would bill partner B while carrying partner A's dispatch as its
+/// recorded origin — an actively WRONG evidence link. ADR-0123 rejected
+/// inference because "a guess in an evidence trail is worse than an honest
+/// absence"; a wrong link is worse still, so promote refuses.
+#[tokio::test(flavor = "current_thread")]
+async fn promoting_a_draft_for_a_different_buyer_is_refused() {
+    let dir = test_dir("mismatch");
+    std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+    // The seeded draft belongs to `ptr_x`.
+    let drf_id = seed_staged_draft(&state);
+
+    let err = promote_as_partner(&state, Some(drf_id.clone()), "ptr_SOMEONE_ELSE")
+        .await
+        .expect_err("billing a different buyer under this shipment must refuse");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("ptr_x") && msg.contains("ptr_SOMEONE_ELSE"),
+        "the refusal must name BOTH partners so the operator can see the swap: {msg}"
+    );
+
+    // Refused cleanly: the draft is untouched and nothing was recorded.
+    assert_eq!(draft_state(&state, &drf_id), DraftState::Staged);
+    let conn = state.db.read().expect("read");
+    assert!(
+        aberp::invoice_provenance::list_for_dispatch(&conn, TEST_TENANT, DSP)
+            .expect("list")
+            .is_empty()
+    );
+}
+
+/// The matching case proceeds — the guard is targeted, not a blanket refusal
+/// of every promote that names a partner.
+#[tokio::test(flavor = "current_thread")]
+async fn promoting_a_draft_for_the_same_buyer_proceeds() {
+    let dir = test_dir("match");
+    std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+    let drf_id = seed_staged_draft(&state);
+
+    let summary = promote_as_partner(&state, Some(drf_id.clone()), "ptr_x")
+        .await
+        .expect("the draft's own buyer promotes normally");
+    let conn = state.db.read().expect("read");
+    assert_eq!(
+        aberp::invoice_provenance::get_for_invoice(&conn, TEST_TENANT, &summary.invoice_id)
+            .expect("read")
+            .expect("recorded")
+            .source_dispatch_id
+            .as_deref(),
+        Some(DSP)
+    );
+}
+
+/// **The one-off-buyer hole, shut.**
+///
+/// The earlier guard compared `partner_id` to `partner_id`, so an invoice that
+/// named NO saved buyer slipped past it entirely: an operator could bill an
+/// ad-hoc buyer while recording this shipment as the invoice's origin. That is
+/// the wrong-link case the guard exists for, reached by leaving a field blank
+/// rather than by changing it.
+///
+/// Absent now refuses on the same footing as different, and the message names
+/// the buyer the shipment actually went to so the operator can fix it.
+#[tokio::test(flavor = "current_thread")]
+async fn promoting_a_shipment_linked_draft_to_a_one_off_buyer_is_refused() {
+    let dir = test_dir("oneoff");
+    std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+    let drf_id = seed_staged_draft(&state);
+
+    // `fixture_request()` carries `partner_id: None` — a one-off buyer.
+    let err = serve::issue_invoice_request(
+        &state,
+        fixture_request(),
+        fixture_supplier(),
+        &UnreachableProvider,
+        Actor::from_local_cli(Ulid::new().to_string(), "test-user"),
+        None,
+        Some(drf_id.clone()),
+    )
+    .await
+    .expect_err("an unsaved buyer cannot be checked against the shipment's buyer");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("ptr_x"),
+        "the refusal must name the buyer the goods went to: {msg}"
+    );
+    assert!(
+        msg.contains("one-off") || msg.contains("no saved buyer"),
+        "the refusal must say WHICH condition tripped, not just that it failed: {msg}"
+    );
+
+    // Refused cleanly — nothing recorded, draft untouched.
+    assert_eq!(draft_state(&state, &drf_id), DraftState::Staged);
+    let conn = state.db.read().expect("read");
+    assert!(
+        aberp::invoice_provenance::list_for_dispatch(&conn, TEST_TENANT, DSP)
+            .expect("list")
+            .is_empty(),
+        "a refused promote records no provenance"
+    );
+}
+
+/// The ORDINARY form still accepts a one-off buyer — the refusal is scoped to
+/// promotions, not a new restriction on ad-hoc invoicing.
+#[tokio::test(flavor = "current_thread")]
+async fn the_ordinary_form_still_accepts_a_one_off_buyer() {
+    let dir = test_dir("oneoffok");
+    std::env::set_var("HOME", &dir);
+    write_fixture_seller_toml(&dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+
+    let summary = serve::issue_invoice_request(
+        &state,
+        fixture_request(),
+        fixture_supplier(),
+        &UnreachableProvider,
+        Actor::from_local_cli(Ulid::new().to_string(), "test-user"),
+        None,
+        None,
+    )
+    .await
+    .expect("an ad-hoc buyer is ordinary business on the plain form");
+    let conn = state.db.read().expect("read");
+    assert_eq!(
+        aberp::invoice_provenance::get_for_invoice(&conn, TEST_TENANT, &summary.invoice_id)
+            .expect("read"),
+        None,
+        "no draft named, so no shipment origin — an honest absence"
+    );
 }

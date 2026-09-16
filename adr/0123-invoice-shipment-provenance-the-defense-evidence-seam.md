@@ -315,6 +315,56 @@ This is **not** a follow-up. A build that closes the seam while leaving the
 schema contract claiming it was never open is half a fix, and the half that
 remains is the half an auditor reads.
 
+### D9 — a promote REQUIRES the invoice to name the draft's partner
+
+Added while building slice 5, which exposed the hazard: the issue form opens
+prefilled from the draft and the operator can then **edit the buyer**. An
+invoice billing someone other than the party the goods went to, while recording
+this dispatch as its origin, is an actively **wrong** evidence link — and §D2's
+own rule ("a guess in an evidence trail is worse than an honest absence") makes
+a wrong link worse than a guess.
+
+The rule is one line: **absent or different both refuse.**
+
+**Why absent refuses too**, and this is the seam the first cut left open: a
+one-off buyer carries no `partner_id`, so a guard that compared
+`partner_id == partner_id` let an unsaved buyer through *by leaving a field
+blank* rather than by changing it. The shipment went to a recorded partner
+(`invoice_draft.partner_id` is NOT NULL), so a shipment-linked invoice has a
+known-correct buyer.
+
+**Why NOT compare on identity (name + tax number) instead.** That is itself a
+heuristic: names vary by whitespace, legal-form suffix and accent, and the tax
+number is **optional** — a PrivatePerson buyer carries none. It would be
+weakest exactly where it is needed most. This ADR already refused heuristics on
+this seam.
+
+The escape path is honest and pre-existing: issue through the ordinary form,
+which records no provenance and which §D3's detector counts as an absence
+rather than hiding. Pinned by
+`promoting_a_shipment_linked_draft_to_a_one_off_buyer_is_refused` +
+`promoting_a_draft_for_a_different_buyer_is_refused`, with
+`the_ordinary_form_still_accepts_a_one_off_buyer` proving the refusal is scoped
+to promotions and is not a new restriction on ad-hoc invoicing.
+
+**Resolves Q5.**
+
+### D10 — a zero-value promote is ACCEPTED, not guarded
+
+The draft carries `qty` but no price, which raised the question of an
+accidental zero-value invoice against a real shipment.
+
+Accepted deliberately, for two reasons. A zero-value invoice against a shipment
+is **legitimate** — a warranty replacement, a free sample and a consignment
+movement are the very cases §D3 names as shipments that may never be invoiced
+at all, and an operator who invoices one at zero for record-keeping is doing
+ordinary work. And the promote flow does not introduce the risk: slice 5
+deliberately prefills **no line items** (§Build slices), so a zero total is
+operator-typed exactly as it would be on the ordinary form.
+
+Refusing would block a real operation on a money path, which §D3 already
+settled is the worse trade.
+
 ## Consequences
 
 - A Defense invoice minted through promote can be joined to its dispatch, and
@@ -388,6 +438,9 @@ derivation from the row rather than the request body; no backfill; and leaving
 
 ## Open questions
 
+- ~~**Q5 — the one-off buyer.**~~ **RESOLVED by D9**: refused. The first cut
+  of the guard compared `partner_id` to `partner_id` and so let an unsaved
+  buyer through by omission; that is now closed and mutation-pinned.
 - **Q1 — does promote replace the plain form for dispatch work, or sit beside
   it?** This ADR says beside, with D3's detector. Flagged because it is the
   decision that determines whether the seam is *closed* or merely *closeable*.

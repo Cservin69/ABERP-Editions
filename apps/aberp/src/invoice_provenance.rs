@@ -169,20 +169,27 @@ pub fn resolve_and_mark_promoted_in_tx(
     tx: &Transaction<'_>,
     tenant: &str,
     drf_id: &str,
+    invoice_partner_id: Option<&str>,
 ) -> Result<DraftProvenance> {
-    let row: Option<(String, Option<String>, Option<String>, Option<String>)> = tx
+    let row: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    )> = tx
         .query_row(
-            "SELECT drf_id, source_dispatch_id, source_wo_id, state
+            "SELECT drf_id, source_dispatch_id, source_wo_id, state, partner_id
                FROM invoice_draft
               WHERE tenant_id = ?1 AND drf_id = ?2
               LIMIT 1;",
             params![tenant, drf_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()
         .context("SELECT invoice_draft for promotion")?;
 
-    let Some((found_id, dispatch, wo, state)) = row else {
+    let Some((found_id, dispatch, wo, state, draft_partner_id)) = row else {
         anyhow::bail!(
             "invoice draft {drf_id} does not exist — refusing to issue an invoice \
              against a draft that is not there rather than issuing one with no \
@@ -197,6 +204,50 @@ pub fn resolve_and_mark_promoted_in_tx(
              from it. Correct an issued invoice with a storno + a new issuance, never \
              by promoting the same draft twice"
         );
+    }
+
+    // A promoted invoice must name the draft's partner. Absent or different
+    // both refuse.
+    //
+    // The operator opens the issue form prefilled from this draft and can then
+    // EDIT the buyer. If that were allowed through, the invoice would bill
+    // someone other than the party the goods went to, while recording THIS
+    // dispatch as its origin — an actively WRONG evidence link. ADR-0123
+    // rejected inference because "a guess in an evidence trail is worse than an
+    // honest absence"; a wrong link is worse than a guess.
+    //
+    // **Why absent refuses too.** A one-off buyer carries no `partner_id`, so
+    // there is nothing to compare — and an unverifiable link is exactly the
+    // thing this guard exists to prevent. The shipment went to a RECORDED
+    // partner (`invoice_draft.partner_id` is NOT NULL), so a shipment-linked
+    // invoice has a known correct buyer; billing an ad-hoc one is either a
+    // mistake or a different transaction.
+    //
+    // **Why not compare on identity (name + tax number) instead.** That is
+    // itself a heuristic: names vary by whitespace, legal-form suffix and
+    // accent, and the tax number is OPTIONAL (a PrivatePerson buyer carries
+    // none). It would be weakest precisely where it is needed. ADR-0123 refused
+    // heuristics on this seam for the same reason.
+    //
+    // The escape path is honest and already exists: issue through the ordinary
+    // form. That records no provenance, and §D3's detector counts it as an
+    // absence rather than hiding it.
+    let invoice_partner = invoice_partner_id.map(str::trim).filter(|s| !s.is_empty());
+    match invoice_partner {
+        Some(p) if p == draft_partner_id.trim() => {}
+        Some(p) => anyhow::bail!(
+            "invoice draft {drf_id} was spawned for partner {draft_partner_id}, but this \
+             invoice bills partner {p}. Refusing to record a shipment provenance that \
+             points at a different buyer's dispatch — issue this invoice through the \
+             ordinary form, or promote the draft that belongs to this buyer"
+        ),
+        None => anyhow::bail!(
+            "invoice draft {drf_id} was spawned for partner {draft_partner_id}, but this \
+             invoice names no saved buyer (a one-off buyer). A shipment-linked invoice \
+             must bill the party the goods went to, and an unsaved buyer cannot be \
+             checked against it — pick the saved partner {draft_partner_id}, or issue \
+             through the ordinary form (which records no shipment origin)"
+        ),
     }
 
     tx.execute(
@@ -382,6 +433,146 @@ mod tests {
             .is_empty());
     }
 
+    // ── ADR-0123 §D3 — the detector ──────────────────────────────────
+
+    use aberp_audit_ledger::{Actor, BinaryHash, Entry, EventKind, Ledger, TenantId};
+
+    /// Build real `Entry` values by appending to an in-memory ledger, so the
+    /// fold runs against genuine chain entries rather than hand-built structs.
+    /// Returned seq DESC, matching what `recent_entries` hands the route.
+    fn entries_of(rows: Vec<(EventKind, serde_json::Value)>) -> Vec<Entry> {
+        let mut ledger = Ledger::open_in_memory(
+            TenantId::new("t-fold").unwrap(),
+            BinaryHash::from_bytes([3u8; 32]),
+        )
+        .expect("in-memory ledger");
+        let actor = Actor::from_local_cli("01H0000000000000000000000Z".to_string(), "t");
+        for (kind, payload) in rows {
+            ledger
+                .append(
+                    kind,
+                    serde_json::to_vec(&payload).unwrap(),
+                    actor.clone(),
+                    None,
+                )
+                .expect("append");
+        }
+        let mut e = ledger.entries().expect("entries");
+        e.reverse();
+        e
+    }
+
+    fn shipped(dsp: &str) -> (EventKind, serde_json::Value) {
+        (
+            EventKind::DispatchShipped,
+            serde_json::json!({ "dsp_id": dsp, "wo_id": "wo_1", "shipped_at": "2026-09-16T00:00:00Z" }),
+        )
+    }
+
+    fn invoice_for(inv: &str, dsp: Option<&str>) -> (EventKind, serde_json::Value) {
+        (
+            EventKind::InvoiceDraftCreated,
+            serde_json::json!({ "invoice_id": inv, "source_dispatch_id": dsp }),
+        )
+    }
+
+    /// The report pairs a shipment with the invoice that records it.
+    #[test]
+    fn a_shipment_with_a_promoted_invoice_reads_as_recorded() {
+        let entries = entries_of(vec![shipped("dsp_1"), invoice_for("inv_1", Some("dsp_1"))]);
+        let r = fold_shipment_provenance(&entries).unwrap();
+        assert_eq!(r.shipments_total, 1);
+        assert_eq!(r.shipments_with_recorded_invoice, 1);
+        assert_eq!(r.shipments_with_no_recorded_invoice, 0);
+        assert_eq!(r.shipments[0].invoice_ids, vec!["inv_1".to_string()]);
+    }
+
+    /// **The hole, made countable.** A shipment invoiced through the ordinary
+    /// form has no recorded origin, and the report says so without calling it
+    /// a fault — an unlinked shipment and an uninvoiceable one are
+    /// indistinguishable here, deliberately (ADR-0123 §D3).
+    #[test]
+    fn a_shipment_with_no_promoted_invoice_reads_as_not_recorded() {
+        let entries = entries_of(vec![
+            shipped("dsp_1"),
+            // An invoice that names NO dispatch — the ordinary issue path.
+            invoice_for("inv_1", None),
+        ]);
+        let r = fold_shipment_provenance(&entries).unwrap();
+        assert_eq!(r.shipments_total, 1);
+        assert_eq!(r.shipments_with_no_recorded_invoice, 1);
+        assert!(r.shipments[0].has_no_recorded_invoice());
+    }
+
+    /// **§D5 again.** A storno + re-issue puts TWO invoices on one shipment,
+    /// in issuance order, and the shipment still counts once.
+    #[test]
+    fn a_storno_and_reissue_shows_both_invoices_on_one_shipment() {
+        let entries = entries_of(vec![
+            shipped("dsp_1"),
+            invoice_for("inv_first", Some("dsp_1")),
+            invoice_for("inv_second", Some("dsp_1")),
+        ]);
+        let r = fold_shipment_provenance(&entries).unwrap();
+        assert_eq!(r.shipments_total, 1, "one shipment, not one per invoice");
+        assert_eq!(
+            r.shipments[0].invoice_ids,
+            vec!["inv_first".to_string(), "inv_second".to_string()],
+            "oldest first — the chain order, not the fold's iteration order"
+        );
+    }
+
+    /// An invoice naming a dispatch the ledger never shipped is SURFACED, not
+    /// dropped. "An invoice claims a shipment that did not happen" is exactly
+    /// what an evidence report must not hide — and a fold keyed only on
+    /// `DispatchShipped` would have swallowed it.
+    #[test]
+    fn an_invoice_naming_an_unshipped_dispatch_is_surfaced() {
+        let entries = entries_of(vec![invoice_for("inv_1", Some("dsp_ghost"))]);
+        let r = fold_shipment_provenance(&entries).unwrap();
+        assert_eq!(r.shipments_total, 1);
+        let row = &r.shipments[0];
+        assert_eq!(row.dsp_id, "dsp_ghost");
+        assert_eq!(row.shipped_at, None, "no ship event ever recorded it");
+        assert_eq!(row.invoice_ids, vec!["inv_1".to_string()]);
+    }
+
+    /// Empty ids never pair anything: a payload carrying `"dsp_id": ""` must
+    /// not become a shipment, and `"source_dispatch_id": ""` must not attach
+    /// an invoice to one. Same guard the membership rules carry.
+    #[test]
+    fn empty_ids_never_pair_anything() {
+        let entries = entries_of(vec![
+            (
+                EventKind::DispatchShipped,
+                serde_json::json!({ "dsp_id": "", "wo_id": "wo_1" }),
+            ),
+            shipped("dsp_1"),
+            (
+                EventKind::InvoiceDraftCreated,
+                serde_json::json!({ "invoice_id": "inv_1", "source_dispatch_id": "" }),
+            ),
+        ]);
+        let r = fold_shipment_provenance(&entries).unwrap();
+        assert_eq!(r.shipments_total, 1, "the empty dsp_id is not a shipment");
+        assert!(
+            r.shipments[0].has_no_recorded_invoice(),
+            "an empty source_dispatch_id attaches to nothing"
+        );
+    }
+
+    /// An undecodable payload is skipped, not fatal — the report is a
+    /// read-only diagnostic and must survive a row it cannot parse.
+    #[test]
+    fn an_undecodable_payload_does_not_break_the_fold() {
+        let mut entries = entries_of(vec![shipped("dsp_1")]);
+        let mut junk = entries[0].clone();
+        junk.payload = b"not json".to_vec();
+        entries.push(junk);
+        let r = fold_shipment_provenance(&entries).unwrap();
+        assert_eq!(r.shipments_total, 1);
+    }
+
     /// `ensure_schema` is idempotent — it runs on every serve boot.
     #[test]
     fn ensure_schema_is_idempotent() {
@@ -389,4 +580,138 @@ mod tests {
         ensure_schema(&c).unwrap();
         ensure_schema(&c).unwrap();
     }
+}
+
+// ── ADR-0123 §D3 — the read-side detector ────────────────────────────────
+
+/// One shipped dispatch and what the ledger says about its invoicing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ShipmentProvenanceRow {
+    pub dsp_id: String,
+    pub wo_id: Option<String>,
+    pub shipped_at: Option<String>,
+    /// Invoices that record THIS dispatch as their origin, oldest first.
+    /// Plural because a storno + re-issue legitimately produces more than one
+    /// (ADR-0123 §D5).
+    pub invoice_ids: Vec<String>,
+}
+
+impl ShipmentProvenanceRow {
+    /// True when no invoice records this shipment as its origin.
+    ///
+    /// Named `has_no_recorded_invoice`, not `is_missing_an_invoice`: a
+    /// warranty replacement, a free sample and a consignment movement are all
+    /// genuine shipped dispatches that will never be invoiced. This states an
+    /// absence; it does not allege a fault.
+    pub fn has_no_recorded_invoice(&self) -> bool {
+        self.invoice_ids.is_empty()
+    }
+}
+
+/// What the ledger knows about invoice provenance across every shipment
+/// (ADR-0123 §D3).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ShipmentProvenanceReport {
+    pub shipments: Vec<ShipmentProvenanceRow>,
+    pub shipments_total: usize,
+    pub shipments_with_recorded_invoice: usize,
+    pub shipments_with_no_recorded_invoice: usize,
+}
+
+/// Fold the audit entries into the report.
+///
+/// # Both sides come from the CHAIN, not from the table
+///
+/// `invoice_shipment_provenance` holds the same facts and would be a cheaper
+/// query, but the chain is the tamper-evident copy: an entry's payload is
+/// covered by the hash chain, and a row in an ordinary table is not. A
+/// detector that exists to tell an auditor what is recorded should read the
+/// record that cannot be quietly edited. (The table stays the query
+/// convenience for the per-invoice lookups.)
+///
+/// # A non-zero `shipments_with_no_recorded_invoice` is EXPECTED
+///
+/// `mes.dispatch_shipped` fires on real shipment only. A warranty replacement,
+/// a free sample, a consignment movement — each is a shipped dispatch that
+/// will never carry an invoice, and each will sit in this report permanently.
+/// The count is a measurement, not a defect list, and ADR-0123 §D3
+/// deliberately ships no suppression flag: "mark this one as fine" on an
+/// evidence report is an affordance that needs its own argument.
+pub fn fold_shipment_provenance(
+    entries: &[aberp_audit_ledger::Entry],
+) -> Result<ShipmentProvenanceReport> {
+    use aberp_audit_ledger::EventKind;
+    use std::collections::BTreeMap;
+
+    /// Only the fields this fold reads, from either side.
+    #[derive(Default, serde::Deserialize)]
+    struct Probe {
+        dsp_id: Option<String>,
+        wo_id: Option<String>,
+        shipped_at: Option<String>,
+        invoice_id: Option<String>,
+        source_dispatch_id: Option<String>,
+    }
+
+    let mut shipments: BTreeMap<String, ShipmentProvenanceRow> = BTreeMap::new();
+    let mut invoices_by_dispatch: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    // `recent_entries` yields seq DESC; walk oldest-first so each dispatch's
+    // invoice list reads in issuance order.
+    for entry in entries.iter().rev() {
+        let probe: Probe = serde_json::from_slice(&entry.payload).unwrap_or_default();
+        match entry.kind {
+            EventKind::DispatchShipped => {
+                let Some(dsp_id) = probe.dsp_id.filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                shipments
+                    .entry(dsp_id.clone())
+                    .or_insert(ShipmentProvenanceRow {
+                        dsp_id,
+                        wo_id: probe.wo_id,
+                        shipped_at: probe.shipped_at,
+                        invoice_ids: Vec::new(),
+                    });
+            }
+            EventKind::InvoiceDraftCreated => {
+                let (Some(dsp_id), Some(invoice_id)) = (
+                    probe.source_dispatch_id.filter(|s| !s.is_empty()),
+                    probe.invoice_id.filter(|s| !s.is_empty()),
+                ) else {
+                    continue;
+                };
+                let list = invoices_by_dispatch.entry(dsp_id).or_default();
+                if !list.contains(&invoice_id) {
+                    list.push(invoice_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (dsp_id, invoice_ids) in invoices_by_dispatch {
+        // An invoice naming a dispatch the ledger never shipped is not dropped
+        // silently — it is surfaced as a shipment row with no ship metadata,
+        // because "an invoice claims a shipment that did not happen" is
+        // exactly the thing an evidence report must not hide.
+        shipments
+            .entry(dsp_id.clone())
+            .or_insert(ShipmentProvenanceRow {
+                dsp_id,
+                wo_id: None,
+                shipped_at: None,
+                invoice_ids: Vec::new(),
+            })
+            .invoice_ids = invoice_ids;
+    }
+
+    let rows: Vec<ShipmentProvenanceRow> = shipments.into_values().collect();
+    let without = rows.iter().filter(|r| r.has_no_recorded_invoice()).count();
+    Ok(ShipmentProvenanceReport {
+        shipments_total: rows.len(),
+        shipments_with_recorded_invoice: rows.len() - without,
+        shipments_with_no_recorded_invoice: without,
+        shipments: rows,
+    })
 }

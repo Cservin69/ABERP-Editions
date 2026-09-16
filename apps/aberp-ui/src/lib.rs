@@ -556,6 +556,9 @@ pub fn run() {
             commands::list_invoice_drafts,
             commands::get_invoice_draft,
             commands::delete_invoice_draft,
+            // ADR-0123 §D1 — promote a draft into an invoice that records its
+            // shipment provenance.
+            commands::promote_invoice_draft,
             // S281 / PR-266 — storefront email-relay queue inspector
             // (read-only operator surface). The drain daemon is the
             // only writer; this command pair surfaces queue state.

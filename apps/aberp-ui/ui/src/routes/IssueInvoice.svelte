@@ -52,6 +52,9 @@
   import { onDestroy, onMount } from "svelte";
   import {
     issueInvoice,
+    promoteInvoiceDraft,
+    getInvoiceDraft,
+    type InvoiceDraftView,
     listPartners,
     listProducts,
     listSellerBanks,
@@ -126,6 +129,16 @@
    * recover without closing the dialog (CLAUDE.md rule 12 — fail
    * loud). */
   let partnersLoadError: string | null = $state(null);
+
+  // ADR-0123 §D1 — the draft this issuance is PROMOTING, or null for an
+  // ordinary issuance.
+  //
+  // Carried through `sessionStorage` rather than a route param because the
+  // PR-53 router deliberately does not support params; this is the same bridge
+  // `JUST_ISSUED_KEY` already uses between two route mounts.
+  const PROMOTE_DRAFT_KEY = "aberp:promote-draft-id";
+  let promoteDraft: InvoiceDraftView | null = $state(null);
+  let promoteDraftError: string | null = $state(null);
   /** PR-74 — combobox dropdown lifecycle. Open on focus + 3+ char
    * needle; closed by Escape, blur, or partner selection. The
    * `buyerComboboxState` helper computes `matches` from the cached
@@ -489,9 +502,55 @@
     onClose();
   }
 
+  /** ADR-0123 §D1 — pick up a draft handed over by the invoice list.
+   *
+   * Loads the draft, then preselects its partner through the ordinary
+   * `pickPartner` path so the buyer fields are filled exactly as a manual pick
+   * fills them. The partner is the ONE field worth prefilling: the backend
+   * refuses a promote whose invoice bills a different partner than the draft,
+   * so pre-selecting it is what stops an operator tripping that refusal by
+   * accident.
+   *
+   * **Nothing else is prefilled, and the line items least of all.** The draft
+   * carries `product_id` and `qty` but NO price — inventing a line at zero
+   * would invite an operator to issue a zero-value invoice by accident, and a
+   * wrong invoice is worse than an empty form. The operator enters the
+   * commercial terms, which were always theirs to enter.
+   */
+  async function adoptPromoteDraft() {
+    let drfId: string | null = null;
+    try {
+      drfId = window.sessionStorage.getItem(PROMOTE_DRAFT_KEY);
+      if (drfId) window.sessionStorage.removeItem(PROMOTE_DRAFT_KEY);
+    } catch {
+      // A browser with storage blocked simply issues without a link.
+      return;
+    }
+    if (!drfId) return;
+    try {
+      const draft = await getInvoiceDraft(drfId);
+      promoteDraft = draft;
+      await loadPartners();
+      const match = savedPartners.find((p) => p.id === draft.partner_id);
+      if (match) {
+        pickPartner(match);
+      } else {
+        // Named, not silent: the operator must know the buyer was not
+        // preselected, because the backend will refuse a mismatch.
+        promoteDraftError =
+          "The draft's buyer is not in the saved-partner list — pick the buyer manually. " +
+          "Issuing to a different buyer than the shipment went to will be refused.";
+      }
+    } catch (err: unknown) {
+      promoteDraft = null;
+      promoteDraftError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
   onMount(() => {
     void loadSellerBanks();
     void loadPartners();
+    void adoptPromoteDraft();
     // PR-100 — same mount-once lazy load posture as partners; the
     // products list is operator-scale and the combobox filters
     // client-side.
@@ -743,7 +802,12 @@
     clearPreflightErrors();
     try {
       const body = composeIssueInvoiceBody(form);
-      const response = await issueInvoice(body);
+      // ADR-0123 §D1 — promoting binds the invoice to the draft's shipment in
+      // the backend's ONE issuance transaction. Same body either way: the
+      // difference is which endpoint records the provenance.
+      const response = promoteDraft
+        ? await promoteInvoiceDraft(promoteDraft.drf_id, body)
+        : await issueInvoice(body);
       submitState = "idle";
       // PR-86 / session-111 — the parent route navigates away on
       // success (back to `#/invoices`), which unmounts this
@@ -807,6 +871,30 @@
       ← Cancel
     </button>
   </header>
+
+    <!-- ADR-0123 §D1 — the operator must SEE that this issuance will be
+         recorded against a shipment. A link created invisibly is one nobody
+         can sanity-check at the moment it is made. -->
+    {#if promoteDraft}
+      <div class="promote-banner" data-testid="promote-banner">
+        <strong>Issuing from shipment draft {promoteDraft.drf_id}</strong>
+        <span>
+          This invoice will record its shipment origin:
+          {#if promoteDraft.source_dispatch_id}
+            dispatch {promoteDraft.source_dispatch_id}{#if promoteDraft.source_wo_id}, work order
+              {promoteDraft.source_wo_id}{/if}.
+          {:else}
+            this draft has no dispatch (it came from a quote pickup), so only the
+            draft reference is recorded.
+          {/if}
+        </span>
+      </div>
+    {/if}
+    {#if promoteDraftError}
+      <div class="error" role="alert" data-testid="promote-banner-error">
+        {promoteDraftError}
+      </div>
+    {/if}
 
     {#if submitState === "error" && submitError}
       {#if preflightErrors}

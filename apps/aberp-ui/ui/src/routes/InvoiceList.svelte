@@ -616,6 +616,26 @@
     }
   }
 
+  /** ADR-0123 §D1 — hand this draft to the issue form and navigate.
+   *
+   * The draft id travels through `sessionStorage` because the PR-53 router
+   * deliberately carries no route params; `JUST_ISSUED_KEY` already uses the
+   * same bridge in the opposite direction. The issue form reads and CLEARS the
+   * key on mount, so a later plain "+ New invoice" cannot inherit a stale
+   * draft and silently record the wrong shipment.
+   */
+  function startPromoteFromDraft(row: InvoiceListItem) {
+    if (busyRow !== null) return;
+    try {
+      window.sessionStorage.setItem("aberp:promote-draft-id", row.invoice_id);
+    } catch {
+      // Storage blocked: fall through to an ordinary issuance rather than
+      // failing the click. The invoice records no provenance, which the
+      // detector counts — an honest absence, not a broken button.
+    }
+    navigateTo("invoices-new");
+  }
+
   function dispatchQuickAction(row: InvoiceListItem, action: RowQuickAction) {
     if (busyRow !== null) return; // one in-flight at a time
     switch (action) {
@@ -1382,6 +1402,27 @@
                  place. -->
             {#if row.row_kind === "Own"}
               <div class="row-actions">
+                <!-- ADR-0123 §D1 — the entry point to the promote flow.
+                     Rendered BESIDE the quick-action vocab, not inside it:
+                     `RowQuickAction` is a closed `Extract<DetailActionButton,…>`
+                     set with its own mirror pin and an explicit counter-pin
+                     against widening, and this affordance exists on exactly one
+                     state. Forcing a new verb through that table would change a
+                     surface two tests guard in order to add a button to one
+                     row kind. -->
+                {#if row.state === "Draft"}
+                  <button
+                    type="button"
+                    class="row-action"
+                    disabled={busyRow !== null}
+                    onclick={() => startPromoteFromDraft(row)}
+                    aria-label={`Issue invoice from shipment draft ${row.invoice_id}`}
+                    title="Issue an invoice from this shipment draft — the invoice records which shipment it bills"
+                  >
+                    <span class="row-action-glyph" aria-hidden="true">🧾</span>
+                    <span class="row-action-label">Issue</span>
+                  </button>
+                {/if}
                 {#each actions as action (action)}
                   {@const meta = quickActionMeta(action)}
                   {@const busy =
