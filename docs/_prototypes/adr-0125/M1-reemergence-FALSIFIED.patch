@@ -1,0 +1,46 @@
+diff --git a/python/aberp-cad-extract/aberp_cad_extract/holes.py b/python/aberp-cad-extract/aberp_cad_extract/holes.py
+index 95c01e0..53ee8d7 100644
+--- a/python/aberp-cad-extract/aberp_cad_extract/holes.py
++++ b/python/aberp-cad-extract/aberp_cad_extract/holes.py
+@@ -2418,6 +2418,7 @@ def _barrier_track(edge, vertex, origin, e1, e2, radius) -> List[Tuple[float, fl
+         )
+     ]
+     point, tangent = gp_Pnt(), gp_Vec()
++    re_emerged = False
+     for _ in range(steps):
+         try:
+             curve.D1(u, point, tangent)
+@@ -2433,8 +2434,32 @@ def _barrier_track(edge, vertex, origin, e1, e2, radius) -> List[Tuple[float, fl
+         )
+         track.append(step)
+         if math.hypot(step[0], step[1]) > radius:
++            re_emerged = True
+             break
+-    return track
++    # RE-EMERGENCE IS THE WHOLE PREMISE (round 9, ADR-0112 R3).
++    #
++    # This walk is only sound because the bore took the MIDDLE out of an
++    # edge: the far side is still there, so the curve underneath leads
++    # back to it and the reconstruction lands on ground the edge really
++    # covered. Leaving the footprint is what proves that — it is the
++    # other stub.
++    #
++    # A walk that runs its whole budget without leaving proves the
++    # opposite. The edge did not re-emerge, so the bore is not what ended
++    # it: something else did, and past that end the curve runs where the
++    # edge never was. Measured on the boss family, that is a cone's
++    # generator on the plate's SIDE face, ended by the plate's TOP face at
++    # z=20 and marched on up PAST THE APEX into empty air — two of them
++    # laying a continuous wall across the mouth, between the bore's axis
++    # and the boss that stands over it. The cone's caps carried the right
++    # depth and were discarded for the plate's top face, 3.3 mm shallow.
++    #
++    # So an un-re-emerged march is not a barrier and must not be reported
++    # as one. Dropping it is also the CONSERVATIVE direction: fewer
++    # barriers can only widen the field of caps a rim keeps (an empty
++    # barrier set is round 5's "keep every cap" exactly), never narrow it,
++    # so this can lose a hole's depth to no less evidence than before.
++    return track if re_emerged else []
+ 
+ 
+ def _rim_barriers(
