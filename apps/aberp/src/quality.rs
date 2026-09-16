@@ -2327,7 +2327,9 @@ mod tests {
             );
         }
         assert!(!Closed.blocks_shipment());
-        assert!(open_ncr_ids_blocking_wo(&[wo_ncr("ncr_x", Closed)], &[], &[], "wo-1", &[]).is_empty());
+        assert!(
+            open_ncr_ids_blocking_wo(&[wo_ncr("ncr_x", Closed)], &[], &[], "wo-1", &[]).is_empty()
+        );
     }
 
     /// **Round 7, B-1 (c) — a waiver is scoped to ONE NCR and ONE WO.**
@@ -2660,7 +2662,8 @@ mod tests {
         let ncrs = list_ncrs(&conn, tenant.as_str(), &NcrFilter::default()).unwrap();
         let waivers = list_ncr_shipment_waivers(&conn, tenant.as_str()).unwrap();
         assert!(waivers.is_empty(), "the timer minted no sign-off");
-        let mut blocking = open_ncr_ids_blocking_wo(&ncrs, &waivers, &[], "wo-1", &["dp-A".to_string()]);
+        let mut blocking =
+            open_ncr_ids_blocking_wo(&ncrs, &waivers, &[], "wo-1", &["dp-A".to_string()]);
         blocking.sort();
         let mut expected = vec![crit.ncr_id.clone(), major.ncr_id.clone()];
         expected.sort();

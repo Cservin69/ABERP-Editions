@@ -5025,6 +5025,12 @@ pub fn build_router(state: AppState) -> Router {
             "/api/ncrs/:id/shipment-waiver",
             post(handle_grant_ncr_shipment_waiver),
         )
+        // ADR-0128 — withdraw a waiver. TERMINAL: the waiver it names never
+        // disarms the belt again, and re-permitting takes a NEW waiver.
+        .route(
+            "/api/ncr-shipment-waivers/:id/revoke",
+            post(handle_revoke_ncr_shipment_waiver),
+        )
         .route("/api/capas/:id/approve", post(handle_approve_capa))
         .route("/api/capas/:id/review", post(handle_review_capa))
         .route("/api/capas/:id/close", post(handle_close_capa))
@@ -18186,15 +18192,14 @@ pub fn resolve_open_ncr_gate(
     // auto-NCR spawned by a failing measurement that carried no `part_uid`
     // has `affected_part_uids: []`, so the unit join matched nothing while a
     // real Open NCR stood against the order.
-    let blocking =
-        crate::quality::open_ncr_ids_blocking_wo(
-            &ncrs,
-            &waivers,
-            // ADR-0128 — a revoked waiver stops disarming the belt, terminally.
-            &crate::quality::list_ncr_shipment_waiver_revocations(conn, tenant)?,
-            &dispatch.wo_id,
-            &part_uids,
-        );
+    let blocking = crate::quality::open_ncr_ids_blocking_wo(
+        &ncrs,
+        &waivers,
+        // ADR-0128 — a revoked waiver stops disarming the belt, terminally.
+        &crate::quality::list_ncr_shipment_waiver_revocations(conn, tenant)?,
+        &dispatch.wo_id,
+        &part_uids,
+    );
     if blocking.is_empty() {
         Ok(OpenNcrGate::Pass)
     } else {
@@ -28904,6 +28909,62 @@ async fn handle_grant_ncr_shipment_waiver(
         Ok(Err(e)) => quality_error_response(e),
         Err(j) => internal_error(
             "grant_ncr_shipment_waiver:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RevokeNcrShipmentWaiverBody {
+    reason: String,
+}
+
+/// ADR-0128 — withdraw a shipment waiver granted in error.
+///
+/// The waiver row is untouched; a revocation is appended beside it. TERMINAL:
+/// that waiver never disarms `open_ncr_ids_blocking_wo` again, and a second
+/// revocation of the same waiver is refused. Re-permitting the shipment takes
+/// a NEW waiver, with its own sign-off and its own ledger entry.
+async fn handle_revoke_ncr_shipment_waiver(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<RevokeNcrShipmentWaiverBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<
+            crate::quality::NcrShipmentWaiverRevocation,
+            crate::quality::QualityError,
+        > {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
+            crate::quality::revoke_ncr_shipment_waiver(
+                state_for_task.db_path.as_path(),
+                &state_for_task.db,
+                state_for_task.tenant.clone(),
+                binary_hash,
+                &operator,
+                &id,
+                &body.reason,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(r)) => (StatusCode::CREATED, Json(r)).into_response(),
+        Ok(Err(e)) => quality_error_response(e),
+        Err(j) => internal_error(
+            "revoke_ncr_shipment_waiver:join",
             anyhow!("blocking task panicked: {j}"),
         ),
     }
