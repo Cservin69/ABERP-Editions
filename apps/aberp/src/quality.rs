@@ -2223,6 +2223,81 @@ mod tests {
         }
     }
 
+    fn revocation_of(waiver_id: &str, at: &str) -> NcrShipmentWaiverRevocation {
+        NcrShipmentWaiverRevocation {
+            revocation_id: format!("wvrv_{waiver_id}"),
+            waiver_id: waiver_id.into(),
+            revoked_by_operator: "manager".into(),
+            reason: "the waiver was signed against the wrong work order".into(),
+            revoked_at_utc: at.into(),
+        }
+    }
+
+    /// ADR-0128 §D2 — a revoked waiver stops disarming the belt.
+    ///
+    /// The hazard this closes: a REAL, unresolved defect whose waiver was
+    /// signed by mistake. Closing the NCR is no remedy there — the NCR has to
+    /// stay open — so before this there was nothing that could make it block
+    /// again.
+    #[test]
+    fn a_revoked_waiver_stops_releasing_the_shipment() {
+        let ncrs = vec![wo_ncr("ncr_a", NcrState::Open)];
+        let signed = vec![waiver("ncr_a", "wo-1")];
+        assert!(
+            open_ncr_ids_blocking_wo(&ncrs, &signed, &[], "wo-1", &[]).is_empty(),
+            "precondition: the waiver releases the shipment"
+        );
+
+        let withdrawn = vec![revocation_of("wvr_ncr_a_wo-1", "2026-06-18T00:00:00Z")];
+        assert_eq!(
+            open_ncr_ids_blocking_wo(&ncrs, &signed, &withdrawn, "wo-1", &[]),
+            vec!["ncr_a".to_string()],
+            "a revoked waiver must not go on releasing parts"
+        );
+    }
+
+    /// ADR-0128 §D2 — TERMINAL, not latest-wins.
+    ///
+    /// The revocation here is time-stamped BEFORE the waiver it withdraws.
+    /// Under a "latest wins" rule the waiver would win and the shipment would
+    /// release; under the terminal rule it does not. This is the whole reason
+    /// the rule is not ordered by time: a clock skew, a replayed row or a
+    /// back-dated grant must not be able to silently re-arm a release nobody
+    /// signed for today. Terminal fails toward REFUSING to ship.
+    #[test]
+    fn revocation_is_terminal_and_not_decided_by_timestamps() {
+        let ncrs = vec![wo_ncr("ncr_a", NcrState::Open)];
+        let signed = vec![waiver("ncr_a", "wo-1")]; // approved 2026-06-17
+        let earlier = vec![revocation_of("wvr_ncr_a_wo-1", "2020-01-01T00:00:00Z")];
+        assert_eq!(
+            open_ncr_ids_blocking_wo(&ncrs, &signed, &earlier, "wo-1", &[]),
+            vec!["ncr_a".to_string()],
+            "an earlier-stamped revocation still wins — this rule is not a \
+             comparison of timestamps"
+        );
+    }
+
+    /// A revocation names ONE waiver, exactly as a waiver names one NCR and
+    /// one work order. Withdrawing one release must not withdraw another.
+    #[test]
+    fn a_revocation_releases_nothing_it_does_not_name() {
+        let ncrs = vec![
+            wo_ncr("ncr_a", NcrState::Open),
+            wo_ncr("ncr_b", NcrState::Open),
+        ];
+        let signed = vec![waiver("ncr_a", "wo-1"), waiver("ncr_b", "wo-1")];
+        assert!(
+            open_ncr_ids_blocking_wo(&ncrs, &signed, &[], "wo-1", &[]).is_empty(),
+            "precondition: both waivers release"
+        );
+        let withdrawn = vec![revocation_of("wvr_ncr_a_wo-1", "2026-06-18T00:00:00Z")];
+        assert_eq!(
+            open_ncr_ids_blocking_wo(&ncrs, &signed, &withdrawn, "wo-1", &[]),
+            vec!["ncr_a".to_string()],
+            "revoking ncr_a's waiver must leave ncr_b's standing"
+        );
+    }
+
     /// **Round 7, B-1 (a) — the escalation TIMER must not release a shipment.**
     ///
     /// `escalate_overdue_ncrs` moves a `Critical` NCR to `Escalated` 24h after
