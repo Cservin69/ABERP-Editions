@@ -724,3 +724,71 @@ fn the_escalation_timer_cannot_release_a_shipment_but_a_signed_waiver_can() {
         .unwrap();
     assert_eq!(escalations, 1, "the timer still raises its alarm");
 }
+
+/// ADR-0199 residual 14 — an inspection must name what it was taken on.
+///
+/// A failing measurement naming neither a work order nor a part reaches
+/// NEITHER shipment gate: its auto-NCR has empty affected lists so the belt
+/// has no key to join on, and ADR-0127 §D1 re-derives from
+/// `list_inspections_for_wo`, which is keyed on `linked_wo_id`.
+///
+/// The residual rejects inventing a join key, and that is right — heat lot or
+/// product would refuse shipments the operator never associated with the
+/// order. This closes the other end instead: the in-band path refuses to
+/// record evidence nobody could act on.
+#[test]
+fn an_inspection_naming_neither_a_wo_nor_a_part_is_refused() {
+    let fx = setup();
+    let plan_id = seed_plan(&fx);
+
+    let err = record_manual_inspection(
+        &fx.handle,
+        fx.tenant.clone(),
+        fx.hash,
+        "ervin",
+        now(),
+        86400,
+        ManualInspectionRequest {
+            plan_id: plan_id.clone(),
+            actual_value: 10.500, // a real failure
+            source: QcSource::Manual,
+            units: None,
+            source_event_id: None,
+            probe_serial: None,
+            last_calibration_at: None,
+            wo_id: None,
+            part_uid: None,
+            heat_lot: Some("HL-9911".into()), // a lot alone is NOT attribution
+        },
+    )
+    .expect_err("an unattributed measurement must be refused, not recorded");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("work order") && msg.contains("part"),
+        "the refusal has to tell the operator what to supply: {msg}"
+    );
+
+    // …and a LOT-level reading, which names the WO and no part, still records:
+    // that is attribution enough for both gates.
+    record_manual_inspection(
+        &fx.handle,
+        fx.tenant.clone(),
+        fx.hash,
+        "ervin",
+        now(),
+        86400,
+        ManualInspectionRequest {
+            plan_id,
+            actual_value: 10.0,
+            source: QcSource::Manual,
+            units: None,
+            source_event_id: None,
+            probe_serial: None,
+            last_calibration_at: None,
+            wo_id: Some("wo-comp".into()),
+            part_uid: None,
+            heat_lot: None,
+        },
+    )
+    .expect("a lot-level reading names the WO and must still record");
+}

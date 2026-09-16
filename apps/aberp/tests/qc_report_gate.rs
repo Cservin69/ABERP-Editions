@@ -3280,3 +3280,92 @@ fn a_post_issuance_stale_calibration_measurement_stops_the_release() {
         ),
     }
 }
+
+/// ADR-0199 residual 14, sharpened — an UNATTRIBUTED failing measurement
+/// reaches neither gate, and ADR-0127 did not change that.
+///
+/// The residual frames this as "the belt's outer edge": an NCR naming neither
+/// a part UID nor a WO has no key to join on, and it notes that "every
+/// auto-NCR from `record_manual_inspection` names at least the WO whenever the
+/// measurement did". The measurement does not always do so — `wo_id`,
+/// `part_uid` and `heat_lot` are all `Option` on `ManualInspectionRequest`,
+/// and the route passes them through with no validation.
+///
+/// So a failing measurement can be recorded with no attribution at all, and:
+///
+/// - the auto-NCR it spawns carries empty affected lists, so the NCR belt has
+///   nothing to join on and blocks nothing;
+/// - ADR-0127 §D1 reads `list_inspections_for_wo`, which is keyed on
+///   `linked_wo_id` — so the re-derivation cannot see it either.
+///
+/// A recorded, failing, real defect that no gate can reach.
+#[test]
+fn an_out_of_band_unattributed_measurement_is_a_stated_limit() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "2");
+    seed_dispatch(&conn, "dsp-unattr", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 2);
+    let plan = seed_plan(&conn, "Bore D", "1", true);
+    for u in &units {
+        measure_at(&mut conn, &plan, &u.part_uid, 25.0, now());
+    }
+    let (_qcr_id, d) = issue_report_for(&mut conn, &units);
+    assert_eq!(d, Disposition::Accept);
+
+    // A failing reading with NOTHING naming what it was taken on.
+    let m = meta();
+    let plan_row = aberp_qa::get_inspection_plan(&conn, T, &plan).unwrap().unwrap();
+    let tx = conn.transaction().unwrap();
+    let rec = record_inspection(
+        &tx,
+        &ctx(&m),
+        RecordInspectionInputs {
+            plan: &plan_row,
+            source: QcSource::Manual,
+            source_event_id: None,
+            actual_value: 30.0, // far outside ±0.05 on nominal 25.0
+            units: "mm".into(),
+            probe_serial: None,
+            last_calibration_at: None,
+            measured_at: now(),
+            current_time: now(),
+            stale_window_seconds: 86_400,
+            linked_part_uid: None,
+            linked_heat_lot: None,
+            linked_wo_id: None,
+            recorded_by: "ervin".into(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(
+        rec.verdict.is_failing(),
+        "precondition: this reading is a real failure"
+    );
+
+    // STATED LIMIT, asserted rather than described. Such a row can no longer
+    // be created in band — `record_manual_inspection` refuses it, pinned by
+    // `an_inspection_naming_neither_a_wo_nor_a_part_is_refused`. Written
+    // DIRECTLY, as here, it is still invisible to both gates, and no join key
+    // can rescue it: the residual's objection stands, since heat lot or
+    // product would refuse shipments the operator never associated with the
+    // order.
+    //
+    // This is asserted so that nobody later reads residual 14 as closed in
+    // both directions. The in-band path is closed; the out-of-band row is a
+    // limit, and this is where it is written down.
+    let disp = dispatch(&conn, "dsp-unattr");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "an out-of-band unattributed measurement remains invisible to both \
+         gates — the in-band path is what ADR-0199 residual 14 closes"
+    );
+}

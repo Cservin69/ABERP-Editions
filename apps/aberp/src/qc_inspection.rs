@@ -129,6 +129,46 @@ pub fn record_manual_inspection(
         ),
         None => None,
     };
+    // ── ADR-0199 residual 14 — evidence has to name what it is about ──
+    //
+    // `wo_id`, `part_uid` and `heat_lot` are all optional on the request and
+    // the route passed them straight through. A FAILING measurement with none
+    // of them recorded a real defect that no gate could reach:
+    //
+    // - its auto-NCR carries empty affected lists, so the open-NCR belt has no
+    //   key to join on and blocks nothing (the residual's own "outer edge");
+    // - ADR-0127 §D1 re-derives from `list_inspections_for_wo`, which is keyed
+    //   on `linked_wo_id`, so the re-derivation cannot see it either.
+    //
+    // The residual rejects inventing a join key — heat lot or product would
+    // refuse shipments the operator never associated with the order — and that
+    // is right. The other end is available: refuse to record a measurement
+    // naming NEITHER a work order NOR a part, because that is evidence nobody
+    // can act on. Nothing is lost; the reading is re-submittable with
+    // attribution, and an unattributable QC measurement is not evidence in a
+    // defense trail, it is a number.
+    //
+    // A lot-level reading is unaffected: it names the WO and no part, which is
+    // attribution enough for both gates.
+    let names_wo = req
+        .wo_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    let names_part = req
+        .part_uid
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    if !names_wo && !names_part {
+        return Err(QcRecordError::Validation(
+            "an inspection must name the work order or the part it was taken \
+             on — an unattributed measurement cannot reach either shipment \
+             gate (ADR-0199 residual 14)"
+                .into(),
+        ));
+    }
+
     let session_id = Ulid::new().to_string();
 
     // ── ONE transaction: the row, its verdict events, and (on a failing
