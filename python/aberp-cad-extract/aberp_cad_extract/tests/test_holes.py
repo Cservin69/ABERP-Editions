@@ -3430,14 +3430,20 @@ def test_r9_a_seat_whose_relief_breaks_the_far_face_is_not_inverted():
     *measure to the deepest point the tool reaches; conservative, never
     under-quote.*
 
-    ⚠️ **PENDING Ervin's convention confirmation.** The competing reading is
-    the FULL-DIAMETER bore length, ``12.04`` (``z = 20`` down to where the
-    relief meets ``r = 8`` at ``z = 7.96``), on the grounds that the relief is
-    not cut by this drill — which is the reasoning N1 used to call a
-    point-breakthrough BLIND on the full-diameter depth. Both readings are
-    defensible; the same ruling settles residual 1. If Ervin rules for
-    full-diameter, RE-PIN this number — the structural half of the fix (axis,
-    entry, and the refusal of an upper-half root) is unaffected either way.
+    **Convention P — the cap's axial pole — ruled 2026-09-16.** Depth runs to
+    the deepest point ON THE BORE'S AXIS, so this reads ``20.0001``.
+
+    The competing reading was the FULL-DIAMETER bore length, ``12.04``
+    (``z = 20`` down to where the relief meets ``r = 8`` at ``z = 7.96``), on
+    the grounds that the relief is not cut by this drill — the reasoning N1
+    used to call a point-breakthrough BLIND on the full-diameter depth. P won
+    on consistency: it is what the three dimple pins and residual 1's ``15.7``
+    already embody, and full-diameter would have re-pinned all four. It is also
+    the conservative half of D-19's rule — measure to the deepest point the
+    tool reaches, never under-quote.
+
+    The structural half of the fix (axis, entry, and the refusal of an
+    upper-half root) was always independent of this ruling.
     """
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
     from OCP.BRepPrimAPI import (
@@ -3489,7 +3495,7 @@ def test_r9_a_seat_whose_relief_breaks_the_far_face_is_not_inverted():
         f"the same seat without it; got {hole.depth_mm} against {control[0].depth_mm}"
     )
 
-    # The numeric half — PENDING, see the docstring.
+    # The numeric half — convention P, the axial pole. See the docstring.
     _approx(hole.depth_mm, 20.0001)
 
 
