@@ -33553,6 +33553,7 @@ mod tests {
             customer_name: None,
             customer_address_line: None,
             customer_purchase_order: None,
+            unit_set_sha256: None,
         }
     }
 

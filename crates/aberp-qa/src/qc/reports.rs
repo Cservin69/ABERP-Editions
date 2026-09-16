@@ -91,6 +91,10 @@ pub struct QcReport {
     pub customer_purchase_order: Option<String>,
     pub qty_reported: u32,
     pub serial_range: Option<String>,
+    /// ADR-0126 — the drift key: [`unit_set_digest`] over the units this
+    /// report enumerated, frozen with it. `None` means the report was issued
+    /// before ADR-0126 and can only be checked by the lossy `serial_range`.
+    pub unit_set_sha256: Option<String>,
     pub heat_lot_reference: Option<String>,
     pub mill_cert_id: Option<String>,
     pub machine_id: Option<String>,
@@ -950,6 +954,7 @@ pub fn freeze_report(
         inputs.units.len() as u32
     };
     let serial_range = serial_range_of(inputs.units);
+    let unit_set_sha256 = unit_set_digest(inputs.units);
     let t = &inputs.traceability;
 
     tx.execute(
@@ -962,9 +967,10 @@ pub fn freeze_report(
             characteristics_failed, characteristics_unaccounted,
             rendered_sha256, renderer_version, issued_at_utc, issued_by,
             superseded_by_qcr_id, created_at, created_by, notes,
-            customer_name, customer_address_line, customer_purchase_order
+            customer_name, customer_address_line, customer_purchase_order,
+            unit_set_sha256
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?);",
+                   ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?);",
         params![
             &qcr_id,
             ctx.tenant,
@@ -996,6 +1002,7 @@ pub fn freeze_report(
             trimmed(inputs.customer.name.as_deref()),
             trimmed(inputs.customer.address_line.as_deref()),
             trimmed(inputs.customer.purchase_order.as_deref()),
+            &unit_set_sha256,
         ],
     )
     .map_err(|e| QcError::Storage(anyhow::anyhow!("INSERT qc_reports: {e}")))?;
@@ -1200,6 +1207,7 @@ pub fn issue_report(
             "drawing_number": report.drawing_number,
             "drawing_rev": report.drawing_rev,
             "serial_range": report.serial_range,
+            "unit_set_sha256": report.unit_set_sha256,
             "qty_reported": report.qty_reported,
             "heat_lot_reference": report.heat_lot_reference,
             "mill_cert_id": report.mill_cert_id,
@@ -1359,7 +1367,7 @@ const REPORT_COLUMNS: &str = "qcr_id, report_number, report_kind, template, stat
      disposition, characteristics_required, characteristics_measured, characteristics_passed,
      characteristics_failed, characteristics_unaccounted, rendered_sha256, renderer_version,
      issued_at_utc, issued_by, superseded_by_qcr_id, created_at, created_by, notes,
-     customer_name, customer_address_line, customer_purchase_order";
+     customer_name, customer_address_line, customer_purchase_order, unit_set_sha256";
 
 /// Fetch one report by id (tenant-scoped).
 pub fn get_report(
@@ -1551,6 +1559,7 @@ fn parse_report_row(row: &duckdb::Row<'_>) -> duckdb::Result<Result<QcReport, an
             customer_name: row.get(32)?,
             customer_address_line: row.get(33)?,
             customer_purchase_order: row.get(34)?,
+            unit_set_sha256: row.get(35)?,
         })
     })())
 }

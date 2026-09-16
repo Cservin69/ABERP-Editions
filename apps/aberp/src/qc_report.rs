@@ -721,6 +721,7 @@ mod tests {
             customer_name: Some("Prime Aerospace Kft.".into()),
             customer_address_line: Some("1117 Budapest, Fő utca 1., HU".into()),
             customer_purchase_order: Some("PO-2026-889".into()),
+            unit_set_sha256: None,
         }
     }
 

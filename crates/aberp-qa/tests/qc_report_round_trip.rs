@@ -1129,3 +1129,103 @@ fn an_unmeasured_line_reports_the_current_plan_requirement() {
     assert_eq!(lines[0].nominal_value, Some(30.0));
     assert_eq!(lines[0].actual_value, None);
 }
+
+/// ADR-0126 (round 1, A1) — the `qcr.report_issued` payload key set, pinned.
+///
+/// **This pin did not exist before ADR-0126, and its absence is why the ADR
+/// had to create it.** `export_payload_field_names_match_the_eventkind_docs`
+/// (`aberp-dispatch/src/audit.rs`) pins only the three `export.*` TYPED
+/// payloads; `qcr.report_issued` is built inline with `json!{…}` and nothing
+/// anywhere asserted its shape. On a hash-chained, append-only ledger a row's
+/// shape cannot be migrated once written, so a renamed or dropped field
+/// silently breaks every future compliance query — the same argument the
+/// export test makes, applied where it was missing.
+///
+/// The `EventKind` doc comment is the schema contract. This is what makes it
+/// one for this event: no more fields, no fewer.
+#[test]
+fn issued_payload_field_names_match_the_eventkind_docs() {
+    let mut conn = setup_db();
+    seed_plan(&conn, "Bore D", "1", true);
+    let u = units();
+    for unit in &u {
+        let plans = list_inspection_plans(&conn, TEST_TENANT, Some("prd_bracket"), false).unwrap();
+        measure(&mut conn, &plans[0].plan_id, &unit.part_uid, 25.0);
+    }
+    let qcr_id = freeze(
+        &mut conn,
+        &u,
+        QcReportKind::DimensionalInspection,
+        QcReportTemplate::AbenStandard,
+    );
+    let m = meta();
+    let tx = conn.transaction().unwrap();
+    issue_report(
+        &tx,
+        &ctx(&m, "ervin"),
+        &qcr_id,
+        "deadbeef",
+        "aberp-qc-pdf@0.0.0",
+        "ervin",
+        now(),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let raw: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM audit_ledger WHERE kind = ?;",
+            duckdb::params![EventKind::QcReportIssued.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "characteristics_failed",
+            "characteristics_measured",
+            "characteristics_passed",
+            "characteristics_required",
+            "characteristics_unaccounted",
+            "disposition",
+            "drawing_number",
+            "drawing_rev",
+            "heat_lot_reference",
+            "issued_at_utc",
+            "issued_by",
+            "machine_id",
+            "mill_cert_id",
+            "partner_id",
+            "product_id",
+            "program_id",
+            "qcr_id",
+            "qty_reported",
+            "rendered_sha256",
+            "renderer_version",
+            "report_kind",
+            "report_number",
+            "serial_range",
+            "template",
+            "unit_set_sha256",
+            "wo_id",
+        ],
+        "the qcr.report_issued payload must carry exactly the fields its \
+         EventKind doc comment names — no more, no fewer"
+    );
+
+    // …and the drift key is actually populated, not a null that would send
+    // every new report down the legacy fallback.
+    assert_eq!(
+        v["unit_set_sha256"].as_str().map(str::len),
+        Some(64),
+        "unit_set_sha256 must be a sha-256 hex digest on a fresh issuance"
+    );
+    assert_eq!(
+        v["unit_set_sha256"].as_str().unwrap(),
+        aberp_qa::unit_set_digest(&u),
+        "and it must be the digest of the units the report enumerated"
+    );
+}

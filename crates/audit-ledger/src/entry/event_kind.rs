@@ -3275,17 +3275,37 @@ pub enum EventKind {
 
     /// ADR-0199 §D8 — **the load-bearing one.** The report was issued: the
     /// renderer ran once, and the SHA-256 of the emitted bytes is pinned
-    /// here. The BYTES ARE NOT STORED anywhere — the report re-renders
-    /// deterministically from the frozen `qc_report_lines`, and this chain
-    /// entry proves the bytes anyone re-renders are the bytes that were
-    /// issued (ADR-0199 §D7). `qcr.*` family. NON-NAV.
+    /// here. The bytes are NOT stored.
+    ///
+    /// **CORRECTED 2026-09-16 (ADR-0124, applied here by ADR-0126).** This
+    /// comment used to end that sentence with "and this chain entry proves
+    /// the bytes anyone re-renders are the bytes that were issued". That was
+    /// unconditionally stated and is only conditionally true, and it is the
+    /// third copy of the claim — ADR-0124 corrected ADR-0199 §D7 and
+    /// `qc_report.rs` and missed this one, which sits in the schema contract
+    /// itself. What actually holds: the bytes are reproducible **by the
+    /// renderer version recorded on this entry** (`renderer_version`), and
+    /// after a renderer bump the prior bytes are not reproducible at all.
+    /// ADR-0122 §D2's export handles that case by omitting the document and
+    /// naming the omission rather than emitting a failing hash check.
+    ///
+    /// `qcr.*` family. NON-NAV.
     ///
     /// Payload (`serde_json::Value`): `qcr_id`, `report_number`,
     /// `report_kind`, `template`, `wo_id`, `product_id`, `partner_id`,
     /// `drawing_number`, `drawing_rev`, `serial_range`, `qty_reported`,
     /// `heat_lot_reference`, `mill_cert_id`, `machine_id`, `program_id`,
     /// `disposition`, the five accountability counts, `rendered_sha256`,
-    /// `renderer_version`, `issued_by`, `issued_at_utc`.
+    /// `renderer_version`, `issued_by`, `issued_at_utc`,
+    /// `unit_set_sha256`.
+    ///
+    /// `unit_set_sha256` (ADR-0126) is the drift key: a SHA-256 over the
+    /// units the report enumerated, length-prefixed and never deduped. It is
+    /// what the shipment gate compares. `serial_range` beside it is a HUMAN
+    /// rendering printed into the PDF and is **not** an identity — using it
+    /// as one was ADR-0199 residual 10. `null` on entries written before
+    /// ADR-0126, which is a different thing from the digest of an empty
+    /// enumeration.
     QcReportIssued,
 
     /// ADR-0199 §D8 — the report was bound to a dispatch. Fired INSIDE
