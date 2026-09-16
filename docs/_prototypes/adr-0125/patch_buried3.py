@@ -24,11 +24,33 @@ def _edges_of(face):
         out.append(TopoDS.Edge_s(ex.Current())); ex.Next()
     return out
 
-def faces_are_adjacent(f1,f2):
-    """Do these two faces still MEET anywhere on the solid?"""
+from OCP.TopAbs import TopAbs_VERTEX
+
+def _vertices_of(edge):
+    out=[]; ex=TopExp_Explorer(edge,TopAbs_VERTEX)
+    while ex.More():
+        out.append(TopoDS.Vertex_s(ex.Current())); ex.Next()
+    return out
+
+def faces_are_adjacent(f1,f2,mouth=()):
+    """Do these two faces still meet ON THIS MOUTH?
+
+    Scoped to the mouth, not to the whole solid: two faces meeting on the
+    far side of a part say nothing about whether the bore consumed their
+    junction HERE. A shared edge counts only when it touches this rim.
+    """
     try:
         e2=_edges_of(f2)
-        return any(a.IsSame(b) for a in _edges_of(f1) for b in e2)
+        shared=[a for a in _edges_of(f1) if any(a.IsSame(b) for b in e2)]
+        if not shared:
+            return False
+        if not mouth:
+            return True
+        ends=[v for e in mouth for v in _vertices_of(e)]
+        for e in shared:
+            if any(v.IsSame(w) for v in _vertices_of(e) for w in ends):
+                return True
+        return False
     except Exception:
         return True
 
@@ -72,7 +94,7 @@ def install(use_skin=True):
                     # barrier machinery already has the evidence. The veto is
                     # only for the case that machinery cannot see -- where the
                     # bore CONSUMED their junction, so they no longer touch.
-                    if ADJ and faces_are_adjacent(c[1],d[1]):
+                    if ADJ and faces_are_adjacent(c[1],d[1],edges):
                         continue
                     a,b=pt(c),pt(d)
                     mid=((a[0]+b[0])/2.,(a[1]+b[1])/2.,(a[2]+b[2])/2.)

@@ -13,3 +13,12 @@ ADR-0125 §2's table, kept so the numbers can be re-run rather than believed.
   every ray.
 
 Run from `python/aberp-cad-extract` with an interpreter that has OCP + pytest.
+
+## Round 1 additions (2026-09-16)
+
+- `patch_buried3.py` — updated: the adjacency gate is now **mouth-scoped**
+  (A1). Behaviourally identical to the whole-solid gate on the whole corpus.
+- `adversarial_parts.py` — `filleted_boss()`, the shape the corpus lacks (A6).
+- `sweep_filleted_boss.py` — run `base` / `m5`. 6/6 correct either way.
+- `check_never_shallower.py` — the direction-of-error check (A2):
+  10 deeper, 98 unchanged, 0 shallower.
