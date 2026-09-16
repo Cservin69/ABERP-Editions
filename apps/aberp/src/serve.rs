@@ -18527,10 +18527,38 @@ pub fn resolve_qc_report_gate_with_capability(
         // than stopping. Both arms are tested; the second one has to write the
         // extra mark directly, because the route will not.
         //
-        // Recomputed through `aberp_qa::serial_range_of` — the SAME pure
-        // function that produced the stored value at freeze time — so the two
-        // sides cannot drift on formatting. Equality here is therefore exactly
-        // "the marks today are the marks the report froze over".
+        // ⚠️ CORRECTED 2026-09-16 (ADR-0126). This comment used to end:
+        // "Equality here is therefore exactly `the marks today are the marks
+        // the report froze over`." THAT WAS FALSE, and it is the sentence
+        // someone auditing this posture reads.
+        //
+        // `serial_range_of` renders "{first} … {last} ({n} units)" from
+        // `part_serial` ALONE, so two different enumerations compare equal
+        // whenever the first serial, the last serial and the count agree —
+        // and it never reads `part_uid` at all. Both shapes were reproduced
+        // against this very function and it passed them: a swapped MIDDLE
+        // serial, and every `part_uid` rewritten with the serials untouched.
+        // The second is the severe one, because `part_uid` is what
+        // `qc_inspections.linked_part_uid` carries, what the per-unit
+        // measurement join keys on (`Evidence::Unit`) and what the NCR belt
+        // keys on — so after it the units being shipped have no measurements
+        // at all, and the old comparison could not see it.
+        //
+        // The drift key is now `aberp_qa::unit_set_digest`, recomputed through
+        // the SAME pure function that produced the stored value at freeze
+        // time. `serial_range` stays exactly as it is: it is printed into the
+        // hash-pinned PDF bytes, so it is a rendering for humans, not an
+        // identity.
+        //
+        // §D5 — a report issued BEFORE ADR-0126 has no digest and cannot be
+        // given one: reconstructing the frozen enumeration would mean reading
+        // the marks as they are now, which is the very thing under suspicion
+        // (ADR-0123's no-backfill posture). Such a report falls back to the
+        // old comparison, which leaves it exactly as strong as it was
+        // yesterday and no stronger. `unit_set_sha256 IS NULL` is the exact
+        // query that separates the two populations; this slice surfaces the
+        // difference nowhere else, and ADR-0126 §D5 says so rather than
+        // implying a record it does not write.
         //
         // This cannot false-block the normal sequence (mark → measure →
         // freeze → issue → ship): `resolve_context` reads ALL of the WO's
@@ -18547,7 +18575,11 @@ pub fn resolve_qc_report_gate_with_capability(
                 part_uid: m.part_uid.clone(),
             })
             .collect();
-        if current.serial_range != aberp_qa::serial_range_of(&units_now) {
+        let units_drifted = match current.unit_set_sha256.as_deref() {
+            Some(frozen) => frozen != aberp_qa::unit_set_digest(&units_now),
+            None => current.serial_range != aberp_qa::serial_range_of(&units_now),
+        };
+        if units_drifted {
             return Ok(QcReportGate::Blocked {
                 work_order_id: wo.wo_id,
                 customer_type,
