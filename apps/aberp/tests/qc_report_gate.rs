@@ -3123,3 +3123,61 @@ fn a_legacy_report_without_a_digest_falls_back_and_says_so() {
         other => panic!("the legacy fallback stopped blocking what it can see: {other:?}"),
     }
 }
+
+// ── ADR-0199 residual 8 — the late-measurement safety net is NOT atomic ──
+//
+// The residual says the document merely goes stale, because "the failure a
+// late measurement records now spawns an NCR the belt sees". That safety net
+// is real but it is NOT atomic: `record_manual_inspection` commits the
+// measurement, then creates the NCR on a SECOND connection, then links it in
+// a THIRD transaction (`apps/aberp/src/qc_inspection.rs`). Between the first
+// commit and the second, a crash or any error leaves a committed FAILING
+// measurement with no NCR at all — and nothing else re-reads `qc_inspections`
+// after issuance.
+//
+// This test reproduces exactly that state. It does not simulate a crash; it
+// builds the row the crash leaves behind, which is what a gate has to survive.
+
+#[test]
+fn a_late_failure_with_no_ncr_must_not_release_the_shipment() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "2");
+    seed_dispatch(&conn, "dsp-late", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 2);
+
+    let plan = seed_plan(&conn, "Bore D", "1", true);
+    for u in &units {
+        measure_at(&mut conn, &plan, &u.part_uid, 25.0, now());
+    }
+    let (qcr_id, d) = issue_report_for(&mut conn, &units);
+    assert_eq!(d, Disposition::Accept, "precondition: the report accepts");
+    let disp = dispatch(&conn, "dsp-late");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: nothing blocks before the late measurement"
+    );
+
+    // A LATE measurement, far outside the ±0.05 band on nominal 25.0, recorded
+    // and committed with no NCR — the state the non-atomic window leaves.
+    measure_at(&mut conn, &plan, &units[0].part_uid, 30.0, now());
+
+    let disp = dispatch(&conn, "dsp-late");
+    match resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked { qcr_id: id, .. } => {
+            assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
+        }
+        other => panic!(
+            "a recorded FAILING measurement released the shipment on a report \
+             that still says `accept`, because the NCR that was supposed to \
+             catch it was never written — {other:?}"
+        ),
+    }
+}
