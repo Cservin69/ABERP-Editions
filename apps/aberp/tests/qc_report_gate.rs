@@ -3181,3 +3181,102 @@ fn a_late_failure_with_no_ncr_must_not_release_the_shipment() {
         ),
     }
 }
+
+/// Record a measurement through a probe whose calibration is STALE.
+/// `measure_at` hardcodes `last_calibration_at: None`, which can never
+/// produce `Verdict::CalibrationStale` — `compute_verdict` only checks the
+/// window when a calibration timestamp exists.
+fn measure_stale_at(
+    conn: &mut Connection,
+    plan_id: &str,
+    part_uid: &str,
+    actual: f64,
+    at: OffsetDateTime,
+) {
+    let m = meta();
+    let plan = aberp_qa::get_inspection_plan(conn, T, plan_id)
+        .unwrap()
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    record_inspection(
+        &tx,
+        &ctx(&m),
+        RecordInspectionInputs {
+            plan: &plan,
+            source: QcSource::Manual,
+            source_event_id: None,
+            actual_value: actual,
+            units: "mm".into(),
+            probe_serial: Some("PRB-1".into()),
+            // calibrated well outside the 1-day window below
+            last_calibration_at: Some(at - time::Duration::days(30)),
+            measured_at: at,
+            current_time: at,
+            stale_window_seconds: 86_400,
+            linked_part_uid: Some(part_uid.into()),
+            linked_heat_lot: Some("HL-9911".into()),
+            linked_wo_id: Some("wo-def".into()),
+            recorded_by: "ervin".into(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+/// ADR-0199 residual 19 — a post-issuance `CalibrationStale` measurement.
+///
+/// The residual records it as reaching NEITHER gate: `CalibrationStale`
+/// raises no NCR by design (an untrusted probe must not manufacture a false
+/// defect), and an issued report is immutable — so a probe found out of
+/// calibration after the certificate was issued surfaced nowhere, and the
+/// residual budgets "a second belt keyed on stale-calibration measurements".
+///
+/// **ADR-0127 §D1 closes it without a second belt.** `compute_disposition`
+/// returns `Incomplete` on any `calibration_stale` count, and the gate now
+/// re-derives from today's measurements — so the stale reading stops the
+/// report releasing on exactly the same path a late failure does. Asserted
+/// here rather than assumed, because "it probably falls out" is how a safety
+/// property ends up resting on nobody having checked.
+#[test]
+fn a_post_issuance_stale_calibration_measurement_stops_the_release() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "2");
+    seed_dispatch(&conn, "dsp-stale", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 2);
+
+    let plan = seed_plan(&conn, "Bore D", "1", true);
+    for u in &units {
+        measure_at(&mut conn, &plan, &u.part_uid, 25.0, now());
+    }
+    let (qcr_id, d) = issue_report_for(&mut conn, &units);
+    assert_eq!(d, Disposition::Accept);
+    let disp = dispatch(&conn, "dsp-stale");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the report releases before the stale reading"
+    );
+
+    // IN tolerance — this is not a failure. The only thing wrong with it is
+    // that the probe could not be trusted when it was taken.
+    measure_stale_at(&mut conn, &plan, &units[0].part_uid, 25.0, now());
+
+    let disp = dispatch(&conn, "dsp-stale");
+    match resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked { reason, qcr_id: id, .. } => {
+            assert_eq!(reason, QcReportBlockReason::EvidenceDrift);
+            assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
+        }
+        other => panic!(
+            "a probe found out of calibration after issuance left the \
+             certificate releasing: {other:?}"
+        ),
+    }
+}
