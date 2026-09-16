@@ -18335,6 +18335,17 @@ pub enum QcReportBlockReason {
     /// building. The evidence is real; it is just not evidence about these
     /// parts (round 4, B-2).
     UnitDrift,
+    /// The scope is intact — the same units, the same characteristics — but
+    /// the MEASUREMENTS that exist today no longer support the verdict this
+    /// report is releasing on (ADR-0127 §D1).
+    ///
+    /// The case that forced this: a failing measurement recorded after
+    /// issuance, whose auto-NCR was never written because
+    /// `record_manual_inspection` created it in a SECOND transaction after
+    /// committing the measurement. The NCR belt reads NCRs, so it saw
+    /// nothing, and nothing else re-read `qc_inspections` — the shipment
+    /// released on a report that still said `accept`.
+    EvidenceDrift,
 }
 
 impl QcReportBlockReason {
@@ -18345,6 +18356,7 @@ impl QcReportBlockReason {
             QcReportBlockReason::Rejected => "rejected",
             QcReportBlockReason::PlanDrift => "plan_drift",
             QcReportBlockReason::UnitDrift => "unit_drift",
+            QcReportBlockReason::EvidenceDrift => "evidence_drift",
         }
     }
 }
@@ -18740,6 +18752,73 @@ pub fn resolve_qc_report_gate_with_capability(
             .all(|id| measured_plan_ids.contains(id));
 
         if identity_covered && required_now.iter().all(|n| covered.contains(n)) {
+            // ── ADR-0127 §D1 — EVIDENCE drift ────────────────────────────────
+            //
+            // The scope checks above ask whether the report is about THESE parts
+            // and THESE characteristics. They do not ask whether the measurements
+            // still say what they said, and until now nothing did: no code path
+            // re-read `qc_inspections` after issuance.
+            //
+            // That mattered because the safety net everyone assumed was covering
+            // it is not atomic. `record_manual_inspection` commits the
+            // measurement, then creates the auto-NCR on a SECOND connection, then
+            // links it in a THIRD transaction. A crash between the first commit
+            // and the second leaves a committed FAILING measurement with no NCR;
+            // the belt reads NCRs, so it sees nothing, and the shipment releases
+            // on a report that still says `accept`. ADR-0127 §D2 closes that
+            // window; this closes the state it leaves behind, which every
+            // database that has already been through the window still contains.
+            //
+            // Re-derived with the SAME pure functions the freeze ran, so the two
+            // sides cannot disagree about what the evidence means — only about
+            // what it IS.
+            //
+            // TIME-FREE on purpose (§D1). The obvious rule, "block on a failing
+            // measurement that postdates the report", is backdatable:
+            // `qc_inspections` has no recorded-at column, only a caller-supplied
+            // `measured_at_utc`. It is also too crude — a failure later corrected
+            // by a passing re-measurement would block for ever. Asking what the
+            // evidence says TODAY needs no clock and answers both.
+            // `build_report_lines` takes no clock either, and calibration
+            // staleness is the verdict stored at record time, so a part cannot
+            // drift into a block merely because time passed.
+            //
+            // §D1c — `open_ncr_against_reported_part` is FALSE here on purpose:
+            // this arm answers on measurement evidence alone, and the NCR belt
+            // keeps sole ownership of the NCR question. Neither gate can mask the
+            // other.
+            let inspections_now = aberp_qa::list_inspections_for_wo(conn, tenant, &wo.wo_id)
+                .map_err(|e| anyhow!("list inspections for {}: {e}", wo.wo_id))?;
+            // Re-read rather than reuse the UnitDrift binding: that one is scoped
+            // to its own arm, and reaching across for it would couple two checks
+            // that are deliberately independent. The rows are the same rows.
+            let marks_for_evidence = crate::part_marking::list_part_marks(conn, tenant, &wo.wo_id)
+                .with_context(|| format!("list part marks for {} (evidence)", wo.wo_id))?;
+            let units_now: Vec<aberp_qa::ReportUnit> = marks_for_evidence
+                .iter()
+                .map(|m| aberp_qa::ReportUnit {
+                    part_serial: m.serial_number.clone(),
+                    part_uid: m.part_uid.clone(),
+                })
+                .collect();
+            let evidence_now = aberp_qa::compute_disposition(
+                aberp_qa::summarise(&aberp_qa::build_report_lines(
+                    &plans,
+                    &inspections_now,
+                    &units_now,
+                )),
+                false,
+            );
+            if !evidence_now.permits_shipment() {
+                return Ok(QcReportGate::Blocked {
+                    work_order_id: wo.wo_id,
+                    customer_type,
+                    reason: QcReportBlockReason::EvidenceDrift,
+                    qcr_id: Some(current.qcr_id.clone()),
+                    disposition: Some(current.disposition.as_str().to_string()),
+                });
+            }
+
             return Ok(QcReportGate::Pass);
         }
         return Ok(QcReportGate::Blocked {
@@ -18750,6 +18829,7 @@ pub fn resolve_qc_report_gate_with_capability(
             disposition: Some(current.disposition.as_str().to_string()),
         });
     }
+
 
     let reason = match current.disposition {
         aberp_qa::Disposition::Reject => QcReportBlockReason::Rejected,
@@ -18958,6 +19038,12 @@ fn qc_report_block_detail(reason: QcReportBlockReason, qcr_id: Option<&str>) -> 
             "QC report {id} does not enumerate the serialised units being shipped — \
              the parts were marked after it was issued, or the marked units changed \
              since. Issue a fresh report covering the units on this work order"
+        ),
+        QcReportBlockReason::EvidenceDrift => format!(
+            "QC report {id} no longer matches the inspection results on file — a \
+             measurement recorded since it was issued means the evidence today \
+             does not support shipping. Review the inspections for this work \
+             order and issue a fresh report"
         ),
     }
 }
