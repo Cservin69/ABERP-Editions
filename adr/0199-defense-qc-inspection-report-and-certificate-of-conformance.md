@@ -656,9 +656,35 @@ At issuance the renderer runs once, the SHA-256 of the emitted bytes is
 computed, and `qcr.report_issued` is appended to the hash-chained ledger
 carrying `rendered_sha256` + `renderer_version` + the full accountability
 counts + the disposition + the traceability keys. The bytes themselves are
-**not** stored: the report re-renders deterministically from the frozen
-`qc_report_lines`, and the chain proves the bytes anyone re-renders are the
-bytes that were issued.
+**not** stored: the report re-renders from the frozen `qc_report_lines`, and
+the chain proves the bytes anyone re-renders **with the recorded
+`renderer_version`** are the bytes that were issued.
+
+> **CORRECTED 2026-09-16 ([ADR-0124](0124-qc-report-retention-accept-the-renderer-drift.md)).**
+> This paragraph previously said the report "re-renders deterministically" and
+> that "the chain proves the bytes anyone re-renders are the bytes that were
+> issued", with no condition attached. That is too strong. `aberp-qc-pdf` is a
+> pure renderer, so the bytes are reproducible **by that renderer version** —
+> and the crate is instructed to bump its version in the same commit as any
+> change to the rendered bytes, with the version printed into the page footer.
+> **After such a bump, every previously issued report's exact bytes are
+> permanently unreproducible by ABERP.**
+>
+> That is accepted, deliberately (ADR-0124 §2): what must be provable is the
+> DATA, and the data is provable independently of any renderer — the
+> disposition, the accountability counts and the traceability keys are pinned
+> in the hash-chained ledger. The PDF is a rendering of that answer, not the
+> answer.
+>
+> The code already behaves correctly: ADR-0122 §D2's 2×2 refuses an export when
+> the SHA diverges under the **same** `renderer_version` (a tamper signal) and
+> omits-and-names the document when the version **differs**. Only this sentence
+> was wrong.
+>
+> **⚠️ There is no archival copy.** ADR-0124 §4 records, with evidence, that the
+> issued PDF is NOT retained in the email archive or anywhere else: Phase 1c is
+> off and unbuilt (Open Q8 below), no mail path references QC, and the invoice
+> mail path renders on the fly without retaining bytes. Ervin's call, open.
 
 **Why this and not the two alternatives:**
 

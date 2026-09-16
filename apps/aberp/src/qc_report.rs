@@ -396,9 +396,22 @@ pub fn draft_report(
 /// Issue a drafted report: render once, hash the bytes, pin the hash.
 ///
 /// The bytes are DISCARDED after hashing — that is the whole point of
-/// ADR-0199 §D7. Anyone who wants the document re-renders it from the
-/// frozen rows, and the chain entry proves the bytes they get are the
-/// bytes that were issued.
+/// ADR-0199 §D7. Anyone who wants the document re-renders it from the frozen
+/// rows, and the chain entry proves the bytes they get **with the recorded
+/// `renderer_version`** are the bytes that were issued.
+///
+/// **CORRECTED 2026-09-16 (ADR-0124).** This said, without condition, that a
+/// re-render yields the issued bytes. It does so only while the renderer that
+/// produced them exists: `aberp-qc-pdf` bumps its version with any change to
+/// the rendered bytes (and prints it into the footer), so after a bump every
+/// previously issued report is permanently unreproducible. That is accepted —
+/// what must be provable is the DATA, which the hash-chained ledger pins
+/// independently of any renderer — and the export path already handles the
+/// split correctly (ADR-0122 §D2: same version + different SHA REFUSES as a
+/// tamper signal; different version OMITS AND NAMES).
+///
+/// There is no archival copy of the issued bytes anywhere in ABERP
+/// (ADR-0124 §4).
 pub fn issue_report(
     db: &HandleArc,
     tenant: TenantId,
