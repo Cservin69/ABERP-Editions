@@ -696,3 +696,106 @@ async fn a_registration_without_attested_credential_data_is_refused() {
     let _ = FLAG_AT;
     p.stub.stop();
 }
+
+/// ADR-0115 adversarial finding 3 — `POST /api/enrol/begin` is a window oracle.
+///
+/// The handler parses the supplied `token` and never validates it: it checks
+/// only `enrolment.is_open()` and then echoes the token back. So a caller who
+/// has got through the front gets **200 while an enrolment window is open** and
+/// **401 while it is not** — a clean binary read on whether Ervin has a
+/// 10-minute window running.
+///
+/// That is precisely the signal §5 deliberately removed from
+/// `GET /api/session`, reintroduced on a different path. It does not GRANT
+/// enrolment — `enrol_finish` consumes the real token and the §4.3a
+/// attestation and §4.3b console confirmation both still stand — but the
+/// window is the thing an attacker needs to know to be present for.
+///
+/// The fix must make the answer identical whether the window is closed or the
+/// token is wrong, so there is nothing to read either way.
+#[tokio::test]
+async fn enrol_begin_does_not_reveal_that_a_window_is_open() {
+    let p = start_portal("enrol-oracle").await;
+    let c = client();
+
+    // No window at all: the baseline refusal.
+    let (closed_status, _) = post_json(
+        &c,
+        &p.url("/api/enrol/begin"),
+        &serde_json::json!({ "token": "not-a-real-token" }),
+    )
+    .await;
+
+    // Ervin opens a window at the console. The attacker does NOT have the
+    // token it minted — only the knock that got them this far.
+    let _real = p
+        .agent
+        .enrolment
+        .mint("ervin-yubikey")
+        .expect("console enrolment");
+    let (open_status, body) = post_json(
+        &c,
+        &p.url("/api/enrol/begin"),
+        &serde_json::json!({ "token": "not-a-real-token" }),
+    )
+    .await;
+
+    assert_eq!(
+        open_status, closed_status,
+        "an open enrolment window is readable from the status code alone: \
+         closed={closed_status}, open={open_status}. That is the 10-minute \
+         window oracle §5 removed from GET /api/session, on another path. \
+         body: {body}"
+    );
+}
+
+/// ADR-0115 finding 3 — a wrong guess must not CANCEL the open window.
+///
+/// `consume` refuses a bad token without clearing, deliberately: an attacker
+/// must not be able to cancel Ervin's legitimate window by guessing at it.
+/// `admits` has to keep that rule, and it is a rule nothing would notice
+/// breaking — the guess is refused either way, and the damage only shows up
+/// when Ervin's own enrolment then fails for no visible reason.
+#[tokio::test]
+async fn a_wrong_enrolment_guess_does_not_cancel_the_open_window() {
+    let p = start_portal("enrol-guess").await;
+    let c = client();
+    let real = p
+        .agent
+        .enrolment
+        .mint("ervin-yubikey")
+        .expect("console enrolment");
+
+    // Someone knocks with a wrong token, twice.
+    for _ in 0..2 {
+        let (status, _) = post_json(
+            &c,
+            &p.url("/api/enrol/begin"),
+            &serde_json::json!({ "token": "wrong" }),
+        )
+        .await;
+        assert_eq!(status, 401, "a wrong token must be refused");
+    }
+
+    // Ervin's own enrolment still works: the window survived the guessing.
+    let (status, begin) = post_json(
+        &c,
+        &p.url("/api/enrol/begin"),
+        &serde_json::json!({ "token": real }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the real token must still open the ceremony — a wrong guess cancelled \
+         the window: {begin}"
+    );
+    // Stops here deliberately. Whether the CEREMONY then completes is
+    // §4.3a's business — a software authenticator is refused on attestation,
+    // which `a_software_credential_cannot_enrol` owns. The property this test
+    // exists for is that the WINDOW survived the guessing, and a 200 from
+    // `begin` on the real token is exactly that.
+    assert!(
+        begin["options"]["challenge"].as_str().is_some(),
+        "the real token must still mint a challenge: {begin}"
+    );
+}

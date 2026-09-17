@@ -142,6 +142,41 @@ impl EnrolStore {
         self.read().is_ok_and(|p| p.expires_at > now_unix())
     }
 
+    /// Does an OPEN window admit this token? Validates without consuming.
+    ///
+    /// ADR-0115 adversarial finding 3. `enrol_begin` used [`Self::is_open`]
+    /// and never looked at the token it was handed, so it answered 200 while a
+    /// window was open and 401 while it was not — the 10-minute-window oracle
+    /// §5 removed from `GET /api/session`, on another path — and it minted a
+    /// live challenge whose `excludeCredentials` lists the already-enrolled
+    /// credential ids.
+    ///
+    /// Peek semantics are kept deliberately: `begin` must not burn Ervin's
+    /// window for a browser that opened the URL and then cancelled. So this
+    /// validates and returns, and [`Self::consume`] still does the spending.
+    ///
+    /// A wrong guess clears NOTHING — the same rule `consume` follows, and for
+    /// the same reason: an attacker must not be able to cancel a legitimate
+    /// open window by guessing at it. An EXPIRED window is not cleared here
+    /// either; this is a pure predicate, and housekeeping belongs to the path
+    /// that spends.
+    ///
+    /// Constant-time on the token compare. The filesystem read is not
+    /// constant-time — "no pending file" returns sooner than a read-and-parse
+    /// — so a timing difference survives this. That is a far weaker signal
+    /// than a status code, it sits behind the knock gate, and closing it would
+    /// mean holding the window in memory, which is its own design change.
+    /// Recorded rather than claimed away.
+    #[must_use]
+    pub fn admits(&self, token: &str) -> bool {
+        match self.read() {
+            Ok(pending) if pending.expires_at > now_unix() => {
+                aberp_portal_core::ct::eq(pending.token.as_bytes(), token.as_bytes())
+            }
+            _ => false,
+        }
+    }
+
     /// Validate and **consume** `token`. Single-use: the pending record
     /// is deleted before the ceremony result is returned, so a replay
     /// of the same URL — including one captured inside the 10-minute
@@ -358,6 +393,42 @@ mod tests {
         assert_eq!(s.consume(&t).expect("consume"), "iPhone");
         assert!(!s.is_open());
         assert!(matches!(s.consume(&t), Err(EnrolError::NonePending)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ADR-0115 finding 3 — `admits` must check EXPIRY, not just the bytes.
+    ///
+    /// Mutation-found: dropping the expiry term left every other test green.
+    /// `consume` still refuses an expired window, so enrolment could not
+    /// complete — but `enrol_begin` would mint a live challenge for a window
+    /// that had already closed, which says "this token was once valid" to
+    /// whoever presents it. A weaker leak than the one finding 3 closed, and
+    /// the same kind.
+    #[test]
+    fn admits_refuses_a_token_whose_window_has_expired() {
+        let dir = tmpdir("admits-expiry");
+        let s = EnrolStore::in_dir(&dir);
+        let t = s.mint("iPhone").expect("mint");
+        assert!(
+            s.admits(&t),
+            "precondition: a fresh window admits its token"
+        );
+
+        // Age the window out from under it, leaving the token itself correct.
+        let expired = Pending {
+            token: t.clone(),
+            expires_at: now_unix() - 1,
+            label: "iPhone".into(),
+        };
+        std::fs::write(s.path(), serde_json::to_string(&expired).expect("json")).expect("write");
+
+        assert!(
+            !s.admits(&t),
+            "the right token against an EXPIRED window must not open the \
+             ceremony — the window is the thing being checked"
+        );
+        // …and a pure predicate leaves the record alone for `consume` to judge.
+        assert!(s.path().exists(), "admits must not clear; it only answers");
         std::fs::remove_dir_all(&dir).ok();
     }
 
