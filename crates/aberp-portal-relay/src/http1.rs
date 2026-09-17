@@ -1113,6 +1113,63 @@ fn render(answer: &Answer, head: &RequestHead, may_reuse: bool) -> (Vec<u8>, boo
 /// response that did would be unique on the whole host. They are worth
 /// having on the shell — that is a real browser context with real
 /// invoice data in it — and actively harmful on the 404.
+/// The CSP header line, with the shell's own inline blocks allow-listed by
+/// HASH (ADR-0115 adversarial finding 1).
+///
+/// # What was wrong
+/// This sent `script-src 'self'; style-src 'self'` with no nonce and no hash,
+/// while `assets/shell.html` is one inline `<style>` and one inline
+/// `<script>`. Every CSP-enforcing browser dropped both, so the shell rendered
+/// unstyled and did nothing: the portal as landed could not authenticate
+/// anyone. It failed CLOSED, so it was never a hole — it was the feature not
+/// working, and no test caught it because the header test asserted the headers
+/// were PRESENT rather than CORRECT.
+///
+/// # Hash, not nonce — and derived from the bytes actually served
+/// A nonce would need per-response randomness and a templated shell; a hash
+/// needs neither, and it is computed HERE from [`crate::front::SHELL_HTML`],
+/// the same `include_str!` constant the body is served from. So the allow-list
+/// cannot drift from the page: edit `shell.html` and the hash follows on the
+/// next build, with no constant to remember to bump. A stale hash is not even
+/// reachable.
+///
+/// Computed once. The other directives are unchanged — `frame-ancestors
+/// 'none'` is still the load-bearing one, and nothing here widens `default-src`.
+fn content_security_policy() -> &'static str {
+    static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSP.get_or_init(|| {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        // Hash the EXACT bytes between the tags — that is what a browser
+        // hashes when it checks an inline block against the policy.
+        fn inline_hash(tag: &str) -> String {
+            let open = format!("<{tag}>");
+            let close = format!("</{tag}>");
+            let html = crate::front::SHELL_HTML;
+            let body = html
+                .find(&open)
+                .map(|i| i + open.len())
+                .and_then(|start| html[start..].find(&close).map(|e| &html[start..start + e]))
+                .unwrap_or("");
+            let digest = Sha256::digest(body.as_bytes());
+            format!(
+                "'sha256-{}'",
+                base64::engine::general_purpose::STANDARD.encode(digest)
+            )
+        }
+
+        format!(
+            "Content-Security-Policy: default-src 'self'; \
+             script-src 'self' {}; style-src 'self' {}; img-src 'self' data:; \
+             connect-src 'self'; object-src 'none'; base-uri 'none'; \
+             form-action 'none'; frame-ancestors 'none'\r\n",
+            inline_hash("script"),
+            inline_hash("style"),
+        )
+    })
+}
+
 fn render_portal(p: &PortalAnswer, date: &str, keep_alive: bool, include_body: bool) -> Vec<u8> {
     use std::fmt::Write as _;
 
@@ -1145,12 +1202,7 @@ fn render_portal(p: &PortalAnswer, date: &str, keep_alive: bool, include_body: b
     // stops the portal being framed by a page that already holds a
     // session cookie. `X-Frame-Options` repeats it for anything that
     // predates CSP level 2.
-    out.push_str(
-        "Content-Security-Policy: default-src 'self'; \
-         script-src 'self'; style-src 'self'; img-src 'self' data:; \
-         connect-src 'self'; object-src 'none'; base-uri 'none'; \
-         form-action 'none'; frame-ancestors 'none'\r\n",
-    );
+    out.push_str(content_security_policy());
     out.push_str("X-Frame-Options: DENY\r\n");
     out.push_str("X-Content-Type-Options: nosniff\r\n");
     // The knock token is IN THE PATH. Without this, following any
@@ -2186,15 +2238,26 @@ mod tests {
             .find(|l| l.starts_with("Content-Security-Policy:"))
             .expect("the shell carries a CSP");
 
-        for (tag, directive) in [("style", "style-src"), ("script", "script-src")] {
+        // Read ONE directive's own value, so a hash that landed in the wrong
+        // directive cannot pass: `script-src` carrying the style hash admits
+        // nothing the browser will run.
+        fn directive<'a>(csp: &'a str, name: &str) -> &'a str {
+            csp.split(';')
+                .map(str::trim)
+                .find(|d| d.starts_with(name))
+                .unwrap_or_else(|| panic!("CSP has no {name}: {csp}"))
+        }
+
+        for (tag, name) in [("style", "style-src"), ("script", "script-src")] {
             let body = inline_body(crate::front::SHELL_HTML, tag);
             let digest = Sha256::digest(body.as_bytes());
             let hash = base64::engine::general_purpose::STANDARD.encode(digest);
+            let d = directive(csp, name);
             assert!(
-                csp.contains(&format!("'sha256-{hash}'")) || csp.contains("'nonce-"),
-                "{directive} does not admit the shell's own inline <{tag}>; a \
+                d.contains(&format!("'sha256-{hash}'")) || d.contains("'nonce-"),
+                "{name} does not admit the shell's own inline <{tag}>; a \
                  CSP-enforcing browser drops it and the portal cannot \
-                 authenticate anyone.\nCSP: {csp}"
+                 authenticate anyone.\n{name}: {d}"
             );
         }
     }
