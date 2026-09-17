@@ -3456,3 +3456,69 @@ fn a_lot_level_ncr_must_label_the_report_accept_with_ncr() {
          hash-pinned so it cannot be corrected afterwards"
     );
 }
+
+/// ADR-0199 residual 15, the stated decision — a WAIVED NCR still labels the
+/// report `accept_with_ncr`.
+///
+/// A waiver is a decision to SHIP anyway; it is not a finding that the
+/// nonconformity never existed. The certificate states what was FOUND, and the
+/// waiver states what was then DECIDED — with its own operator, reason and
+/// hash-chained entry. If the label folded them together, a signature would
+/// erase a defect from a compliance document.
+#[test]
+fn a_waived_ncr_still_labels_the_report_accept_with_ncr() {
+    if !aberp::build_profile::qc_reporting_allowed() {
+        return;
+    }
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-wv", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    measure(&mut conn, &p1, &units[0].part_uid, 25.0);
+    seed_ncr(&conn, "ncr_lot", &[], &["wo-def"]);
+    // A manager has signed the shipment off for this exact (ncr, wo) pair.
+    aberp::quality::ensure_schema(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO ncr_shipment_waivers (waiver_id, tenant_id, ncr_id, work_order_id, \
+         approved_by_operator, reason, approved_at_utc, ncr_state_at_waiver) \
+         VALUES ('wvr_1',?1,'ncr_lot','wo-def','manager', \
+         'customer accepted the deviation in writing','2026-08-03T00:00:00Z','open')",
+        params![T],
+    )
+    .unwrap();
+
+    let handle = aberp::serve::open_tenant_handle(&db, TenantId::new(T).unwrap()).unwrap();
+    let hash = BinaryHash::from_bytes([0u8; 32]);
+    let tenant = TenantId::new(T).unwrap();
+    drop(conn);
+
+    let drafted = aberp::qc_report::draft_report(
+        &handle,
+        tenant,
+        hash,
+        "ervin",
+        now(),
+        aberp::qc_report::DraftReportRequest {
+            wo_id: "wo-def".into(),
+            report_kind: QcReportKind::DimensionalInspection,
+            template: None,
+            notes: None,
+        },
+    )
+    .expect("draft");
+
+    assert_eq!(
+        drafted.report.disposition,
+        Disposition::AcceptWithNcr,
+        "a waiver releases the shipment; it does not un-find the defect, and \
+         the certificate must not say otherwise"
+    );
+}
