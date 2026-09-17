@@ -396,6 +396,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// ADR-0115 finding 3 — `admits` must check EXPIRY, not just the bytes.
+    ///
+    /// Mutation-found: dropping the expiry term left every other test green.
+    /// `consume` still refuses an expired window, so enrolment could not
+    /// complete — but `enrol_begin` would mint a live challenge for a window
+    /// that had already closed, which says "this token was once valid" to
+    /// whoever presents it. A weaker leak than the one finding 3 closed, and
+    /// the same kind.
+    #[test]
+    fn admits_refuses_a_token_whose_window_has_expired() {
+        let dir = tmpdir("admits-expiry");
+        let s = EnrolStore::in_dir(&dir);
+        let t = s.mint("iPhone").expect("mint");
+        assert!(
+            s.admits(&t),
+            "precondition: a fresh window admits its token"
+        );
+
+        // Age the window out from under it, leaving the token itself correct.
+        let expired = Pending {
+            token: t.clone(),
+            expires_at: now_unix() - 1,
+            label: "iPhone".into(),
+        };
+        std::fs::write(s.path(), serde_json::to_string(&expired).expect("json")).expect("write");
+
+        assert!(
+            !s.admits(&t),
+            "the right token against an EXPIRED window must not open the \
+             ceremony — the window is the thing being checked"
+        );
+        // …and a pure predicate leaves the record alone for `consume` to judge.
+        assert!(s.path().exists(), "admits must not clear; it only answers");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn with_no_pending_enrolment_nothing_can_register() {
         // The property that makes remote enrolment impossible.
