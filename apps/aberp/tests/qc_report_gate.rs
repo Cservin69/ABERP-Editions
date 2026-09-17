@@ -3522,3 +3522,57 @@ fn a_waived_ncr_still_labels_the_report_accept_with_ncr() {
          the certificate must not say otherwise"
     );
 }
+
+/// ADR-0199 residual 15 — the LOT-ONLY report, which the removed
+/// `units.is_empty()` early return swallowed whole.
+///
+/// A work order with no serialised units still gets a certificate, and a
+/// lot-level nonconformity is exactly the kind raised against it. The old
+/// guard returned "no NCR" before looking, so this was the one report shape
+/// guaranteed to be mislabelled.
+#[test]
+fn a_lot_only_report_still_sees_a_work_order_ncr() {
+    if !aberp::build_profile::qc_reporting_allowed() {
+        return;
+    }
+    let db = setup();
+    let conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-lotonly", "wo-def", &buyer.id);
+    // NO marked units at all — the lot-only shape.
+    seed_ncr(&conn, "ncr_lot", &[], &["wo-def"]);
+
+    let handle = aberp::serve::open_tenant_handle(&db, TenantId::new(T).unwrap()).unwrap();
+    let hash = BinaryHash::from_bytes([0u8; 32]);
+    let tenant = TenantId::new(T).unwrap();
+    drop(conn);
+
+    let drafted = aberp::qc_report::draft_report(
+        &handle,
+        tenant,
+        hash,
+        "ervin",
+        now(),
+        aberp::qc_report::DraftReportRequest {
+            wo_id: "wo-def".into(),
+            report_kind: QcReportKind::DimensionalInspection,
+            template: None,
+            notes: None,
+        },
+    )
+    .expect("draft");
+
+    assert_ne!(
+        drafted.report.disposition,
+        Disposition::Accept,
+        "a lot-only report with an open work-order NCR must not read as a \
+         clean accept — this is the shape the units.is_empty() early return \
+         mislabelled every time"
+    );
+}
