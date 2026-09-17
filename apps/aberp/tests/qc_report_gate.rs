@@ -3373,3 +3373,86 @@ fn an_out_of_band_unattributed_measurement_is_a_stated_limit() {
          gates — the in-band path is what ADR-0199 residual 14 closes"
     );
 }
+
+/// Seed an NCR row directly, so a test can choose exactly what it names.
+/// `create_ncr` writes through its own opener; this keeps the row in the same
+/// world as the rest of the fixture's seeding.
+fn seed_ncr(conn: &Connection, ncr_id: &str, part_uids: &[&str], wo_ids: &[&str]) {
+    aberp::quality::ensure_schema(conn).unwrap();
+    let enc = |v: &[&str]| serde_json::to_string(v).unwrap();
+    conn.execute(
+        "INSERT INTO ncrs (ncr_id, tenant_id, discovered_at_utc, discovered_by_operator, \
+         severity, category, description, affected_part_uids, affected_wo_ids, \
+         affected_heat_lots, photos, state, closed_at_utc, closed_by_operator) \
+         VALUES (?1,?2,'2026-08-02T00:00:00Z','op','major','workmanship','seeded', \
+         ?3,?4,'[]','[]','open',NULL,NULL)",
+        params![ncr_id, T, enc(part_uids), enc(wo_ids)],
+    )
+    .unwrap();
+}
+
+/// ADR-0199 residual 15 — a LOT-level NCR leaves the report labelled `accept`.
+///
+/// `open_ncr_against` joins on `affected_part_uids` only, so an NCR that names
+/// the WORK ORDER and no unit does not set `open_ncr_against_reported_part` —
+/// and `compute_disposition` therefore returns `Accept` rather than
+/// `AcceptWithNcr`.
+///
+/// The residual calls this deliberate, on the grounds that it "decides how a
+/// report is LABELLED, not whether a shipment leaves", and that is true: the
+/// shipment is refused by the NCR belt either way, and ADR-0127 now refuses it
+/// a second time. But the QC report is a COMPLIANCE DOCUMENT. A certificate
+/// that says `accept` while a major nonconformity stands open against the very
+/// work order it certifies is a document that misstates the quality record,
+/// and it is printed into hash-pinned bytes where it cannot later be corrected.
+#[test]
+fn a_lot_level_ncr_must_label_the_report_accept_with_ncr() {
+    if !aberp::build_profile::qc_reporting_allowed() {
+        return;
+    }
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-lot", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    measure(&mut conn, &p1, &units[0].part_uid, 25.0);
+
+    // An NCR against the WORK ORDER, naming no unit — the shape a lot-level
+    // nonconformity is raised in.
+    seed_ncr(&conn, "ncr_lot", &[], &["wo-def"]);
+
+    let handle = aberp::serve::open_tenant_handle(&db, TenantId::new(T).unwrap()).unwrap();
+    let hash = BinaryHash::from_bytes([0u8; 32]);
+    let tenant = TenantId::new(T).unwrap();
+    drop(conn);
+
+    let drafted = aberp::qc_report::draft_report(
+        &handle,
+        tenant,
+        hash,
+        "ervin",
+        now(),
+        aberp::qc_report::DraftReportRequest {
+            wo_id: "wo-def".into(),
+            report_kind: QcReportKind::DimensionalInspection,
+            template: None,
+            notes: None,
+        },
+    )
+    .expect("draft");
+
+    assert_eq!(
+        drafted.report.disposition,
+        Disposition::AcceptWithNcr,
+        "an open MAJOR NCR stands against this work order; a certificate that \
+         says plain `accept` misstates the quality record, and the bytes are \
+         hash-pinned so it cannot be corrected afterwards"
+    );
+}
