@@ -243,10 +243,28 @@ impl Agent {
         // Peek without consuming: the token is spent only once the
         // ceremony actually completes, so a browser that opened the URL
         // and then hit cancel has not burned Ervin's 10 minutes.
-        if !self.enrolment.is_open() {
+        //
+        // ADR-0115 finding 3 — VALIDATE the token, do not merely ask
+        // whether a window is open. This used to call `is_open()` and
+        // ignore `body.token` entirely, so the status code answered
+        // "is Ervin enrolling right now?" to anyone through the front:
+        // 200 inside the window, 401 outside. That is the signal §5
+        // deliberately removed from `GET /api/session`. It also minted
+        // a live challenge whose `excludeCredentials` lists the
+        // already-enrolled credential ids.
+        //
+        // The refusal is ONE path and one response, so a closed window
+        // and a wrong token are indistinguishable to the caller. The
+        // audit records which, because it is local, hash-chained and
+        // written for Ervin — not for whoever is knocking.
+        if !self.enrolment.admits(&body.token) {
             self.audit.append(
                 &Event::new("portal.enrol.refused")
-                    .reason("no enrolment window open")
+                    .reason(if self.enrolment.is_open() {
+                        "enrolment token did not match the open window"
+                    } else {
+                        "no enrolment window open"
+                    })
                     .peer(req.peer.as_deref()),
             );
             return unauthorised();

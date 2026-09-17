@@ -142,6 +142,41 @@ impl EnrolStore {
         self.read().is_ok_and(|p| p.expires_at > now_unix())
     }
 
+    /// Does an OPEN window admit this token? Validates without consuming.
+    ///
+    /// ADR-0115 adversarial finding 3. `enrol_begin` used [`Self::is_open`]
+    /// and never looked at the token it was handed, so it answered 200 while a
+    /// window was open and 401 while it was not — the 10-minute-window oracle
+    /// §5 removed from `GET /api/session`, on another path — and it minted a
+    /// live challenge whose `excludeCredentials` lists the already-enrolled
+    /// credential ids.
+    ///
+    /// Peek semantics are kept deliberately: `begin` must not burn Ervin's
+    /// window for a browser that opened the URL and then cancelled. So this
+    /// validates and returns, and [`Self::consume`] still does the spending.
+    ///
+    /// A wrong guess clears NOTHING — the same rule `consume` follows, and for
+    /// the same reason: an attacker must not be able to cancel a legitimate
+    /// open window by guessing at it. An EXPIRED window is not cleared here
+    /// either; this is a pure predicate, and housekeeping belongs to the path
+    /// that spends.
+    ///
+    /// Constant-time on the token compare. The filesystem read is not
+    /// constant-time — "no pending file" returns sooner than a read-and-parse
+    /// — so a timing difference survives this. That is a far weaker signal
+    /// than a status code, it sits behind the knock gate, and closing it would
+    /// mean holding the window in memory, which is its own design change.
+    /// Recorded rather than claimed away.
+    #[must_use]
+    pub fn admits(&self, token: &str) -> bool {
+        match self.read() {
+            Ok(pending) if pending.expires_at > now_unix() => {
+                aberp_portal_core::ct::eq(pending.token.as_bytes(), token.as_bytes())
+            }
+            _ => false,
+        }
+    }
+
     /// Validate and **consume** `token`. Single-use: the pending record
     /// is deleted before the ceremony result is returned, so a replay
     /// of the same URL — including one captured inside the 10-minute

@@ -748,3 +748,54 @@ async fn enrol_begin_does_not_reveal_that_a_window_is_open() {
          body: {body}"
     );
 }
+
+/// ADR-0115 finding 3 — a wrong guess must not CANCEL the open window.
+///
+/// `consume` refuses a bad token without clearing, deliberately: an attacker
+/// must not be able to cancel Ervin's legitimate window by guessing at it.
+/// `admits` has to keep that rule, and it is a rule nothing would notice
+/// breaking — the guess is refused either way, and the damage only shows up
+/// when Ervin's own enrolment then fails for no visible reason.
+#[tokio::test]
+async fn a_wrong_enrolment_guess_does_not_cancel_the_open_window() {
+    let p = start_portal("enrol-guess").await;
+    let c = client();
+    let real = p
+        .agent
+        .enrolment
+        .mint("ervin-yubikey")
+        .expect("console enrolment");
+
+    // Someone knocks with a wrong token, twice.
+    for _ in 0..2 {
+        let (status, _) = post_json(
+            &c,
+            &p.url("/api/enrol/begin"),
+            &serde_json::json!({ "token": "wrong" }),
+        )
+        .await;
+        assert_eq!(status, 401, "a wrong token must be refused");
+    }
+
+    // Ervin's own enrolment still works: the window survived the guessing.
+    let (status, begin) = post_json(
+        &c,
+        &p.url("/api/enrol/begin"),
+        &serde_json::json!({ "token": real }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the real token must still open the ceremony — a wrong guess cancelled \
+         the window: {begin}"
+    );
+    // Stops here deliberately. Whether the CEREMONY then completes is
+    // §4.3a's business — a software authenticator is refused on attestation,
+    // which `a_software_credential_cannot_enrol` owns. The property this test
+    // exists for is that the WINDOW survived the guessing, and a 200 from
+    // `begin` on the real token is exactly that.
+    assert!(
+        begin["options"]["challenge"].as_str().is_some(),
+        "the real token must still mint a challenge: {begin}"
+    );
+}
