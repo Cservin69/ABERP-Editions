@@ -266,6 +266,38 @@ fn first_segment_is_knock_shaped(path: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Replace a knock-shaped first path segment with a placeholder.
+///
+/// ADR-0115 adversarial finding 2. [`crate::canary`]'s own `ProbeSample` doc
+/// promises "there is no field that can hold a request body, a cookie, a query
+/// string or a token". `path` could, and routinely did: `Front::trip` records
+/// the whole path for any UN-knocked request, and the relay's `knock_matches`
+/// is false whenever the Mac's presence lease has lapsed — a restart, which is
+/// routine. So Ervin's own bookmark reload arrived with the REAL knock in path
+/// position, classified `KnockShaped` → HIGH, and the alert printed
+/// `path: /<live knock>/…` over SMTP and into the durable probe log.
+///
+/// Redacting here, next to [`first_segment_is_knock_shaped`], is deliberate:
+/// the rule that decides a segment LOOKS like a knock and the rule that hides
+/// it are the same rule, so they cannot drift apart. Redact with one and
+/// classify with the other and the day someone widens the shape is the day the
+/// leak comes back.
+///
+/// The CLASSIFICATION is untouched — knowing a knock-shaped probe arrived is
+/// the entire signal, and callers must classify BEFORE redacting. Only the
+/// secret goes; the rest of the path stays, because that is what triage reads.
+#[must_use]
+pub fn redact_knock_segment(path: &str) -> std::borrow::Cow<'_, str> {
+    if !first_segment_is_knock_shaped(path) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    // The predicate admits only ASCII alphanumerics, `-` and `_`, so the
+    // segment is exactly KNOCK_TOKEN_CHARS bytes and this index is a char
+    // boundary.
+    let rest = &path[1 + KNOCK_TOKEN_CHARS..];
+    std::borrow::Cow::Owned(format!("/<redacted-knock>{rest}"))
+}
+
 /// One probe, as it appears in the probe log and the alert.
 ///
 /// Metadata only, and structurally so: there is no field that can hold

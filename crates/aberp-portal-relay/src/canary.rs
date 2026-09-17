@@ -330,7 +330,14 @@ pub fn to_sample(
             .source
             .map_or_else(|| "unknown".to_string(), |ip| ip.to_string()),
         method: aberp_portal_core::canary::sanitise(&observation.method, 16),
-        path: aberp_portal_core::canary::sanitise(&observation.path, 120),
+        // ADR-0115 finding 2 — classified ABOVE, redacted here. A lapsed
+        // presence lease turns Ervin's own bookmark reload into an
+        // un-knocked request carrying the REAL token, and this is the
+        // field that reaches SMTP and the durable probe log.
+        path: aberp_portal_core::canary::sanitise(
+            &aberp_portal_core::canary::redact_knock_segment(&observation.path),
+            120,
+        ),
         user_agent: observation
             .user_agent
             .as_deref()
@@ -612,6 +619,64 @@ mod tests {
         assert!(
             !batch.is_reportable(),
             "the operator's own browser must not page anyone"
+        );
+    }
+}
+
+#[cfg(test)]
+mod adr0115_finding2 {
+    use super::*;
+    use aberp_portal_core::canary::Reason;
+
+    fn observation(path: &str) -> Observation {
+        Observation {
+            wall: time::OffsetDateTime::now_utc(),
+            source: Some("203.0.113.7".parse().expect("ip")),
+            method: "GET".into(),
+            path: path.into(),
+            user_agent: Some("Mozilla/5.0".into()),
+            host: Some("portal.example".into()),
+        }
+    }
+
+    /// ADR-0115 adversarial finding 2 — the LIVE knock reaches the alert.
+    ///
+    /// `Front::trip` records the whole request path for any un-knocked
+    /// request, and `knock_matches` is false whenever the Mac's presence
+    /// lease has lapsed — a restart, which is routine. So **Ervin's own
+    /// bookmark reload** arrives with the REAL knock in path position, is
+    /// classified `KnockShaped` → HIGH, and the agent prints
+    /// `path: /<live knock>/…` over SMTP and into the durable probe log.
+    ///
+    /// That contradicts `ProbeSample`'s own doc — "there is no field that can
+    /// hold a request body, a cookie, a query string or a token" — and
+    /// defeats the same reasoning that made `named_the_host` a boolean rather
+    /// than the hostname.
+    ///
+    /// The classification must survive: knowing a knock-shaped probe arrived
+    /// is the signal. Only the secret goes.
+    #[test]
+    fn a_live_knock_never_reaches_the_probe_sample() {
+        // Exactly KNOCK_TOKEN_CHARS, so it classifies the way a real one does.
+        let live = "Zx8Kq2mR7vT1bN4wL0pS6yH3dG9jF5cAe1Ui7Ok3Qr9";
+        assert_eq!(live.len(), aberp_portal_core::canary::KNOCK_TOKEN_CHARS);
+        let sample = to_sample(
+            &observation(&format!("/{live}/shell")),
+            None,
+            "/tripwire",
+            false,
+        );
+
+        assert_eq!(
+            sample.reason,
+            Reason::KnockShaped,
+            "the classification is the signal and must survive redaction"
+        );
+        assert!(
+            !sample.path.contains(live),
+            "the live knock token reached the alert body and the durable probe \
+             log in plaintext: {}",
+            sample.path
         );
     }
 }
