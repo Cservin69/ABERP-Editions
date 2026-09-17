@@ -1229,3 +1229,55 @@ fn issued_payload_field_names_match_the_eventkind_docs() {
         "and it must be the digest of the units the report enumerated"
     );
 }
+
+/// ADR-0199 residual 16 — the refusal message is the whole operator prompt.
+///
+/// A characteristic's type is immutable once measured and there is no
+/// override, so this 400 body is the only explanation anyone gets. The
+/// residual asks for "an operator-facing prompt saying so"; until the plan
+/// form grows one, the message IS the prompt — and nothing pinned its wording,
+/// so it could be shortened to "cannot change characteristic_type" without a
+/// single test noticing.
+///
+/// Pinned on the same argument `qc_report_block_detail` makes for the shipment
+/// gate: a message that understates the cause sends someone looking in the
+/// wrong place.
+#[test]
+fn the_reclassification_refusal_states_both_the_remedy_and_the_reason() {
+    let mut conn = setup_db();
+    seed_plan(&conn, "Bore D", "1", true);
+    let plans = list_inspection_plans(&conn, TEST_TENANT, Some("prd_bracket"), false).unwrap();
+    let plan = plans[0].clone();
+    measure(&mut conn, &plan.plan_id, "dp-A", 25.0);
+
+    let mut edit = NewInspectionPlan {
+        product_id: plan.product_id.clone(),
+        feature_name: plan.feature_name.clone(),
+        nominal_value: plan.nominal_value,
+        upper_tol: plan.upper_tol,
+        lower_tol: plan.lower_tol,
+        units: plan.units.clone(),
+        optional_probe_cycle_id: None,
+        enabled: true,
+        characteristic_number: plan.characteristic_number.clone(),
+        characteristic_designator: None,
+        characteristic_type: Some(CharacteristicType::Process),
+        inspection_method: None,
+        sheet_zone: None,
+        is_required: Some(true),
+    };
+    edit.characteristic_type = Some(CharacteristicType::Process);
+
+    let err = update_inspection_plan(&conn, TEST_TENANT, &plan.plan_id, edit)
+        .expect_err("a measured plan must refuse re-classification");
+    let msg = format!("{err}");
+
+    assert!(
+        msg.contains("archive this characteristic and create a new one"),
+        "the message must carry the REMEDY: {msg}"
+    );
+    assert!(
+        msg.contains("measurable on its own identity"),
+        "…and the REASON, or the refusal reads as arbitrary: {msg}"
+    );
+}
