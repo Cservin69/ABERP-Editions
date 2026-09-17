@@ -2145,6 +2145,60 @@ mod tests {
         }
     }
 
+    /// ADR-0115 adversarial finding 1 — the CSP blocks the portal's own UI.
+    ///
+    /// `render_portal` sends `script-src 'self'; style-src 'self'` with no
+    /// nonce and no hash, while `assets/shell.html` is one inline `<style>`
+    /// and one inline `<script>`. Every CSP-enforcing browser blocks both: the
+    /// shell renders unstyled and does nothing, so the portal as landed cannot
+    /// authenticate anyone.
+    ///
+    /// It fails CLOSED, so it is not a security hole — but it is the whole
+    /// feature not working, and **no test caught it**. The header test above
+    /// asserts the headers are PRESENT; the e2e tests drive the JSON API and
+    /// never load the page. "Present" and "correct" are different claims, and
+    /// only one of them was being made.
+    ///
+    /// This asserts the policy admits the very bytes the server ships.
+    #[test]
+    fn the_csp_admits_the_shells_own_inline_blocks() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        fn inline_body<'a>(html: &'a str, tag: &str) -> &'a str {
+            let open = format!("<{tag}>");
+            let close = format!("</{tag}>");
+            let start = html.find(&open).expect("shell has the tag") + open.len();
+            let end = html[start..].find(&close).expect("tag is closed") + start;
+            &html[start..end]
+        }
+
+        let p = PortalAnswer {
+            status: 200,
+            reason: "OK",
+            content_type: "text/html; charset=utf-8".into(),
+            body: crate::front::SHELL_HTML.as_bytes().to_vec(),
+            set_cookie: None,
+        };
+        let rendered = String::from_utf8(render_portal(&p, "D", true, true)).expect("utf8");
+        let csp = rendered
+            .lines()
+            .find(|l| l.starts_with("Content-Security-Policy:"))
+            .expect("the shell carries a CSP");
+
+        for (tag, directive) in [("style", "style-src"), ("script", "script-src")] {
+            let body = inline_body(crate::front::SHELL_HTML, tag);
+            let digest = Sha256::digest(body.as_bytes());
+            let hash = base64::engine::general_purpose::STANDARD.encode(digest);
+            assert!(
+                csp.contains(&format!("'sha256-{hash}'")) || csp.contains("'nonce-"),
+                "{directive} does not admit the shell's own inline <{tag}>; a \
+                 CSP-enforcing browser drops it and the portal cannot \
+                 authenticate anyone.\nCSP: {csp}"
+            );
+        }
+    }
+
     #[test]
     fn a_header_value_cannot_split_the_response() {
         // A compromised — or merely buggy — Mac must not be able to

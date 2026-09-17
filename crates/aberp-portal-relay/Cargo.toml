@@ -32,6 +32,7 @@ anyhow = { workspace = true }
 # in this repo: ADR-0115 §3.2 uses the wildcard precisely so the portal's
 # label never enters a Certificate Transparency log.
 base64 = { workspace = true }
+sha2 = { workspace = true }
 clap = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
