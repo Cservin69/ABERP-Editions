@@ -26,7 +26,13 @@ __pycache__/
 .mypy_cache/
 
 # --- Node / Svelte / Tauri frontend -------------------------
-node_modules/
+# No trailing slash, deliberately. `node_modules/` matches a DIRECTORY only,
+# and a node_modules SYMLINK slips past it: `git add -A` stages the link as a
+# blob. That is not hypothetical — borrowing another checkout's installed deps
+# for svelte-check put an absolute symlink into a commit here, and it took a
+# controlled test to see it, because `git check-ignore` and `git add` disagree
+# about this exact combination and only `add` is the one that bites.
+node_modules
 dist/
 build/
 .svelte-kit/
