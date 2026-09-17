@@ -1696,6 +1696,38 @@ pub async fn get_ncr(state: State<'_, AppState>, ncr_id: String) -> Result<Value
     forward_get(&state, &path, true).await
 }
 
+/// ADR-0090 round 7 / ADR-0199 residual 20 — `POST /api/ncrs/:id/shipment-waiver`.
+/// Body: `{ work_order_id, reason }`. The audited management sign-off that
+/// releases ONE NCR for ONE work order; scoped, hash-chained, never a wildcard.
+#[tauri::command]
+pub async fn grant_ncr_shipment_waiver(
+    state: State<'_, AppState>,
+    ncr_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_quality_id(&ncr_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/ncrs/{ncr_id}/shipment-waiver");
+    forward_post(&state, &path, body).await
+}
+
+/// ADR-0128 — `POST /api/ncr-shipment-waivers/:id/revoke`. Body: `{ reason }`.
+/// TERMINAL: the waiver it names never disarms the shipment belt again, and
+/// re-permitting takes a NEW waiver.
+///
+/// The id here is a `wvr_<ULID>`, not an `ncr_`/`capa_` id, so
+/// `validate_quality_id` does not apply — the server resolves and refuses an
+/// unknown waiver, and a client-side shape check here would only duplicate a
+/// rule that has to live there anyway.
+#[tauri::command]
+pub async fn revoke_ncr_shipment_waiver(
+    state: State<'_, AppState>,
+    waiver_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/ncr-shipment-waivers/{waiver_id}/revoke");
+    forward_post(&state, &path, body).await
+}
+
 /// S439 — `POST /api/ncrs/:id/transition`. Body: `{ to_state, note? }`.
 #[tauri::command]
 pub async fn transition_ncr(

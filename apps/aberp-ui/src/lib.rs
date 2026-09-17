@@ -404,6 +404,8 @@ pub fn run() {
             commands::create_ncr,
             commands::get_ncr,
             commands::transition_ncr,
+            commands::grant_ncr_shipment_waiver,
+            commands::revoke_ncr_shipment_waiver,
             commands::create_capa,
             commands::approve_capa,
             commands::review_capa,

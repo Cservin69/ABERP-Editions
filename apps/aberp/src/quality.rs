@@ -271,6 +271,10 @@ pub fn generate_waiver_id() -> String {
     format!("wvr_{}", Ulid::new())
 }
 
+pub fn generate_waiver_revocation_id() -> String {
+    format!("wvrv_{}", Ulid::new())
+}
+
 /// Trim + validate an operator-typed NCR description. Loud-rejects blank
 /// (CLAUDE.md rule 12) — an NCR with no description is not an NCR.
 pub fn validate_description(s: &str) -> std::result::Result<(), &'static str> {
@@ -326,6 +330,14 @@ CREATE TABLE IF NOT EXISTS ncr_shipment_waivers (
     reason                VARCHAR NOT NULL,
     approved_at_utc       VARCHAR NOT NULL,
     ncr_state_at_waiver   VARCHAR NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ncr_shipment_waiver_revocations (
+    revocation_id         VARCHAR NOT NULL,
+    tenant_id             VARCHAR NOT NULL,
+    waiver_id             VARCHAR NOT NULL,
+    revoked_by_operator   VARCHAR NOT NULL,
+    reason                VARCHAR NOT NULL,
+    revoked_at_utc        VARCHAR NOT NULL
 );
 CREATE TABLE IF NOT EXISTS capas (
     capa_id                    VARCHAR NOT NULL,
@@ -406,6 +418,21 @@ pub struct NcrShipmentWaiver {
     /// The NCR's state at the moment of signing, kept verbatim so an auditor
     /// can see what was released without replaying the transition log.
     pub ncr_state_at_waiver: String,
+}
+
+/// The withdrawal of one shipment waiver (ADR-0128).
+///
+/// A separate append, never a mutation: `ncr_shipment_waivers` stays
+/// append-only, so who signed the release, when and why survives a
+/// revocation verbatim. A revoked waiver is not an erased one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NcrShipmentWaiverRevocation {
+    pub revocation_id: String,
+    /// The waiver this withdraws. TERMINAL — see `waived_for`.
+    pub waiver_id: String,
+    pub revoked_by_operator: String,
+    pub reason: String,
+    pub revoked_at_utc: String,
 }
 
 /// One CAPA record linked to a parent NCR.
@@ -795,6 +822,224 @@ pub fn create_ncr(
         payload,
     )?;
     Ok(ncr)
+}
+
+/// [`create_ncr`], but INSIDE the caller's transaction (ADR-0127 §D2).
+///
+/// # Why this exists
+/// `record_manual_inspection` used to commit the failing measurement, then
+/// call [`create_ncr`] on a second connection, then link the NCR in a third
+/// transaction. A crash or any error between the first commit and the second
+/// leaves a committed FAILING measurement with **no NCR** — the open-NCR belt
+/// reads NCRs, so it saw nothing, and the shipment released on a QC report
+/// that still said `accept`. That is the ADR-0099 lesson the AVL firing sites
+/// already taught: commit, then do the consequence in a second transaction.
+///
+/// Here the measurement, its NCR and the link all ride ONE transaction, so
+/// either the failure and its blocker both land or neither does.
+///
+/// # Photos are refused, not silently dropped
+/// [`create_ncr`] writes photo files to disk before inserting. A filesystem
+/// write cannot be rolled back with the transaction, so this variant refuses a
+/// non-empty `photos` rather than pretend it is atomic. Auto-NCRs carry none.
+///
+/// This does NOT open a connection — it borrows the caller's — so it adds no
+/// write-fork surface for CHECK 10M/10N, and it leaves [`create_ncr`]'s
+/// residual opener exactly where the frozen ledger has it.
+pub(crate) fn create_ncr_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    tenant: &TenantId,
+    binary_hash: BinaryHash,
+    operator: &str,
+    input: NewNcr,
+) -> std::result::Result<Ncr, QualityError> {
+    validate_description(&input.description).map_err(|e| QualityError::Invalid(e.to_string()))?;
+    if !input.photos.is_empty() {
+        return Err(QualityError::Invalid(
+            "create_ncr_in_tx cannot carry photos: a file written to disk does \
+             not roll back with the transaction (ADR-0127 §D2)"
+                .into(),
+        ));
+    }
+    let ncr_id = generate_ncr_id();
+    let now = now_rfc3339();
+    let ncr = Ncr {
+        ncr_id: ncr_id.clone(),
+        discovered_at_utc: now.clone(),
+        discovered_by_operator: operator.to_string(),
+        severity: input.severity,
+        category: input.category,
+        description: input.description.trim().to_string(),
+        affected_part_uids: input.affected_part_uids,
+        affected_wo_ids: input.affected_wo_ids,
+        affected_heat_lots: input.affected_heat_lots,
+        photos: Vec::new(),
+        state: NcrState::Open,
+        closed_at_utc: None,
+        closed_by_operator: None,
+    };
+    ensure_schema(tx)?;
+    tx.execute(
+        "INSERT INTO ncrs (ncr_id, tenant_id, discovered_at_utc, discovered_by_operator, \
+         severity, category, description, affected_part_uids, affected_wo_ids, \
+         affected_heat_lots, photos, state, closed_at_utc, closed_by_operator) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,NULL)",
+        params![
+            ncr.ncr_id,
+            tenant.as_str(),
+            ncr.discovered_at_utc,
+            ncr.discovered_by_operator,
+            ncr.severity.as_db_str(),
+            ncr.category.as_db_str(),
+            ncr.description,
+            encode_array(&ncr.affected_part_uids),
+            encode_array(&ncr.affected_wo_ids),
+            encode_array(&ncr.affected_heat_lots),
+            encode_array(&ncr.photos),
+            ncr.state.as_db_str(),
+        ],
+    )
+    .context("insert ncr row (in tx)")?;
+    tx.execute(
+        "INSERT INTO ncr_transitions (tenant_id, ncr_id, seq, from_state, to_state, operator, at_utc, note) \
+         VALUES (?1,?2,0,'','open',?3,?4,'opened')",
+        params![tenant.as_str(), ncr.ncr_id, operator, ncr.discovered_at_utc],
+    )
+    .context("insert ncr opening transition (in tx)")?;
+
+    let payload = serde_json::json!({
+        "ncr_id": ncr.ncr_id,
+        "severity": ncr.severity.as_db_str(),
+        "category": ncr.category.as_db_str(),
+        "discovered_by_operator": ncr.discovered_by_operator,
+        "discovered_at_utc": ncr.discovered_at_utc,
+        "affected_part_uids": ncr.affected_part_uids,
+        "affected_wo_ids": ncr.affected_wo_ids,
+        "operator_user_id": operator,
+    });
+    let meta = LedgerMeta::new(tenant.clone(), binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        tx,
+        &meta,
+        EventKind::NcrCreated,
+        serde_json::to_vec(&payload).expect("serialize ncr payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        None,
+    )
+    .map_err(|e| QualityError::Other(anyhow::anyhow!("append ncr.created (in tx): {e}")))?;
+    Ok(ncr)
+}
+
+/// Withdraw a shipment waiver (ADR-0128).
+///
+/// The waiver row is NOT touched — `ncr_shipment_waivers` stays append-only,
+/// so who signed the release, when and why survives verbatim. A second fact
+/// is appended beside it, and `waived_for` stops counting the waiver.
+///
+/// # TERMINAL (§D2)
+/// A revoked waiver never disarms the belt again. Re-permitting the shipment
+/// takes a NEW waiver, with its own sign-off and its own entry. A second
+/// revocation of the same waiver is refused rather than appended twice, so the
+/// table cannot fill with rows that mean nothing.
+///
+/// # ONE transaction on the shared Handle (§D3, revised)
+/// The first draft mirrored [`grant_ncr_shipment_waiver`]'s own
+/// `Connection::open(db_path)` and then argued about ordering: append first
+/// (the grant's choice, because an unaudited RELEASE is the worst residue) or
+/// insert first (a tightening's worst residue being a chain that claims a
+/// withdrawal while the gate still releases).
+///
+/// **CHECK 10i/10k refused it** — `quality.rs` grew its residual openers from
+/// 11 to 12 and the fingerprint set diverged — and the gate was right twice
+/// over. The ordering question only exists because those two writes are on
+/// different connections. On the shared Handle they are one transaction, so
+/// the revocation row and its ledger entry land together or not at all, and
+/// there is no residue to reason about. ADR-0099's rule, and it makes this
+/// writer strictly stronger than the grant it was copied from.
+pub fn revoke_ncr_shipment_waiver(
+    db: &HandleArc,
+    tenant: TenantId,
+    binary_hash: BinaryHash,
+    operator: &str,
+    waiver_id: &str,
+    reason: &str,
+) -> std::result::Result<NcrShipmentWaiverRevocation, QualityError> {
+    validate_waiver_reason(reason).map_err(|e| QualityError::Invalid(e.to_string()))?;
+    if operator.trim().is_empty() {
+        return Err(QualityError::Invalid(
+            "a revocation must name the operator withdrawing the waiver".to_string(),
+        ));
+    }
+
+    let mut guard = db
+        .write()
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("shared writer for revocation: {e}")))?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("ensure audit schema: {e}")))?;
+    ensure_schema(&guard)?;
+
+    let waiver = list_ncr_shipment_waivers(&guard, tenant.as_str())?
+        .into_iter()
+        .find(|w| w.waiver_id == waiver_id)
+        .ok_or_else(|| QualityError::Invalid(format!("no such waiver: {waiver_id}")))?;
+    if list_ncr_shipment_waiver_revocations(&guard, tenant.as_str())?
+        .iter()
+        .any(|r| r.waiver_id == waiver_id)
+    {
+        return Err(QualityError::IllegalTransition(format!(
+            "waiver {waiver_id} is already revoked — revocation is terminal, and \
+             re-permitting this shipment takes a NEW waiver"
+        )));
+    }
+
+    let revocation = NcrShipmentWaiverRevocation {
+        revocation_id: generate_waiver_revocation_id(),
+        waiver_id: waiver.waiver_id.clone(),
+        revoked_by_operator: operator.to_string(),
+        reason: reason.trim().to_string(),
+        revoked_at_utc: now_rfc3339(),
+    };
+
+    let tx = guard
+        .transaction()
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("begin revocation tx: {e}")))?;
+    tx.execute(
+        "INSERT INTO ncr_shipment_waiver_revocations \
+         (revocation_id, tenant_id, waiver_id, revoked_by_operator, reason, revoked_at_utc) \
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            revocation.revocation_id,
+            tenant.as_str(),
+            revocation.waiver_id,
+            revocation.revoked_by_operator,
+            revocation.reason,
+            revocation.revoked_at_utc,
+        ],
+    )
+    .context("insert ncr_shipment_waiver_revocation row")?;
+    let meta = LedgerMeta::new(tenant.clone(), binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        EventKind::NcrShipmentWaiverRevoked,
+        serde_json::to_vec(&serde_json::json!({
+            "revocation_id": revocation.revocation_id,
+            "waiver_id": revocation.waiver_id,
+            "ncr_id": waiver.ncr_id,
+            "work_order_id": waiver.work_order_id,
+            "reason": revocation.reason,
+            "revoked_by_operator": revocation.revoked_by_operator,
+            "revoked_at_utc": revocation.revoked_at_utc,
+            "operator_user_id": operator,
+        }))
+        .expect("serialize revocation payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        None,
+    )
+    .map_err(|e| QualityError::Other(anyhow::anyhow!("append waiver revocation: {e}")))?;
+    tx.commit()
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("commit revocation tx: {e}")))?;
+    Ok(revocation)
 }
 
 /// Apply an NCR state transition (operator-driven). Validates the edge against
@@ -1529,10 +1774,55 @@ pub fn grant_ncr_shipment_waiver(
 }
 
 /// Whether a signed waiver releases this NCR for this WO's shipment. Pure.
-fn waived_for(waivers: &[NcrShipmentWaiver], ncr_id: &str, wo_id: &str) -> bool {
-    waivers
-        .iter()
-        .any(|w| w.ncr_id == ncr_id && w.work_order_id == wo_id)
+pub fn list_ncr_shipment_waiver_revocations(
+    conn: &Connection,
+    tenant: &str,
+) -> Result<Vec<NcrShipmentWaiverRevocation>> {
+    ensure_schema(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT revocation_id, waiver_id, revoked_by_operator, reason, revoked_at_utc \
+             FROM ncr_shipment_waiver_revocations WHERE tenant_id = ?1",
+        )
+        .context("prepare ncr_shipment_waiver_revocations select")?;
+    let rows = stmt
+        .query_map(params![tenant], |r| {
+            Ok(NcrShipmentWaiverRevocation {
+                revocation_id: r.get::<_, String>(0)?,
+                waiver_id: r.get::<_, String>(1)?,
+                revoked_by_operator: r.get::<_, String>(2)?,
+                reason: r.get::<_, String>(3)?,
+                revoked_at_utc: r.get::<_, String>(4)?,
+            })
+        })
+        .context("query ncr_shipment_waiver_revocations")?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.context("read ncr_shipment_waiver_revocation row")?);
+    }
+    Ok(out)
+}
+
+/// Is this `(ncr, work order)` released by a waiver that is still standing?
+///
+/// ADR-0128 §D2 — a revoked waiver NEVER disarms the belt again, whatever the
+/// timestamps say. Not "latest wins": ordering a grant and a revocation by
+/// time would let a clock skew, a replayed row or a back-dated grant silently
+/// re-arm a release nobody signed for today. Terminal revocation fails toward
+/// REFUSING to ship, which is visible and correctable; latest-wins fails
+/// toward shipping, which is neither. Re-permitting takes a NEW waiver, with
+/// its own sign-off and its own ledger entry.
+fn waived_for(
+    waivers: &[NcrShipmentWaiver],
+    revocations: &[NcrShipmentWaiverRevocation],
+    ncr_id: &str,
+    wo_id: &str,
+) -> bool {
+    waivers.iter().any(|w| {
+        w.ncr_id == ncr_id
+            && w.work_order_id == wo_id
+            && !revocations.iter().any(|r| r.waiver_id == w.waiver_id)
+    })
 }
 
 // ── Refuse-Shipment gate helper (extends S438) ──────────────────────
@@ -1601,6 +1891,7 @@ pub fn open_ncr_ids_blocking_part_uids(ncrs: &[Ncr], wo_part_uids: &[String]) ->
 pub fn open_ncr_ids_blocking_wo(
     ncrs: &[Ncr],
     waivers: &[NcrShipmentWaiver],
+    revocations: &[NcrShipmentWaiverRevocation],
     wo_id: &str,
     wo_part_uids: &[String],
 ) -> Vec<String> {
@@ -1615,7 +1906,7 @@ pub fn open_ncr_ids_blocking_wo(
         // Round 7, B-1 — the ONLY release for a still-open NCR. Both terms of
         // the match are load-bearing: a waiver naming another NCR releases
         // nothing here, and a waiver naming another WO releases nothing here.
-        .filter(|n| !waived_for(waivers, &n.ncr_id, wo_id))
+        .filter(|n| !waived_for(waivers, revocations, &n.ncr_id, wo_id))
         .map(|n| n.ncr_id.clone())
         .collect()
 }
@@ -1873,7 +2164,7 @@ mod tests {
         );
         // The gate's helper sees both, and only both.
         assert_eq!(
-            open_ncr_ids_blocking_wo(&ncrs, &[], "wo-1", &wo_uids),
+            open_ncr_ids_blocking_wo(&ncrs, &[], &[], "wo-1", &wo_uids),
             vec!["ncr_lot".to_string(), "ncr_unit".to_string()]
         );
     }
@@ -1899,10 +2190,10 @@ mod tests {
             closed_by_operator: None,
         };
         assert_eq!(
-            open_ncr_ids_blocking_wo(std::slice::from_ref(&ncr), &[], "wo-1", &[]),
+            open_ncr_ids_blocking_wo(std::slice::from_ref(&ncr), &[], &[], "wo-1", &[]),
             vec!["ncr_lot".to_string()]
         );
-        assert!(open_ncr_ids_blocking_wo(&[ncr], &[], "wo-other", &[]).is_empty());
+        assert!(open_ncr_ids_blocking_wo(&[ncr], &[], &[], "wo-other", &[]).is_empty());
     }
 
     fn wo_ncr(id: &str, state: NcrState) -> Ncr {
@@ -1935,6 +2226,81 @@ mod tests {
         }
     }
 
+    fn revocation_of(waiver_id: &str, at: &str) -> NcrShipmentWaiverRevocation {
+        NcrShipmentWaiverRevocation {
+            revocation_id: format!("wvrv_{waiver_id}"),
+            waiver_id: waiver_id.into(),
+            revoked_by_operator: "manager".into(),
+            reason: "the waiver was signed against the wrong work order".into(),
+            revoked_at_utc: at.into(),
+        }
+    }
+
+    /// ADR-0128 §D2 — a revoked waiver stops disarming the belt.
+    ///
+    /// The hazard this closes: a REAL, unresolved defect whose waiver was
+    /// signed by mistake. Closing the NCR is no remedy there — the NCR has to
+    /// stay open — so before this there was nothing that could make it block
+    /// again.
+    #[test]
+    fn a_revoked_waiver_stops_releasing_the_shipment() {
+        let ncrs = vec![wo_ncr("ncr_a", NcrState::Open)];
+        let signed = vec![waiver("ncr_a", "wo-1")];
+        assert!(
+            open_ncr_ids_blocking_wo(&ncrs, &signed, &[], "wo-1", &[]).is_empty(),
+            "precondition: the waiver releases the shipment"
+        );
+
+        let withdrawn = vec![revocation_of("wvr_ncr_a_wo-1", "2026-06-18T00:00:00Z")];
+        assert_eq!(
+            open_ncr_ids_blocking_wo(&ncrs, &signed, &withdrawn, "wo-1", &[]),
+            vec!["ncr_a".to_string()],
+            "a revoked waiver must not go on releasing parts"
+        );
+    }
+
+    /// ADR-0128 §D2 — TERMINAL, not latest-wins.
+    ///
+    /// The revocation here is time-stamped BEFORE the waiver it withdraws.
+    /// Under a "latest wins" rule the waiver would win and the shipment would
+    /// release; under the terminal rule it does not. This is the whole reason
+    /// the rule is not ordered by time: a clock skew, a replayed row or a
+    /// back-dated grant must not be able to silently re-arm a release nobody
+    /// signed for today. Terminal fails toward REFUSING to ship.
+    #[test]
+    fn revocation_is_terminal_and_not_decided_by_timestamps() {
+        let ncrs = vec![wo_ncr("ncr_a", NcrState::Open)];
+        let signed = vec![waiver("ncr_a", "wo-1")]; // approved 2026-06-17
+        let earlier = vec![revocation_of("wvr_ncr_a_wo-1", "2020-01-01T00:00:00Z")];
+        assert_eq!(
+            open_ncr_ids_blocking_wo(&ncrs, &signed, &earlier, "wo-1", &[]),
+            vec!["ncr_a".to_string()],
+            "an earlier-stamped revocation still wins — this rule is not a \
+             comparison of timestamps"
+        );
+    }
+
+    /// A revocation names ONE waiver, exactly as a waiver names one NCR and
+    /// one work order. Withdrawing one release must not withdraw another.
+    #[test]
+    fn a_revocation_releases_nothing_it_does_not_name() {
+        let ncrs = vec![
+            wo_ncr("ncr_a", NcrState::Open),
+            wo_ncr("ncr_b", NcrState::Open),
+        ];
+        let signed = vec![waiver("ncr_a", "wo-1"), waiver("ncr_b", "wo-1")];
+        assert!(
+            open_ncr_ids_blocking_wo(&ncrs, &signed, &[], "wo-1", &[]).is_empty(),
+            "precondition: both waivers release"
+        );
+        let withdrawn = vec![revocation_of("wvr_ncr_a_wo-1", "2026-06-18T00:00:00Z")];
+        assert_eq!(
+            open_ncr_ids_blocking_wo(&ncrs, &signed, &withdrawn, "wo-1", &[]),
+            vec!["ncr_a".to_string()],
+            "revoking ncr_a's waiver must leave ncr_b's standing"
+        );
+    }
+
     /// **Round 7, B-1 (a) — the escalation TIMER must not release a shipment.**
     ///
     /// `escalate_overdue_ncrs` moves a `Critical` NCR to `Escalated` 24h after
@@ -1958,13 +2324,15 @@ mod tests {
                 "{state:?} must block — only Closed or a signed waiver releases"
             );
             assert_eq!(
-                open_ncr_ids_blocking_wo(&[wo_ncr("ncr_x", state)], &[], "wo-1", &[]),
+                open_ncr_ids_blocking_wo(&[wo_ncr("ncr_x", state)], &[], &[], "wo-1", &[]),
                 vec!["ncr_x".to_string()],
                 "{state:?} must still be listed by the gate"
             );
         }
         assert!(!Closed.blocks_shipment());
-        assert!(open_ncr_ids_blocking_wo(&[wo_ncr("ncr_x", Closed)], &[], "wo-1", &[]).is_empty());
+        assert!(
+            open_ncr_ids_blocking_wo(&[wo_ncr("ncr_x", Closed)], &[], &[], "wo-1", &[]).is_empty()
+        );
     }
 
     /// **Round 7, B-1 (c) — a waiver is scoped to ONE NCR and ONE WO.**
@@ -1982,12 +2350,12 @@ mod tests {
 
         // Unwaived: both block.
         assert_eq!(
-            open_ncr_ids_blocking_wo(&ncrs, &[], "wo-1", &[]),
+            open_ncr_ids_blocking_wo(&ncrs, &[], &[], "wo-1", &[]),
             vec!["ncr_a".to_string(), "ncr_b".to_string()]
         );
         // The waiver releases ncr_a — and ONLY ncr_a.
         assert_eq!(
-            open_ncr_ids_blocking_wo(&ncrs, &signed, "wo-1", &[]),
+            open_ncr_ids_blocking_wo(&ncrs, &signed, &[], "wo-1", &[]),
             vec!["ncr_b".to_string()],
             "a waiver for ncr_a must not release ncr_b"
         );
@@ -2002,7 +2370,7 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            open_ncr_ids_blocking_wo(&other_wo, &signed, "wo-2", &[]),
+            open_ncr_ids_blocking_wo(&other_wo, &signed, &[], "wo-2", &[]),
             vec!["ncr_a".to_string(), "ncr_b".to_string()],
             "a waiver for wo-1 must not release wo-2's shipment"
         );
@@ -2297,7 +2665,8 @@ mod tests {
         let ncrs = list_ncrs(&conn, tenant.as_str(), &NcrFilter::default()).unwrap();
         let waivers = list_ncr_shipment_waivers(&conn, tenant.as_str()).unwrap();
         assert!(waivers.is_empty(), "the timer minted no sign-off");
-        let mut blocking = open_ncr_ids_blocking_wo(&ncrs, &waivers, "wo-1", &["dp-A".to_string()]);
+        let mut blocking =
+            open_ncr_ids_blocking_wo(&ncrs, &waivers, &[], "wo-1", &["dp-A".to_string()]);
         blocking.sort();
         let mut expected = vec![crit.ncr_id.clone(), major.ncr_id.clone()];
         expected.sort();
@@ -2338,7 +2707,7 @@ mod tests {
             let ncrs = list_ncrs(&conn, tenant.as_str(), &NcrFilter::default()).unwrap();
             let w = list_ncr_shipment_waivers(&conn, tenant.as_str()).unwrap();
             assert_eq!(
-                open_ncr_ids_blocking_wo(&ncrs, &w, "wo-1", &["dp-A".to_string()]),
+                open_ncr_ids_blocking_wo(&ncrs, &w, &[], "wo-1", &["dp-A".to_string()]),
                 vec![ncr.ncr_id.clone()]
             );
         }
@@ -2370,14 +2739,14 @@ mod tests {
             let w = list_ncr_shipment_waivers(&conn, tenant.as_str()).unwrap();
             assert_eq!(w.len(), 1);
             assert!(
-                open_ncr_ids_blocking_wo(&ncrs, &w, "wo-1", &["dp-A".to_string()]).is_empty(),
+                open_ncr_ids_blocking_wo(&ncrs, &w, &[], "wo-1", &["dp-A".to_string()]).is_empty(),
                 "the signed waiver must release this WO's shipment"
             );
             // …and only this WO's.
             let mut elsewhere = ncrs.clone();
             elsewhere[0].affected_wo_ids = vec!["wo-9".into()];
             assert_eq!(
-                open_ncr_ids_blocking_wo(&elsewhere, &w, "wo-9", &[]),
+                open_ncr_ids_blocking_wo(&elsewhere, &w, &[], "wo-9", &[]),
                 vec![ncr.ncr_id.clone()],
                 "the waiver named wo-1; wo-9 stays blocked"
             );
@@ -2512,7 +2881,7 @@ mod tests {
         );
         let ncrs = list_ncrs(&conn, tenant.as_str(), &NcrFilter::default()).unwrap();
         assert_eq!(
-            open_ncr_ids_blocking_wo(&ncrs, &waivers, "wo-1", &["dp-A".to_string()]),
+            open_ncr_ids_blocking_wo(&ncrs, &waivers, &[], "wo-1", &["dp-A".to_string()]),
             vec![ncr.ncr_id],
             "the shipment stays blocked — an unaudited release is the one \
              outcome this ordering exists to make impossible"

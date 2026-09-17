@@ -301,13 +301,39 @@ fn dispatch_partner_for_wo(
 
 /// Whether any Open/Contained NCR references one of the report's parts.
 /// Drives the `accept_with_ncr` disposition arm (ADR-0199 §D4).
-fn open_ncr_against(conn: &Connection, tenant: &str, units: &[ReportUnit]) -> Result<bool> {
-    if units.is_empty() {
-        return Ok(false);
-    }
+/// Is there an open nonconformity against what this report certifies?
+///
+/// Decides the LABEL — `accept` versus `accept_with_ncr` — not whether the
+/// shipment leaves. The belt and ADR-0127's evidence check own that.
+///
+/// # ADR-0199 residual 15 — the WORK ORDER counts, not only the units
+/// This used to join on `affected_part_uids` alone, so a nonconformity raised
+/// against the WORK ORDER and naming no unit — the shape a LOT-level defect
+/// takes — left the certificate saying plain `accept`. The residual called
+/// that acceptable because the label does not gate the shipment, which is
+/// true. It is still a compliance document stating a quality record that was
+/// not the quality record, printed into hash-pinned bytes where it cannot be
+/// corrected afterwards.
+///
+/// The `units.is_empty()` early return went with it: a lot-only report is
+/// exactly the report a lot-level NCR belongs on.
+///
+/// # STATED DECISION: waivers are deliberately NOT consulted here
+/// `open_ncr_ids_blocking_wo` is called with empty waivers and revocations, so
+/// a waived NCR still labels the report `accept_with_ncr`. A waiver is a
+/// decision to SHIP anyway; it is not a finding that the nonconformity never
+/// existed. The document states what was found; the waiver states what was
+/// then decided, and it has its own hash-chained entry. Folding the two would
+/// let a signature erase a defect from a certificate.
+fn open_ncr_against(
+    conn: &Connection,
+    tenant: &str,
+    wo_id: &str,
+    units: &[ReportUnit],
+) -> Result<bool> {
     let uids: Vec<String> = units.iter().map(|u| u.part_uid.clone()).collect();
     let ncrs = crate::quality::list_ncrs(conn, tenant, &crate::quality::NcrFilter::default())?;
-    Ok(!crate::quality::open_ncr_ids_blocking_part_uids(&ncrs, &uids).is_empty())
+    Ok(!crate::quality::open_ncr_ids_blocking_wo(&ncrs, &[], &[], wo_id, &uids).is_empty())
 }
 
 /// Draft a report: resolve traceability, compute accountability, freeze
@@ -355,8 +381,8 @@ pub fn draft_report(
             .filter(|p| p.enabled)
             .collect();
     let inspections = aberp_qa::list_inspections_for_wo(&guard, tenant.as_str(), &req.wo_id)?;
-    let open_ncr =
-        open_ncr_against(&guard, tenant.as_str(), &units).map_err(QcReportError::Other)?;
+    let open_ncr = open_ncr_against(&guard, tenant.as_str(), &req.wo_id, &units)
+        .map_err(QcReportError::Other)?;
     // The ONLY read of `partners` on the whole report path. Resolved here,
     // at freeze, and snapshotted onto the header — see
     // `aberp_qa::QcReport::customer_name`.

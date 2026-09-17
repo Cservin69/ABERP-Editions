@@ -1090,6 +1090,7 @@ pub(crate) fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::NcrClosed
         | EventKind::WoBlockedByOpenNcr
         | EventKind::NcrShipmentWaiverGranted
+        | EventKind::NcrShipmentWaiverRevoked
         | EventKind::CapaCreated
         | EventKind::CapaApproved
         | EventKind::CapaEffectivenessReviewed
@@ -1177,7 +1178,7 @@ pub(crate) fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 197,
+        EventKind::ALL_KINDS_COUNT == 198,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1991,6 +1992,7 @@ mod tests {
             EventKind::NcrClosed,
             EventKind::WoBlockedByOpenNcr,
             EventKind::NcrShipmentWaiverGranted,
+            EventKind::NcrShipmentWaiverRevoked,
             EventKind::CapaCreated,
             EventKind::CapaApproved,
             EventKind::CapaEffectivenessReviewed,

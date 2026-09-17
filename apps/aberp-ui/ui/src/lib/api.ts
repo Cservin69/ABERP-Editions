@@ -3331,6 +3331,57 @@ export async function transitionNcr(
   return invoke<Ncr>("transition_ncr", { ncrId, body });
 }
 
+/** One audited management sign-off releasing ONE NCR for ONE work order. */
+export interface NcrShipmentWaiver {
+  waiver_id: string;
+  ncr_id: string;
+  work_order_id: string;
+  approved_by_operator: string;
+  reason: string;
+  approved_at_utc: string;
+  ncr_state_at_waiver: string;
+}
+
+/** ADR-0128 — the withdrawal of one waiver. Terminal. */
+export interface NcrShipmentWaiverRevocation {
+  revocation_id: string;
+  waiver_id: string;
+  revoked_by_operator: string;
+  reason: string;
+  revoked_at_utc: string;
+}
+
+/**
+ * ADR-0090 round 7 — `POST /api/ncrs/:id/shipment-waiver`.
+ *
+ * The ONLY release path for a shipment blocked by a still-open NCR. Scoped to
+ * one `(ncr_id, work_order_id)` pair: a waiver for one NCR releases no other,
+ * and one for one work order releases no other.
+ */
+export async function grantNcrShipmentWaiver(
+  ncrId: string,
+  body: { work_order_id: string; reason: string },
+): Promise<NcrShipmentWaiver> {
+  return invoke<NcrShipmentWaiver>("grant_ncr_shipment_waiver", { ncrId, body });
+}
+
+/**
+ * ADR-0128 — `POST /api/ncr-shipment-waivers/:id/revoke`.
+ *
+ * TERMINAL: the waiver never disarms the shipment belt again, and a second
+ * revocation of the same waiver is refused. Re-permitting the shipment takes a
+ * NEW waiver, with its own sign-off.
+ */
+export async function revokeNcrShipmentWaiver(
+  waiverId: string,
+  body: { reason: string },
+): Promise<NcrShipmentWaiverRevocation> {
+  return invoke<NcrShipmentWaiverRevocation>("revoke_ncr_shipment_waiver", {
+    waiverId,
+    body,
+  });
+}
+
 /** S439 — `POST /api/ncrs/:id/capas` (create a CAPA for an NCR). */
 export async function createCapa(
   ncrId: string,

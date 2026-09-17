@@ -21,7 +21,8 @@ use aberp::part_marking::{
 use aberp::partners::{create_partner, CustomerType, PartnerInputs, PartnerKind};
 use aberp::qc_inspection::{record_manual_inspection, ManualInspectionRequest};
 use aberp::serve::{
-    resolve_open_ncr_gate, resolve_qc_report_gate_with_capability, OpenNcrGate, QcReportGate,
+    resolve_open_ncr_gate, resolve_qc_report_gate_with_capability, OpenNcrGate,
+    QcReportBlockReason, QcReportGate,
 };
 
 use aberp_audit_ledger::{
@@ -193,7 +194,6 @@ fn major_inspection_auto_ncr_blocks_defense_shipment() {
     // Operator records 10.025 mm against nominal 10.0 ±0.010 → overage
     // 0.015, ratio 1.5× half-width → MAJOR (verdict computed in code).
     let result = record_manual_inspection(
-        &fx.db_path,
         &fx.handle,
         fx.tenant.clone(),
         fx.hash,
@@ -255,7 +255,6 @@ fn pass_inspection_does_not_block_shipment() {
 
     let plan_id = seed_plan(&fx);
     let result = record_manual_inspection(
-        &fx.db_path,
         &fx.handle,
         fx.tenant.clone(),
         fx.hash,
@@ -302,7 +301,6 @@ fn calibration_stale_measurement_spawns_no_ncr() {
     // Calibration 2 days old, window 1 day → stale; value 10.5 (way out).
     let stale_cal = "2026-06-15T12:00:00Z".to_string();
     let result = record_manual_inspection(
-        &fx.db_path,
         &fx.handle,
         fx.tenant.clone(),
         fx.hash,
@@ -418,7 +416,7 @@ fn issue_report_for(fx: &Fixture, wo_id: &str, units: &[ReportUnit]) -> (String,
 #[test]
 fn a_failing_lot_level_measurement_after_issuance_still_blocks_the_shipment() {
     let fx = setup();
-    let conn = Connection::open(&fx.db_path).unwrap();
+    let conn = fx.handle.write().unwrap();
     let buyer = create_partner(&conn, T, &partner_inputs("Def Co", CustomerType::Defense)).unwrap();
     seed_wo(&conn, "wo-comp");
     seed_dispatch(&conn, "dsp-comp", "wo-comp", &buyer.id);
@@ -429,7 +427,6 @@ fn a_failing_lot_level_measurement_after_issuance_still_blocks_the_shipment() {
 
     // 1. The unit is measured and passes.
     let ok = record_manual_inspection(
-        &fx.db_path,
         &fx.handle,
         fx.tenant.clone(),
         fx.hash,
@@ -461,7 +458,7 @@ fn a_failing_lot_level_measurement_after_issuance_still_blocks_the_shipment() {
     assert_eq!(disp, Disposition::Accept);
 
     // 3. …and BOTH shipment gates are open at this point.
-    let conn = Connection::open(&fx.db_path).unwrap();
+    let conn = fx.handle.write().unwrap();
     assert_eq!(
         resolve_qc_report_gate_with_capability(&conn, T, &dispatch(&conn, "dsp-comp"), true)
             .unwrap(),
@@ -475,7 +472,6 @@ fn a_failing_lot_level_measurement_after_issuance_still_blocks_the_shipment() {
 
     // 4. AFTER issuance, a batch measurement fails — and names no unit.
     let bad = record_manual_inspection(
-        &fx.db_path,
         &fx.handle,
         fx.tenant.clone(),
         fx.hash,
@@ -507,13 +503,44 @@ fn a_failing_lot_level_measurement_after_issuance_still_blocks_the_shipment() {
     // 5. The report gate is STILL Pass — the frozen document has not
     //    changed and is not supposed to. The refusal has to come from the
     //    NCR belt, and it does.
-    let conn = Connection::open(&fx.db_path).unwrap();
-    assert_eq!(
-        resolve_qc_report_gate_with_capability(&conn, T, &dispatch(&conn, "dsp-comp"), true)
-            .unwrap(),
-        QcReportGate::Pass,
-        "the issued report is immutable; this half of the composition stands"
-    );
+    // Read through the SHARED HANDLE, which is what production does: both
+    // gate call sites in `serve.rs` take `state.db.read()`. This test used to
+    // open its own `Connection` on the db path and only saw the NCR because
+    // `create_ncr` happened to write through a matching second opener — it was
+    // asserting a production gate through a connection production never uses.
+    // ADR-0127 §D2 moves that write into the measurement's own transaction on
+    // the handle, so the fixture now reads where the writes actually land.
+    let conn = fx.handle.read().unwrap();
+    // CHANGED by ADR-0127 §D1. This used to assert `Pass` here, on the
+    // reasoning that "the issued report is immutable; the refusal has to come
+    // from the NCR belt". The document IS still immutable — nothing rewrites
+    // it — but the GATE no longer releases on it, because the measurements
+    // that exist now no longer support the verdict it froze.
+    //
+    // Two independent refusals is the point. The NCR belt depends on the NCR
+    // having been written, and the reproduction in `qc_report_gate.rs` shows
+    // exactly that write being missable. This arm does not depend on it.
+    match resolve_qc_report_gate_with_capability(&conn, T, &dispatch(&conn, "dsp-comp"), true)
+        .unwrap()
+    {
+        QcReportGate::Blocked {
+            reason,
+            disposition,
+            ..
+        } => {
+            assert_eq!(reason, QcReportBlockReason::EvidenceDrift);
+            assert_eq!(
+                disposition.as_deref(),
+                Some("accept"),
+                "the frozen document still says accept — it is the EVIDENCE \
+                 that moved, not the report"
+            );
+        }
+        other => panic!(
+            "a Critical measurement recorded after issuance must stop the \
+             report releasing, independently of the NCR belt: {other:?}"
+        ),
+    }
     match resolve_open_ncr_gate(&conn, T, &dispatch(&conn, "dsp-comp")).unwrap() {
         OpenNcrGate::Blocked {
             work_order_id,
@@ -560,7 +587,6 @@ fn the_escalation_timer_cannot_release_a_shipment_but_a_signed_waiver_can() {
 
     // 10.500 against 10.0 ±0.010 → far beyond 2× half-width → Critical.
     let bad = record_manual_inspection(
-        &fx.db_path,
         &fx.handle,
         fx.tenant.clone(),
         fx.hash,
@@ -697,4 +723,72 @@ fn the_escalation_timer_cannot_release_a_shipment_but_a_signed_waiver_can() {
         )
         .unwrap();
     assert_eq!(escalations, 1, "the timer still raises its alarm");
+}
+
+/// ADR-0199 residual 14 — an inspection must name what it was taken on.
+///
+/// A failing measurement naming neither a work order nor a part reaches
+/// NEITHER shipment gate: its auto-NCR has empty affected lists so the belt
+/// has no key to join on, and ADR-0127 §D1 re-derives from
+/// `list_inspections_for_wo`, which is keyed on `linked_wo_id`.
+///
+/// The residual rejects inventing a join key, and that is right — heat lot or
+/// product would refuse shipments the operator never associated with the
+/// order. This closes the other end instead: the in-band path refuses to
+/// record evidence nobody could act on.
+#[test]
+fn an_inspection_naming_neither_a_wo_nor_a_part_is_refused() {
+    let fx = setup();
+    let plan_id = seed_plan(&fx);
+
+    let err = record_manual_inspection(
+        &fx.handle,
+        fx.tenant.clone(),
+        fx.hash,
+        "ervin",
+        now(),
+        86400,
+        ManualInspectionRequest {
+            plan_id: plan_id.clone(),
+            actual_value: 10.500, // a real failure
+            source: QcSource::Manual,
+            units: None,
+            source_event_id: None,
+            probe_serial: None,
+            last_calibration_at: None,
+            wo_id: None,
+            part_uid: None,
+            heat_lot: Some("HL-9911".into()), // a lot alone is NOT attribution
+        },
+    )
+    .expect_err("an unattributed measurement must be refused, not recorded");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("work order") && msg.contains("part"),
+        "the refusal has to tell the operator what to supply: {msg}"
+    );
+
+    // …and a LOT-level reading, which names the WO and no part, still records:
+    // that is attribution enough for both gates.
+    record_manual_inspection(
+        &fx.handle,
+        fx.tenant.clone(),
+        fx.hash,
+        "ervin",
+        now(),
+        86400,
+        ManualInspectionRequest {
+            plan_id,
+            actual_value: 10.0,
+            source: QcSource::Manual,
+            units: None,
+            source_event_id: None,
+            probe_serial: None,
+            last_calibration_at: None,
+            wo_id: Some("wo-comp".into()),
+            part_uid: None,
+            heat_lot: None,
+        },
+    )
+    .expect("a lot-level reading names the WO and must still record");
 }

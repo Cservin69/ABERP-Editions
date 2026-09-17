@@ -338,12 +338,22 @@ pub fn update_plan(
     let old_kind = existing.characteristic_type.unwrap_or_default();
     let new_kind = input.characteristic_type.unwrap_or_default();
     if new_kind != old_kind && has_recorded_evidence(conn, tenant, plan_id)? {
+        // ADR-0199 residual 16 — this 400 body is the ONLY thing the operator
+        // sees. It has to carry the remedy AND the reason, or it reads as an
+        // arbitrary refusal and the next step is a support ticket. Same
+        // argument `qc_report_block_detail` makes for the shipment gate's
+        // wording, and it is pinned by a test for the same reason: a message
+        // that understates the cause sends someone looking in the wrong place.
         return Err(QcError::Validation(format!(
             "cannot change characteristic_type from {} to {} on a plan that \
              has recorded inspections — archive this characteristic and \
-             create a new one",
+             create a new one. The existing measurements were taken against \
+             the {} definition, and a new plan_id is what makes the \
+             replacement measurable on its own identity instead of \
+             inheriting evidence that was never about it",
             old_kind.as_str(),
-            new_kind.as_str()
+            new_kind.as_str(),
+            old_kind.as_str()
         )));
     }
     ensure_unique(

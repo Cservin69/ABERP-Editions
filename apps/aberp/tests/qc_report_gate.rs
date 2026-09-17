@@ -3123,3 +3123,456 @@ fn a_legacy_report_without_a_digest_falls_back_and_says_so() {
         other => panic!("the legacy fallback stopped blocking what it can see: {other:?}"),
     }
 }
+
+// ── ADR-0199 residual 8 — the late-measurement safety net is NOT atomic ──
+//
+// The residual says the document merely goes stale, because "the failure a
+// late measurement records now spawns an NCR the belt sees". That safety net
+// is real but it is NOT atomic: `record_manual_inspection` commits the
+// measurement, then creates the NCR on a SECOND connection, then links it in
+// a THIRD transaction (`apps/aberp/src/qc_inspection.rs`). Between the first
+// commit and the second, a crash or any error leaves a committed FAILING
+// measurement with no NCR at all — and nothing else re-reads `qc_inspections`
+// after issuance.
+//
+// This test reproduces exactly that state. It does not simulate a crash; it
+// builds the row the crash leaves behind, which is what a gate has to survive.
+
+#[test]
+fn a_late_failure_with_no_ncr_must_not_release_the_shipment() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "2");
+    seed_dispatch(&conn, "dsp-late", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 2);
+
+    let plan = seed_plan(&conn, "Bore D", "1", true);
+    for u in &units {
+        measure_at(&mut conn, &plan, &u.part_uid, 25.0, now());
+    }
+    let (qcr_id, d) = issue_report_for(&mut conn, &units);
+    assert_eq!(d, Disposition::Accept, "precondition: the report accepts");
+    let disp = dispatch(&conn, "dsp-late");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: nothing blocks before the late measurement"
+    );
+
+    // A LATE measurement, far outside the ±0.05 band on nominal 25.0, recorded
+    // and committed with no NCR — the state the non-atomic window leaves.
+    measure_at(&mut conn, &plan, &units[0].part_uid, 30.0, now());
+
+    let disp = dispatch(&conn, "dsp-late");
+    match resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked { qcr_id: id, .. } => {
+            assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
+        }
+        other => panic!(
+            "a recorded FAILING measurement released the shipment on a report \
+             that still says `accept`, because the NCR that was supposed to \
+             catch it was never written — {other:?}"
+        ),
+    }
+}
+
+/// Record a measurement through a probe whose calibration is STALE.
+/// `measure_at` hardcodes `last_calibration_at: None`, which can never
+/// produce `Verdict::CalibrationStale` — `compute_verdict` only checks the
+/// window when a calibration timestamp exists.
+fn measure_stale_at(
+    conn: &mut Connection,
+    plan_id: &str,
+    part_uid: &str,
+    actual: f64,
+    at: OffsetDateTime,
+) {
+    let m = meta();
+    let plan = aberp_qa::get_inspection_plan(conn, T, plan_id)
+        .unwrap()
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    record_inspection(
+        &tx,
+        &ctx(&m),
+        RecordInspectionInputs {
+            plan: &plan,
+            source: QcSource::Manual,
+            source_event_id: None,
+            actual_value: actual,
+            units: "mm".into(),
+            probe_serial: Some("PRB-1".into()),
+            // calibrated well outside the 1-day window below
+            last_calibration_at: Some(at - time::Duration::days(30)),
+            measured_at: at,
+            current_time: at,
+            stale_window_seconds: 86_400,
+            linked_part_uid: Some(part_uid.into()),
+            linked_heat_lot: Some("HL-9911".into()),
+            linked_wo_id: Some("wo-def".into()),
+            recorded_by: "ervin".into(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+/// ADR-0199 residual 19 — a post-issuance `CalibrationStale` measurement.
+///
+/// The residual records it as reaching NEITHER gate: `CalibrationStale`
+/// raises no NCR by design (an untrusted probe must not manufacture a false
+/// defect), and an issued report is immutable — so a probe found out of
+/// calibration after the certificate was issued surfaced nowhere, and the
+/// residual budgets "a second belt keyed on stale-calibration measurements".
+///
+/// **ADR-0127 §D1 closes it without a second belt.** `compute_disposition`
+/// returns `Incomplete` on any `calibration_stale` count, and the gate now
+/// re-derives from today's measurements — so the stale reading stops the
+/// report releasing on exactly the same path a late failure does. Asserted
+/// here rather than assumed, because "it probably falls out" is how a safety
+/// property ends up resting on nobody having checked.
+#[test]
+fn a_post_issuance_stale_calibration_measurement_stops_the_release() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "2");
+    seed_dispatch(&conn, "dsp-stale", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 2);
+
+    let plan = seed_plan(&conn, "Bore D", "1", true);
+    for u in &units {
+        measure_at(&mut conn, &plan, &u.part_uid, 25.0, now());
+    }
+    let (qcr_id, d) = issue_report_for(&mut conn, &units);
+    assert_eq!(d, Disposition::Accept);
+    let disp = dispatch(&conn, "dsp-stale");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the report releases before the stale reading"
+    );
+
+    // IN tolerance — this is not a failure. The only thing wrong with it is
+    // that the probe could not be trusted when it was taken.
+    measure_stale_at(&mut conn, &plan, &units[0].part_uid, 25.0, now());
+
+    let disp = dispatch(&conn, "dsp-stale");
+    match resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason, qcr_id: id, ..
+        } => {
+            assert_eq!(reason, QcReportBlockReason::EvidenceDrift);
+            assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
+        }
+        other => panic!(
+            "a probe found out of calibration after issuance left the \
+             certificate releasing: {other:?}"
+        ),
+    }
+}
+
+/// ADR-0199 residual 14, sharpened — an UNATTRIBUTED failing measurement
+/// reaches neither gate, and ADR-0127 did not change that.
+///
+/// The residual frames this as "the belt's outer edge": an NCR naming neither
+/// a part UID nor a WO has no key to join on, and it notes that "every
+/// auto-NCR from `record_manual_inspection` names at least the WO whenever the
+/// measurement did". The measurement does not always do so — `wo_id`,
+/// `part_uid` and `heat_lot` are all `Option` on `ManualInspectionRequest`,
+/// and the route passes them through with no validation.
+///
+/// So a failing measurement can be recorded with no attribution at all, and:
+///
+/// - the auto-NCR it spawns carries empty affected lists, so the NCR belt has
+///   nothing to join on and blocks nothing;
+/// - ADR-0127 §D1 reads `list_inspections_for_wo`, which is keyed on
+///   `linked_wo_id` — so the re-derivation cannot see it either.
+///
+/// A recorded, failing, real defect that no gate can reach.
+#[test]
+fn an_out_of_band_unattributed_measurement_is_a_stated_limit() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "2");
+    seed_dispatch(&conn, "dsp-unattr", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 2);
+    let plan = seed_plan(&conn, "Bore D", "1", true);
+    for u in &units {
+        measure_at(&mut conn, &plan, &u.part_uid, 25.0, now());
+    }
+    let (_qcr_id, d) = issue_report_for(&mut conn, &units);
+    assert_eq!(d, Disposition::Accept);
+
+    // A failing reading with NOTHING naming what it was taken on.
+    let m = meta();
+    let plan_row = aberp_qa::get_inspection_plan(&conn, T, &plan)
+        .unwrap()
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    let rec = record_inspection(
+        &tx,
+        &ctx(&m),
+        RecordInspectionInputs {
+            plan: &plan_row,
+            source: QcSource::Manual,
+            source_event_id: None,
+            actual_value: 30.0, // far outside ±0.05 on nominal 25.0
+            units: "mm".into(),
+            probe_serial: None,
+            last_calibration_at: None,
+            measured_at: now(),
+            current_time: now(),
+            stale_window_seconds: 86_400,
+            linked_part_uid: None,
+            linked_heat_lot: None,
+            linked_wo_id: None,
+            recorded_by: "ervin".into(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(
+        rec.verdict.is_failing(),
+        "precondition: this reading is a real failure"
+    );
+
+    // STATED LIMIT, asserted rather than described. Such a row can no longer
+    // be created in band — `record_manual_inspection` refuses it, pinned by
+    // `an_inspection_naming_neither_a_wo_nor_a_part_is_refused`. Written
+    // DIRECTLY, as here, it is still invisible to both gates, and no join key
+    // can rescue it: the residual's objection stands, since heat lot or
+    // product would refuse shipments the operator never associated with the
+    // order.
+    //
+    // This is asserted so that nobody later reads residual 14 as closed in
+    // both directions. The in-band path is closed; the out-of-band row is a
+    // limit, and this is where it is written down.
+    let disp = dispatch(&conn, "dsp-unattr");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &disp, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "an out-of-band unattributed measurement remains invisible to both \
+         gates — the in-band path is what ADR-0199 residual 14 closes"
+    );
+}
+
+/// Seed an NCR row directly, so a test can choose exactly what it names.
+/// `create_ncr` writes through its own opener; this keeps the row in the same
+/// world as the rest of the fixture's seeding.
+fn seed_ncr(conn: &Connection, ncr_id: &str, part_uids: &[&str], wo_ids: &[&str]) {
+    aberp::quality::ensure_schema(conn).unwrap();
+    let enc = |v: &[&str]| serde_json::to_string(v).unwrap();
+    conn.execute(
+        "INSERT INTO ncrs (ncr_id, tenant_id, discovered_at_utc, discovered_by_operator, \
+         severity, category, description, affected_part_uids, affected_wo_ids, \
+         affected_heat_lots, photos, state, closed_at_utc, closed_by_operator) \
+         VALUES (?1,?2,'2026-08-02T00:00:00Z','op','major','workmanship','seeded', \
+         ?3,?4,'[]','[]','open',NULL,NULL)",
+        params![ncr_id, T, enc(part_uids), enc(wo_ids)],
+    )
+    .unwrap();
+}
+
+/// ADR-0199 residual 15 — a LOT-level NCR leaves the report labelled `accept`.
+///
+/// `open_ncr_against` joins on `affected_part_uids` only, so an NCR that names
+/// the WORK ORDER and no unit does not set `open_ncr_against_reported_part` —
+/// and `compute_disposition` therefore returns `Accept` rather than
+/// `AcceptWithNcr`.
+///
+/// The residual calls this deliberate, on the grounds that it "decides how a
+/// report is LABELLED, not whether a shipment leaves", and that is true: the
+/// shipment is refused by the NCR belt either way, and ADR-0127 now refuses it
+/// a second time. But the QC report is a COMPLIANCE DOCUMENT. A certificate
+/// that says `accept` while a major nonconformity stands open against the very
+/// work order it certifies is a document that misstates the quality record,
+/// and it is printed into hash-pinned bytes where it cannot later be corrected.
+#[test]
+fn a_lot_level_ncr_must_label_the_report_accept_with_ncr() {
+    if !aberp::build_profile::qc_reporting_allowed() {
+        return;
+    }
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-lot", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    measure(&mut conn, &p1, &units[0].part_uid, 25.0);
+
+    // An NCR against the WORK ORDER, naming no unit — the shape a lot-level
+    // nonconformity is raised in.
+    seed_ncr(&conn, "ncr_lot", &[], &["wo-def"]);
+
+    let handle = aberp::serve::open_tenant_handle(&db, TenantId::new(T).unwrap()).unwrap();
+    let hash = BinaryHash::from_bytes([0u8; 32]);
+    let tenant = TenantId::new(T).unwrap();
+    drop(conn);
+
+    let drafted = aberp::qc_report::draft_report(
+        &handle,
+        tenant,
+        hash,
+        "ervin",
+        now(),
+        aberp::qc_report::DraftReportRequest {
+            wo_id: "wo-def".into(),
+            report_kind: QcReportKind::DimensionalInspection,
+            template: None,
+            notes: None,
+        },
+    )
+    .expect("draft");
+
+    assert_eq!(
+        drafted.report.disposition,
+        Disposition::AcceptWithNcr,
+        "an open MAJOR NCR stands against this work order; a certificate that \
+         says plain `accept` misstates the quality record, and the bytes are \
+         hash-pinned so it cannot be corrected afterwards"
+    );
+}
+
+/// ADR-0199 residual 15, the stated decision — a WAIVED NCR still labels the
+/// report `accept_with_ncr`.
+///
+/// A waiver is a decision to SHIP anyway; it is not a finding that the
+/// nonconformity never existed. The certificate states what was FOUND, and the
+/// waiver states what was then DECIDED — with its own operator, reason and
+/// hash-chained entry. If the label folded them together, a signature would
+/// erase a defect from a compliance document.
+#[test]
+fn a_waived_ncr_still_labels_the_report_accept_with_ncr() {
+    if !aberp::build_profile::qc_reporting_allowed() {
+        return;
+    }
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-wv", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    measure(&mut conn, &p1, &units[0].part_uid, 25.0);
+    seed_ncr(&conn, "ncr_lot", &[], &["wo-def"]);
+    // A manager has signed the shipment off for this exact (ncr, wo) pair.
+    aberp::quality::ensure_schema(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO ncr_shipment_waivers (waiver_id, tenant_id, ncr_id, work_order_id, \
+         approved_by_operator, reason, approved_at_utc, ncr_state_at_waiver) \
+         VALUES ('wvr_1',?1,'ncr_lot','wo-def','manager', \
+         'customer accepted the deviation in writing','2026-08-03T00:00:00Z','open')",
+        params![T],
+    )
+    .unwrap();
+
+    let handle = aberp::serve::open_tenant_handle(&db, TenantId::new(T).unwrap()).unwrap();
+    let hash = BinaryHash::from_bytes([0u8; 32]);
+    let tenant = TenantId::new(T).unwrap();
+    drop(conn);
+
+    let drafted = aberp::qc_report::draft_report(
+        &handle,
+        tenant,
+        hash,
+        "ervin",
+        now(),
+        aberp::qc_report::DraftReportRequest {
+            wo_id: "wo-def".into(),
+            report_kind: QcReportKind::DimensionalInspection,
+            template: None,
+            notes: None,
+        },
+    )
+    .expect("draft");
+
+    assert_eq!(
+        drafted.report.disposition,
+        Disposition::AcceptWithNcr,
+        "a waiver releases the shipment; it does not un-find the defect, and \
+         the certificate must not say otherwise"
+    );
+}
+
+/// ADR-0199 residual 15 — the LOT-ONLY report, which the removed
+/// `units.is_empty()` early return swallowed whole.
+///
+/// A work order with no serialised units still gets a certificate, and a
+/// lot-level nonconformity is exactly the kind raised against it. The old
+/// guard returned "no NCR" before looking, so this was the one report shape
+/// guaranteed to be mislabelled.
+#[test]
+fn a_lot_only_report_still_sees_a_work_order_ncr() {
+    if !aberp::build_profile::qc_reporting_allowed() {
+        return;
+    }
+    let db = setup();
+    let conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-lotonly", "wo-def", &buyer.id);
+    // NO marked units at all — the lot-only shape.
+    seed_ncr(&conn, "ncr_lot", &[], &["wo-def"]);
+
+    let handle = aberp::serve::open_tenant_handle(&db, TenantId::new(T).unwrap()).unwrap();
+    let hash = BinaryHash::from_bytes([0u8; 32]);
+    let tenant = TenantId::new(T).unwrap();
+    drop(conn);
+
+    let drafted = aberp::qc_report::draft_report(
+        &handle,
+        tenant,
+        hash,
+        "ervin",
+        now(),
+        aberp::qc_report::DraftReportRequest {
+            wo_id: "wo-def".into(),
+            report_kind: QcReportKind::DimensionalInspection,
+            template: None,
+            notes: None,
+        },
+    )
+    .expect("draft");
+
+    assert_ne!(
+        drafted.report.disposition,
+        Disposition::Accept,
+        "a lot-only report with an open work-order NCR must not read as a \
+         clean accept — this is the shape the units.is_empty() early return \
+         mislabelled every time"
+    );
+}

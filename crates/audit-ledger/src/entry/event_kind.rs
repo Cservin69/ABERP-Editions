@@ -3004,6 +3004,29 @@ pub enum EventKind {
     /// bytes.
     NcrShipmentWaiverGranted,
 
+    /// ADR-0128 — a shipment waiver was WITHDRAWN. The waiver row it names
+    /// stays exactly where it is: a revoked waiver is not an erased one, and
+    /// who signed it, when and why remains the record.
+    ///
+    /// **TERMINAL, not latest-wins** (§D2). Once revoked, that waiver never
+    /// disarms `open_ncr_ids_blocking_wo` again whatever the timestamps say;
+    /// re-permitting the shipment takes a NEW waiver, with its own sign-off
+    /// and its own entry. Ordering the two by time would let a clock skew or
+    /// a back-dated grant silently re-arm a release nobody signed for today.
+    ///
+    /// **Appended AFTER the revocation row is inserted** (§D3) — the mirror
+    /// of `NcrShipmentWaiverGranted`, which is deliberately appended BEFORE
+    /// its row. A grant releases, so its dangerous residue is an unaudited
+    /// release; a revocation tightens, so its dangerous residue is the chain
+    /// claiming a withdrawal while the gate still releases. Each writer is
+    /// ordered so the residue leaves the gate REFUSING rather than releasing.
+    ///
+    /// Payload (`serde_json::Value`): `revocation_id`, `waiver_id`, `ncr_id`,
+    /// `work_order_id`, `reason`, `revoked_by_operator`, `revoked_at_utc`,
+    /// `operator_user_id`. `ncr.*` family — app-layer JSON, never NAV XML
+    /// bytes.
+    NcrShipmentWaiverRevoked,
+
     /// S439 (ADR-0090) — a Corrective And Preventive Action was created for a
     /// parent NCR. FIRST member of the new `capa.*` prefix family. Records the
     /// corrective + preventive plan, the responsible operator, and the target
@@ -3521,6 +3544,7 @@ impl EventKind {
             EventKind::NcrClosed => "ncr.closed",
             EventKind::WoBlockedByOpenNcr => "ncr.wo_blocked_by_open_ncr",
             EventKind::NcrShipmentWaiverGranted => "ncr.shipment_waiver_granted",
+            EventKind::NcrShipmentWaiverRevoked => "ncr.shipment_waiver_revoked",
             EventKind::CapaCreated => "capa.created",
             EventKind::CapaApproved => "capa.approved",
             EventKind::CapaEffectivenessReviewed => "capa.effectiveness_reviewed",
@@ -3750,6 +3774,7 @@ impl EventKind {
             "ncr.closed" => Ok(EventKind::NcrClosed),
             "ncr.wo_blocked_by_open_ncr" => Ok(EventKind::WoBlockedByOpenNcr),
             "ncr.shipment_waiver_granted" => Ok(EventKind::NcrShipmentWaiverGranted),
+            "ncr.shipment_waiver_revoked" => Ok(EventKind::NcrShipmentWaiverRevoked),
             "capa.created" => Ok(EventKind::CapaCreated),
             "capa.approved" => Ok(EventKind::CapaApproved),
             "capa.effectiveness_reviewed" => Ok(EventKind::CapaEffectivenessReviewed),
@@ -3967,6 +3992,7 @@ impl EventKind {
         EventKind::NcrClosed,
         EventKind::WoBlockedByOpenNcr,
         EventKind::NcrShipmentWaiverGranted,
+        EventKind::NcrShipmentWaiverRevoked,
         EventKind::CapaCreated,
         EventKind::CapaApproved,
         EventKind::CapaEffectivenessReviewed,
@@ -4193,6 +4219,7 @@ mod tests {
             EventKind::NcrClosed,
             EventKind::WoBlockedByOpenNcr,
             EventKind::NcrShipmentWaiverGranted,
+            EventKind::NcrShipmentWaiverRevoked,
             EventKind::CapaCreated,
             EventKind::CapaApproved,
             EventKind::CapaEffectivenessReviewed,
@@ -4265,7 +4292,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            197,
+            198,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
@@ -6873,6 +6900,11 @@ mod tests {
                 "ncr.",
             ),
             (
+                EventKind::NcrShipmentWaiverRevoked,
+                "ncr.shipment_waiver_revoked",
+                "ncr.",
+            ),
+            (
                 EventKind::NcrShipmentWaiverGranted,
                 "ncr.shipment_waiver_granted",
                 "ncr.",
@@ -6898,7 +6930,7 @@ mod tests {
             );
             assert!(seen.insert(s), "duplicate storage string {s}");
         }
-        assert_eq!(seen.len(), 10, "ten distinct quality kinds");
+        assert_eq!(seen.len(), 11, "eleven distinct quality kinds");
     }
 
     /// S440 (ADR-0068) — the nine purchase-order kinds round-trip, carry the new
