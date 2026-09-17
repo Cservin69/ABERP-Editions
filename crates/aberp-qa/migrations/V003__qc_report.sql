@@ -177,5 +177,14 @@ CREATE TABLE IF NOT EXISTS qc_report_lines (
 CREATE INDEX IF NOT EXISTS qc_reports_tenant_dsp_idx
     ON qc_reports (tenant_id, dsp_id);
 
+-- ADR-0126 — the drift key. A SHA-256 over the units the report enumerated,
+-- frozen with the report. `serial_range` above it is a HUMAN rendering and is
+-- printed into the hash-pinned PDF bytes; it is not an identity and must not
+-- be used as one (ADR-0199 residual 10). NULL means "issued before ADR-0126",
+-- which is a different thing from the digest of an empty enumeration.
+ALTER TABLE qc_reports
+    ADD COLUMN IF NOT EXISTS unit_set_sha256 VARCHAR;
+
+
 CREATE INDEX IF NOT EXISTS qc_report_lines_tenant_report_idx
     ON qc_report_lines (tenant_id, qcr_id);

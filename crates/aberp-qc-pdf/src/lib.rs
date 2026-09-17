@@ -1112,6 +1112,7 @@ mod tests {
             customer_name: Some("Prime Aerospace Kft.".into()),
             customer_address_line: Some("1117 Budapest, Fő utca 1., HU".into()),
             customer_purchase_order: Some("PO-2026-889".into()),
+            unit_set_sha256: None,
         }
     }
 
@@ -1147,6 +1148,50 @@ mod tests {
             created_at: "2026-08-23T11:00:00Z".into(),
             required: true,
         }
+    }
+
+    /// ADR-0126 (round 1, A8) — the drift key must NEVER reach the bytes.
+    ///
+    /// `rendered_sha256` pins the emitted bytes into the hash chain, and
+    /// ADR-0124 records what a moved byte costs: bump the renderer and every
+    /// previously issued report becomes permanently unreproducible. So a new
+    /// field on `QcReport` that the template does not print has to be PROVEN
+    /// not to print, not assumed not to print — "it is not in the template"
+    /// is an argument, and this is the measurement.
+    ///
+    /// `serial_range` is the deliberate contrast: it IS rendered (twice), and
+    /// that is exactly why ADR-0126 left it untouched and added a separate
+    /// field instead of widening it.
+    #[test]
+    fn the_unit_set_digest_does_not_reach_the_rendered_bytes() {
+        let lines = vec![line(1, Some("SN-001"), true), line(2, Some("SN-002"), true)];
+        let mut without = report(
+            QcReportKind::DimensionalInspection,
+            QcReportTemplate::AbenStandard,
+        );
+        without.unit_set_sha256 = None;
+        let mut with = without.clone();
+        with.unit_set_sha256 =
+            Some("9f2c0ca1a6b1f0a1d1d3f6e4c7b8a95043210fedcba98765432100123456789ab".into());
+
+        let a = render(&inputs(&without, &lines)).unwrap();
+        let b = render(&inputs(&with, &lines)).unwrap();
+        assert_eq!(
+            a, b,
+            "the unit-set digest reached the rendered bytes; every issued \
+             report's rendered_sha256 would move (ADR-0124)"
+        );
+
+        // …and the contrast: serial_range IS in the bytes, so this proves the
+        // comparison above can actually detect a field that reaches them.
+        let mut moved = without.clone();
+        moved.serial_range = Some("SN-999 … SN-998 (7 units)".into());
+        assert_ne!(
+            render(&inputs(&moved, &lines)).unwrap(),
+            a,
+            "serial_range must still reach the bytes — if it does not, this \
+             test proves nothing about the digest"
+        );
     }
 
     fn inputs<'a>(r: &'a QcReport, lines: &'a [QcReportLine]) -> QcReportInputs<'a> {

@@ -91,6 +91,10 @@ pub struct QcReport {
     pub customer_purchase_order: Option<String>,
     pub qty_reported: u32,
     pub serial_range: Option<String>,
+    /// ADR-0126 — the drift key: [`unit_set_digest`] over the units this
+    /// report enumerated, frozen with it. `None` means the report was issued
+    /// before ADR-0126 and can only be checked by the lossy `serial_range`.
+    pub unit_set_sha256: Option<String>,
     pub heat_lot_reference: Option<String>,
     pub mill_cert_id: Option<String>,
     pub machine_id: Option<String>,
@@ -730,6 +734,92 @@ pub fn compute_disposition(
 
 /// Render the human-readable serial range for the report header
 /// (`"SN-001 … SN-012 (12 units)"`). Pure; snapshotted onto the row.
+/// The drift key: a SHA-256 over the units a report enumerated.
+///
+/// **This is the value the shipment gate compares. `serial_range_of` is NOT**
+/// — it renders `"{first} … {last} ({n} units)"` from `part_serial` alone, for
+/// a human to read on the PDF, and using that projection as an equality test
+/// was ADR-0199 residual 10. Two different enumerations render the same string
+/// whenever the first serial, the last serial and the count agree, and it
+/// never reads `part_uid` at all. Both shapes were reproduced against the live
+/// gate and it passed them:
+///
+/// - the same first and last serial with a DIFFERENT middle;
+/// - every serial preserved and every `part_uid` REWRITTEN — and `part_uid` is
+///   what `qc_inspections.linked_part_uid` carries, what the per-unit
+///   measurement join keys on (`Evidence::Unit`), and what the NCR belt keys
+///   on. After that rewrite the units being shipped have no measurements at
+///   all, and the old key could not see it.
+///
+/// # A MULTISET, never deduped
+/// `wo_part_marks` has no primary key and no unique constraint of any kind, so
+/// two rows may share a `part_uid` and a row may be duplicated outright — only
+/// `record_part_marks`'s refuse-second-write holds that line, which is exactly
+/// the protection this check assumes is absent. Every pair is therefore hashed,
+/// duplicates included: **a duplicated row IS drift.** Do not "optimise" this
+/// with a dedupe; that silently restores the hole.
+///
+/// # Why length-prefixed
+/// Each field is written as `<byte-len>:<bytes>`. A delimiter join is not
+/// injective — under `join(",")` the pairs `("AB","C")` and `("A","BC")`
+/// collide unless serials are known never to contain the delimiter, and
+/// nothing enforces that. Length-prefixing removes the assumption instead of
+/// documenting it. `str::len()` is bytes on both sides, so any UTF-8 serial,
+/// multi-byte or empty, encodes unambiguously.
+///
+/// # The empty enumeration has a digest
+/// A lot-only report enumerates no units and gets the digest of the empty
+/// encoding, **not** `None`. Otherwise "no digest because there are no units"
+/// could not be told from "no digest because this report predates ADR-0126",
+/// and the gate's legacy fallback would fire on lot-only reports forever.
+///
+/// # Mutation record (2026-09-16) — 8 killed, 2 survived
+/// Killed: reverting the gate to the `serial_range` comparison; making the
+/// legacy fallback a blanket pass; deduping the multiset; dropping the
+/// `part_uid` bytes; dropping the `part_serial` bytes; dropping BOTH length
+/// prefixes (a true delimiter join); removing the sort; and freezing no
+/// digest at all.
+///
+/// **The first draft of the injectivity pin did not kill any of those last
+/// four**, and the mutants are why. It used `("AB","C")` against
+/// `("A","BC")`, which is not a collision for a `:`-delimited encoding at all
+/// — `:AB:C` and `:A:BC` are different strings — and it compared values whose
+/// lengths and sort positions differed, so the surviving parts of the
+/// encoding separated them for the wrong reason. The pins now use a genuine
+/// collision (the delimiter INSIDE a field) and same-length, single-pair
+/// values, so content is what they measure.
+///
+/// **Survived, recorded rather than papered over:** dropping *only* the uid
+/// length prefix, and dropping *only* the serial length prefix. In each case
+/// the remaining prefix still disambiguates the split, and no collision could
+/// be constructed for either — they are plausibly equivalent mutants rather
+/// than gaps. Dropping both is killed, which is the property the design
+/// actually claims.
+pub fn unit_set_digest(units: &[ReportUnit]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut pairs: Vec<(&str, &str)> = units
+        .iter()
+        .map(|u| (u.part_uid.as_str(), u.part_serial.as_str()))
+        .collect();
+    pairs.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    for (uid, serial) in pairs {
+        hasher.update(uid.len().to_string().as_bytes());
+        hasher.update(b":");
+        hasher.update(uid.as_bytes());
+        hasher.update(serial.len().to_string().as_bytes());
+        hasher.update(b":");
+        hasher.update(serial.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 pub fn serial_range_of(units: &[ReportUnit]) -> Option<String> {
     if units.is_empty() {
         return None;
@@ -887,6 +977,7 @@ pub fn freeze_report(
         inputs.units.len() as u32
     };
     let serial_range = serial_range_of(inputs.units);
+    let unit_set_sha256 = unit_set_digest(inputs.units);
     let t = &inputs.traceability;
 
     tx.execute(
@@ -899,9 +990,10 @@ pub fn freeze_report(
             characteristics_failed, characteristics_unaccounted,
             rendered_sha256, renderer_version, issued_at_utc, issued_by,
             superseded_by_qcr_id, created_at, created_by, notes,
-            customer_name, customer_address_line, customer_purchase_order
+            customer_name, customer_address_line, customer_purchase_order,
+            unit_set_sha256
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?);",
+                   ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?);",
         params![
             &qcr_id,
             ctx.tenant,
@@ -933,6 +1025,7 @@ pub fn freeze_report(
             trimmed(inputs.customer.name.as_deref()),
             trimmed(inputs.customer.address_line.as_deref()),
             trimmed(inputs.customer.purchase_order.as_deref()),
+            &unit_set_sha256,
         ],
     )
     .map_err(|e| QcError::Storage(anyhow::anyhow!("INSERT qc_reports: {e}")))?;
@@ -1137,6 +1230,7 @@ pub fn issue_report(
             "drawing_number": report.drawing_number,
             "drawing_rev": report.drawing_rev,
             "serial_range": report.serial_range,
+            "unit_set_sha256": report.unit_set_sha256,
             "qty_reported": report.qty_reported,
             "heat_lot_reference": report.heat_lot_reference,
             "mill_cert_id": report.mill_cert_id,
@@ -1296,7 +1390,7 @@ const REPORT_COLUMNS: &str = "qcr_id, report_number, report_kind, template, stat
      disposition, characteristics_required, characteristics_measured, characteristics_passed,
      characteristics_failed, characteristics_unaccounted, rendered_sha256, renderer_version,
      issued_at_utc, issued_by, superseded_by_qcr_id, created_at, created_by, notes,
-     customer_name, customer_address_line, customer_purchase_order";
+     customer_name, customer_address_line, customer_purchase_order, unit_set_sha256";
 
 /// Fetch one report by id (tenant-scoped).
 pub fn get_report(
@@ -1488,6 +1582,7 @@ fn parse_report_row(row: &duckdb::Row<'_>) -> duckdb::Result<Result<QcReport, an
             customer_name: row.get(32)?,
             customer_address_line: row.get(33)?,
             customer_purchase_order: row.get(34)?,
+            unit_set_sha256: row.get(35)?,
         })
     })())
 }
@@ -2161,6 +2256,127 @@ mod tests {
     }
 
     /// The serial range is a human-readable snapshot, sorted, with a count.
+    fn u(uid: &str, serial: &str) -> ReportUnit {
+        ReportUnit {
+            part_uid: uid.into(),
+            part_serial: serial.into(),
+        }
+    }
+
+    /// The collision a delimiter join would have. This is the whole fix.
+    #[test]
+    fn the_encoding_is_injective_where_a_delimiter_join_collides() {
+        let a = [u("AB", "C")];
+        let b = [u("A", "BC")];
+        // Under `join(":")` both render "AB:C" / "A:BC" -> the same bytes once
+        // concatenated without lengths. Length-prefixing separates them.
+        assert_ne!(
+            unit_set_digest(&a),
+            unit_set_digest(&b),
+            "a delimiter join collides here; the length prefix is what stops it"
+        );
+    }
+
+    /// A field boundary must not be forgeable by putting the delimiter INTO a
+    /// field — the reason the prefix is a byte LENGTH and not a separator.
+    ///
+    /// These are the mutation-proof cases. An earlier draft of this pin used
+    /// `("AB","C")` against `("A","BC")`, which is **not** a collision for a
+    /// `:`-delimited encoding (`:AB:C` and `:A:BC` are different strings) —
+    /// so it passed even with the length prefixes removed. A genuine
+    /// collision needs the delimiter inside a field.
+    #[test]
+    fn a_field_containing_the_delimiter_cannot_forge_a_boundary() {
+        // Delimiter-joined, both of these are ":A:B:C" — identical. Only the
+        // length prefix separates them.
+        assert_ne!(
+            unit_set_digest(&[u("A:B", "C")]),
+            unit_set_digest(&[u("A", "B:C")]),
+            "a delimiter-joined encoding collides here; the length prefix is \
+             the whole reason it does not"
+        );
+        assert_ne!(unit_set_digest(&[u("", "")]), unit_set_digest(&[]));
+    }
+
+    /// Every field of every pair must be INSIDE the hash — content, not just
+    /// length, and not merely reflected in the sort order.
+    ///
+    /// Same-length values are the point: hashing only the length prefix, or
+    /// relying on the sort to reorder the remaining fields, both pass a test
+    /// whose values differ in length or in sort position. These do not.
+    #[test]
+    fn both_fields_are_hashed_by_content_not_merely_by_length() {
+        // one pair, so the sort cannot separate them; equal lengths, so the
+        // length prefix cannot either. Only the uid bytes differ.
+        assert_ne!(
+            unit_set_digest(&[u("aa", "SN-001")]),
+            unit_set_digest(&[u("ab", "SN-001")]),
+            "part_uid content must reach the hash — it is the identity the \
+             measurement join and the NCR belt key on"
+        );
+        // …and the same for the serial.
+        assert_ne!(
+            unit_set_digest(&[u("p1", "aa")]),
+            unit_set_digest(&[u("p1", "ab")]),
+            "part_serial content must reach the hash"
+        );
+    }
+
+    /// `wo_part_marks` has no unique constraint, so a duplicated row is a
+    /// thing that can happen — and it is drift, not a no-op.
+    #[test]
+    fn a_duplicated_unit_moves_the_digest() {
+        let one = [u("p1", "SN-001")];
+        let twice = [u("p1", "SN-001"), u("p1", "SN-001")];
+        assert_ne!(
+            unit_set_digest(&one),
+            unit_set_digest(&twice),
+            "deduping here would silently restore ADR-0199 residual 10"
+        );
+    }
+
+    /// Order is not identity: the same enumeration in any order is one digest.
+    #[test]
+    fn the_digest_does_not_depend_on_enumeration_order() {
+        let fwd = [u("p1", "SN-001"), u("p2", "SN-002")];
+        let rev = [u("p2", "SN-002"), u("p1", "SN-001")];
+        assert_eq!(unit_set_digest(&fwd), unit_set_digest(&rev));
+    }
+
+    /// The empty enumeration has a digest, and it is not the digest of a unit.
+    #[test]
+    fn the_empty_enumeration_has_its_own_digest() {
+        let empty = unit_set_digest(&[]);
+        assert_eq!(empty.len(), 64, "sha-256 hex");
+        assert_ne!(empty, unit_set_digest(&[u("p1", "SN-001")]));
+    }
+
+    /// ADR-0199 residual 10, both shapes, stated as the contrast that matters:
+    /// the rendered range CANNOT tell these apart and the digest CAN.
+    #[test]
+    fn the_digest_sees_exactly_what_the_rendered_range_cannot() {
+        let frozen = [u("p1", "SN-001"), u("p2", "SN-002"), u("p3", "SN-003")];
+
+        // Shape A — the middle serial changes; first, last and count do not.
+        let middle = [u("p1", "SN-001"), u("p2", "SN-002X"), u("p3", "SN-003")];
+        assert_eq!(
+            serial_range_of(&frozen),
+            serial_range_of(&middle),
+            "precondition: this is the blindness being fixed"
+        );
+        assert_ne!(unit_set_digest(&frozen), unit_set_digest(&middle));
+
+        // Shape B — every serial preserved, a part_uid rewritten. This is the
+        // identity the measurement join and the NCR belt key on.
+        let uid = [u("p1", "SN-001"), u("pX", "SN-002"), u("p3", "SN-003")];
+        assert_eq!(
+            serial_range_of(&frozen),
+            serial_range_of(&uid),
+            "precondition: the rendered range never reads part_uid"
+        );
+        assert_ne!(unit_set_digest(&frozen), unit_set_digest(&uid));
+    }
+
     #[test]
     fn serial_range_summarises_the_units() {
         assert_eq!(serial_range_of(&[]), None);
