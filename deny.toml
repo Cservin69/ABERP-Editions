@@ -93,18 +93,14 @@ ignore = [
     { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version unmaintained via tauri-utils → urlpattern; no safe upgrade. Tracking upstream tauri urlpattern bump." },
     { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident unmaintained via tauri-utils → urlpattern; same path as -0098." },
 
-    # ─── Tauri 2 Linux backend pulls GTK3 bindings (gtk-rs migrated
-    # to GTK4 upstream but no GTK4-backed Tauri release exists yet).
-    # All "unmaintained" — none are CVE-class. Revisit when Tauri
-    # ships a GTK4 path. ───
-    { id = "RUSTSEC-2024-0411", reason = "gdk unmaintained via Tauri GTK3 backend." },
-    { id = "RUSTSEC-2024-0412", reason = "gdk-sys unmaintained via Tauri GTK3 backend." },
-    { id = "RUSTSEC-2024-0413", reason = "atk unmaintained via Tauri GTK3 backend." },
-    { id = "RUSTSEC-2024-0415", reason = "gtk unmaintained via Tauri GTK3 backend." },
-    { id = "RUSTSEC-2024-0416", reason = "atk-sys unmaintained via Tauri GTK3 backend." },
-    { id = "RUSTSEC-2024-0418", reason = "gtk-sys unmaintained via Tauri GTK3 backend." },
-    { id = "RUSTSEC-2024-0419", reason = "gdkwayland-sys unmaintained via Tauri GTK3 backend." },
-    { id = "RUSTSEC-2024-0420", reason = "gdkx11-sys unmaintained via Tauri GTK3 backend." },
+    # ─── Tauri 2 Linux backend pulls GTK3 bindings. The eight gtk-rs
+    # "unmaintained" advisories (RUSTSEC-2024-0411/0412/0413/0415/0416/
+    # 0418/0419/0420) that used to be ignored here were WITHDRAWN by
+    # RustSec on 2026-08-14. A withdrawn advisory is never reported, so
+    # each entry matched nothing and `--deny advisory-not-detected` turned
+    # the whole check red. Nobody saw it: this check lived only in the
+    # workflows, and the workflows do not run. It is `ci/supply-chain.sh`
+    # now. The glib entry below is NOT withdrawn and still matches. ───
     { id = "RUSTSEC-2024-0429", reason = "glib 0.18.x VariantStrIter unsoundness via Tauri GTK3 backend. Not directly used by ABERP; revisit when Tauri 2 ships a GTK4 path. NOTE: only actually REPORTED since `unsound = \"all\"` (2026-08-04) — before that this entry matched nothing and warned advisory-not-detected, which looked like drift but was a scoped-out finding." },
 
     # ─── Older ecosystem crates still in transitive trees; none
