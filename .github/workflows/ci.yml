@@ -14,7 +14,14 @@
 # identical triggers, so this workflow was paying a ~70-min harness a second
 # time and being CANCELLED at its own cap. See the block above those removed
 # steps for the measurements. This workflow keeps the strict-SVG lint (not
-# duplicated anywhere) and remains the sole home of the toolchain work.
+# duplicated anywhere) and remains the sole CI home of the toolchain work.
+#
+# 2026-09-23 — every check here is a ci/*.sh gate; each step below calls one
+# (one producer), and run/local-gates.sh runs the same list locally. Pushes go
+# out Actions-off, so until then fmt, build, test, clippy, cargo-deny, the SPA
+# build and the Python suite had lived ONLY in this file and ran nowhere —
+# cargo-deny was red on main. ci/gate-parity.sh now fails if a check is added
+# here without a gate, or a gate exists that no step runs.
 #
 # The Portable arm was dropped 2026-08-04: this repository is Defense-only,
 # and the Portable line is built in ABERP.git per the architecture. That makes
@@ -69,6 +76,10 @@ jobs:
     # real regression, which is the exact failure this comment has recorded
     # twice already. Headroom here is cheap; a false red is not.
     timeout-minutes: 90
+    # The ci/ gates read the edition's feature flags from here, so the matrix
+    # arm stays the one place an edition is defined.
+    env:
+      ABERP_EDITION_FEATURES: ${{ matrix.features }}
     strategy:
       # Defense-only from 2026-08-04: this repository's CI builds the Defense
       # line alone. The Portable line lives in ABERP.git per the architecture,
@@ -84,6 +95,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      # ── Gate parity (toolchain-free, both directions) ─────────────────
+      # Every check below is a ci/*.sh gate the local harness also runs
+      # (run/local-gates.sh); this step fails if a workflow ever grows a check
+      # that lives only here again. See the header of ci/gate-parity.sh.
+      - name: Gate parity — every workflow step is a gate, every gate is wired
+        run: ./ci/gate-parity.sh
+
+      - name: Prove the gate-parity gate has teeth (mutation probes)
+        run: ./ci/gate-parity-probes.sh
 
       # ── DB-isolation / checkpoint-site gates: run in cut-gate.yml ───────
       # These four steps used to run HERE as well:
@@ -155,20 +176,7 @@ jobs:
         # webkit2gtk-4.1, gtk-3, libsoup-3.0, librsvg, ayatana appindicator;
         # without the -dev packages the `wry`/`tao` build-scripts fail at link.
         # Mirrors the canonical Tauri 2 Ubuntu prerequisites.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libsoup-3.0-dev \
-            libgtk-3-dev
+        run: ./ci/workflow-only/tauri-system-deps.sh
 
       - name: Install Rust stable (matches rust-toolchain.toml channel pin)
         uses: dtolnay/rust-toolchain@stable
@@ -187,10 +195,15 @@ jobs:
           cache-dependency-path: apps/aberp-ui/ui/package-lock.json
 
       - name: Build SPA bundle (populates apps/aberp-ui/ui/dist)
-        working-directory: apps/aberp-ui/ui
-        run: |
-          npm ci --no-audit --no-fund
-          npm run build
+        run: ./ci/spa-build.sh
+
+      # svelte-check and vitest were in package.json and run by NOTHING until
+      # 2026-09-23 — neither here nor locally. Toolchain-free, seconds each.
+      - name: SPA type-check (svelte-check)
+        run: ./ci/spa-types.sh
+
+      - name: SPA test suite (vitest)
+        run: ./ci/spa-tests.sh
 
       - name: Install Python (matches python/aberp-cad-extract pyproject min)
         # crates/aberp-cad-extract-wrapper/tests/* shell out to the Python CLI
@@ -217,10 +230,7 @@ jobs:
         # `[project.optional-dependencies].dev`). Without it the Python suite
         # step below cannot run at all — `[step]` alone installs the OCCT
         # runtime, never a test runner.
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e 'python/aberp-cad-extract[step,dev]'
-          echo "ABERP_TEST_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+        run: ./ci/workflow-only/python-extractor-install.sh
 
       # ── The Python extractor suite — previously run by NOTHING ───────────
       # Until 2026-09-02 no workflow in this repo executed the Python tests.
@@ -247,7 +257,6 @@ jobs:
       # testpaths is the RELATIVE "aberp_cad_extract/tests", so pytest only
       # discovers the suite when invoked from the package root.
       - name: Python extractor test suite (pytest)
-        working-directory: python/aberp-cad-extract
         # The `import OCP` line is a GUARD, not a smoke test, and it is the
         # reason this step is trustworthy. test_holes.py opens with
         # `pytest.importorskip("OCP")`, so if the [step] extra ever fails to
@@ -255,10 +264,8 @@ jobs:
         # pytest still exits 0 — a green step covering nothing. Asserting the
         # import first converts that silent hole into a loud failure.
         # (run/provision_pipeline_venv.sh verifies the same import for the
-        # same reason.)
-        run: |
-          python -c "import OCP"
-          python -m pytest
+        # same reason.) The guard and the pytest call live in the gate script.
+        run: ./ci/python-extractor-tests.sh
 
       - name: Cargo cache (per edition arm)
         uses: Swatinem/rust-cache@v2
@@ -270,12 +277,12 @@ jobs:
           shared-key: aberp-ci-${{ matrix.edition }}
 
       - name: Format check
-        run: cargo fmt --all -- --check
+        run: ./ci/rust-formatting.sh
 
       - name: Build (${{ matrix.edition }}, --locked)
         # --all-targets builds tests/benches/examples too, catching compile
         # errors that would otherwise only surface later in test/clippy.
-        run: cargo build --workspace --locked --all-targets ${{ matrix.features }}
+        run: ./ci/rust-build.sh
 
       # ── ADR-0098 Gap 1a/1b — the load-bearing DuckDB Handle e2e ──────
       # Run the shared-Handle acceptance proof + the C2 assertion-#1
@@ -285,8 +292,6 @@ jobs:
       # is captured even if a later test step fails. No `production` feature:
       # aberp-db is edition-agnostic (same rationale as the aberp-snapshot
       # crate tests below).
-      - name: ADR-0098 DuckDB Handle e2e (assertion #1 + concurrency)
-        run: cargo test -p aberp-db --test handle_concurrency_e2e --locked -- --nocapture
 
       # ADR-0105 — same rationale as the step above: this is the acceptance proof
       # that the two audit-append lock domains (the Handle writer mutex and the
@@ -295,8 +300,6 @@ jobs:
       # verdict is visible even if a later step fails. Single-threaded: the
       # mutual-exclusion guard measures lock WAIT, and cargo's default parallel
       # test threads add scheduler noise to that measurement.
-      - name: ADR-0105 audit lock-domain e2e (cross-domain fork)
-        run: cargo test -p aberp-db --test audit_lock_domain_e2e --locked -- --nocapture --test-threads=1
 
       # ADR-0110 D3 — same rationale as the two steps above. This is the
       # acceptance proof that `Handle::durable_ack` actually REACHES the
@@ -305,11 +308,14 @@ jobs:
       # in cut-gate.yml: the gate keeps the ack CALLED, this keeps the ack REAL.
       # Surfaced before the broad workspace Test so the verdict is visible even
       # if a later step fails.
-      - name: ADR-0110 D3 durable-ack fault injection (fsync reach)
-        run: cargo test -p aberp-db --test durable_ack_fault_injection --locked -- --nocapture
+      #
+      # The three runs above are one gate, ci/durability-e2e.sh, so they run
+      # locally with the same flags (incl. --test-threads=1 for ADR-0105).
+      - name: ADR-0098 / ADR-0105 / ADR-0110 durability e2e (Handle, lock domains, fsync reach)
+        run: ./ci/durability-e2e.sh
 
       - name: Test (${{ matrix.edition }}, --locked)
-        run: cargo test --workspace --locked ${{ matrix.features }}
+        run: ./ci/rust-tests.sh
 
       - name: Edition-isolation + crash-safe integration tests (by name)
         # Named explicitly (per SAW-OFF.md chunk-3 handoff) so they are visible
@@ -318,15 +324,10 @@ jobs:
         # could not run. The `production` feature exists only on the
         # aberp / aberp-ui packages, so the edition-agnostic crate tests
         # (aberp-snapshot, aberp-audit-ledger) run WITHOUT it.
-        run: |
-          cargo test -p aberp --test edition_db_isolation ${{ matrix.features }} --locked
-          cargo test -p aberp --test edition_snapshot_isolation ${{ matrix.features }} --locked
-          cargo test -p aberp-snapshot --test crash_safe_checkpoint_tests --locked
-          cargo test -p aberp-snapshot --test edition_isolation_tests --locked
-          cargo test -p aberp-audit-ledger ensure_consistent_refuses_and_preserves_when_mirror_ahead_of_db --locked
+        run: ./ci/named-integration-tests.sh
 
       - name: Clippy (${{ matrix.edition }}, warnings denied per ADR-0007)
-        run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }} -- -D warnings
+        run: ./ci/clippy.sh
 
       # ── Supply chain (arm-independent: operates on Cargo.lock) ──────────
       # These steps were gated `if: matrix.edition == 'portable'` to run the
@@ -375,9 +376,4 @@ jobs:
         #   license-not-encountered          → an allowed license nothing uses
         #   license-exception-not-encountered→ a per-crate exception nothing uses
         #   unmatched-skip                   → a [bans] skip matching nothing
-        run: |
-          cargo deny check \
-            --deny advisory-not-detected \
-            --deny license-not-encountered \
-            --deny license-exception-not-encountered \
-            --deny unmatched-skip
+        run: ./ci/supply-chain.sh
