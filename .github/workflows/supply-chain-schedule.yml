@@ -76,9 +76,4 @@ jobs:
       # there for why each --deny lint is present and why a blanket
       # `-D warnings` is deliberately NOT used.
       - name: cargo-deny check (advisories, licenses, bans, sources)
-        run: |
-          cargo deny check \
-            --deny advisory-not-detected \
-            --deny license-not-encountered \
-            --deny license-exception-not-encountered \
-            --deny unmatched-skip
+        run: ./ci/supply-chain.sh

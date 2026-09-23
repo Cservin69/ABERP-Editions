@@ -207,18 +207,12 @@ jobs:
     if: always()
     timeout-minutes: 10
     steps:
+      # The check itself is a script now (one producer, ci/gate-parity.sh), so
+      # this job needs the tree. It still runs no cargo.
+      - uses: actions/checkout@v5
+
       - name: Require every gate job and every probe shard to be green
         env:
           GATES: ${{ needs.gates.result }}
           PROBES: ${{ needs.negative-probes.result }}
-        run: |
-          echo "gates            = $GATES"
-          echo "negative-probes  = $PROBES   (matrix aggregate: 'success' only if EVERY shard succeeded)"
-          rc=0
-          [ "$GATES" = "success" ]  || { echo "✗ the ENFORCED gate job did not succeed ($GATES)"; rc=1; }
-          [ "$PROBES" = "success" ] || { echo "✗ at least one negative-probe shard did not succeed ($PROBES)"; rc=1; }
-          if [ "$rc" -ne 0 ]; then
-            echo "ADR-0093 DB-isolation cut-gate: ✗ FAILED"
-            exit 1
-          fi
-          echo "ADR-0093 DB-isolation cut-gate: ✓ every ENFORCED check passed and every probe shard has teeth"
+        run: ./ci/workflow-only/require-every-cut-gate-job.sh
